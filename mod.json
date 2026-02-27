@@ -1,0 +1,71 @@
+{
+	"geode": "5.1.0",
+	"gd": {
+		"win": "2.2081",
+		"android": "2.2081",
+		"mac": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "kusmic.rhythm_game",
+	"name": "Rhythm Game",
+	"version": "v1.0.0",
+	"developer": "Kusmic",
+	"description": "Gaming",
+	"dependencies": {
+		"geode.node-ids": ">=v1.20.0"
+	},
+	"settings": {
+		"show-inputs-ingame": {
+			"name": "Show Inputs In-Game",
+			"description": "Show input bars when playing a level with a matching JSON replay.",
+			"type": "bool",
+			"default": false
+		},
+		"bar-height": {
+			"name": "Bar Height",
+			"description": "Height of the input bars in pixels.",
+			"type": "int",
+			"default": 10,
+			"min": 2,
+			"max": 50
+		},
+		"bar-y-position": {
+			"name": "Bar Y Position",
+			"description": "Vertical position of the bars from the bottom of the screen.",
+			"type": "int",
+			"default": 15,
+			"min": 5,
+			"max": 200
+		},
+		"player1-color": {
+			"name": "Player 1 Color",
+			"description": "Color for Player 1 input bars.",
+			"type": "rgba",
+			"default": [50, 255, 80, 200]
+		},
+		"player2-color": {
+			"name": "Player 2 Color",
+			"description": "Color for Player 2 input bars.",
+			"type": "rgba",
+			"default": [80, 130, 255, 200]
+		},
+		"indicator-color": {
+			"name": "Indicator Color",
+			"description": "Color for the player position indicator outline.",
+			"type": "rgba",
+			"default": [255, 255, 255, 220]
+		},
+		"background-color": {
+			"name": "Background Color",
+			"description": "Color for the background strip behind the input bars.",
+			"type": "rgba",
+			"default": [0, 0, 0, 120]
+		},
+		"accent-color": {
+			"name": "Accent Color",
+			"description": "Accent color for the mod UI.",
+			"type": "color",
+			"default": [255, 255, 255]
+		}
+	}
+}
