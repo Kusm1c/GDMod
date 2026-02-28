@@ -66,6 +66,46 @@
 			"description": "Accent color for the mod UI.",
 			"type": "color",
 			"default": [255, 255, 255]
+		},
+		"ur-bar-width": {
+			"name": "UR Bar Width",
+			"description": "Width of the UR bar in pixels.",
+			"type": "int",
+			"default": 300,
+			"min": 100,
+			"max": 600
+		},
+		"ur-bar-height": {
+			"name": "UR Bar Height",
+			"description": "Height of the UR bar in pixels.",
+			"type": "int",
+			"default": 12,
+			"min": 4,
+			"max": 40
+		},
+		"ur-good-frames": {
+			"name": "Good Zone (frames)",
+			"description": "Number of frames for the Good zone (±). At 240fps, 1 frame ≈ 4.17ms.",
+			"type": "int",
+			"default": 2,
+			"min": 1,
+			"max": 10
+		},
+		"ur-earlylate-frames": {
+			"name": "Early/Late Zone (frames)",
+			"description": "Number of frames for the Early/Late zone boundary (±).",
+			"type": "int",
+			"default": 5,
+			"min": 2,
+			"max": 20
+		},
+		"ur-very-frames": {
+			"name": "Very Early/Late Zone (frames)",
+			"description": "Number of frames for the Very Early/Late zone boundary (±). Beyond this is a Miss.",
+			"type": "int",
+			"default": 8,
+			"min": 3,
+			"max": 30
 		}
 	}
 }

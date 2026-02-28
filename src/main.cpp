@@ -1,6 +1,8 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/EndLevelLayer.hpp>
 #include <Geode/utils/file.hpp>
 #include <Geode/utils/web.hpp>
 #include <Geode/loader/SettingV3.hpp>
@@ -638,6 +640,42 @@ static std::optional<ReplayLoadResult> loadMatchingReplay(int levelId) {
     return result;
 }
 
+// ============================================================
+// Rhythm Game – Judgment & UR Bar Types
+// ============================================================
+
+enum class Judgment {
+    VeryEarly,
+    Early,
+    Good,
+    Late,
+    VeryLate,
+    Miss
+};
+
+struct URTick {
+    float offsetFrames; // negative = early, positive = late
+    Judgment judgment;
+    float timeCreated;
+};
+
+// Static bridge: captures player inputs from GJBaseGameLayer::handleButton
+static std::vector<std::pair<float, bool>> s_playerInputs; // (time, isPress)
+static bool s_rhythmActive = false;
+
+class $modify(MyGJBGL, GJBaseGameLayer) {
+    void handleButton(bool push, int button, bool isPlayer1) {
+        GJBaseGameLayer::handleButton(push, button, isPlayer1);
+        if (s_rhythmActive && isPlayer1 && button == 1) {
+            float time = static_cast<float>(m_gameState.m_currentProgress);
+            // Use m_timePlayed from the game layer for accurate timing
+            auto pl = PlayLayer::get();
+            if (pl) time = static_cast<float>(pl->m_timePlayed);
+            s_playerInputs.push_back({time, push});
+        }
+    }
+};
+
 class $modify(MyPlayLayer, PlayLayer) {
     struct Fields {
         std::vector<ReplayPress> m_presses;
@@ -645,7 +683,7 @@ class $modify(MyPlayLayer, PlayLayer) {
         CCNode* m_indicator = nullptr; // hollow square following the player
         double m_framerate = 240.0;
         bool m_active = false;
-        bool m_allPlaced = false;
+        bool m_dotsCreated = false;
         // Settings
         int m_barHeight = 10;
         int m_barY = 15;
@@ -654,12 +692,38 @@ class $modify(MyPlayLayer, PlayLayer) {
         ccColor4B m_indicatorColor = ccc4(255, 255, 255, 220);
         ccColor4B m_bgColor = ccc4(0, 0, 0, 120);
         CCLayerColor* m_bgStrip = nullptr;
-        // Store world X for each placed dot so we can update screen positions each frame
-        std::vector<std::tuple<float, float, CCNode*>> m_dots; // (worldXStart, worldXEnd, dotNode)
+        // Position history: (time, playerWorldX) samples for accurate interpolation
+        // across speed changes (portals)
+        std::vector<std::pair<float, float>> m_posHistory;
+        // Dot nodes (one per press): (pressIndex, dotNode)
+        std::vector<std::pair<size_t, CCNode*>> m_dots;
+
+        // ========== UR Bar / Rhythm Game ==========
+        CCNode* m_urBar = nullptr;
+        CCLabelBMFont* m_accuracyLabel = nullptr;
+        std::vector<CCNode*> m_urTickNodes;
+        std::vector<URTick> m_urTicks;
+        size_t m_processedInputIdx = 0;
+        std::vector<bool> m_replayPressUsed;
+        std::vector<bool> m_replayReleaseUsed;
+        int m_judgmentCounts[6] = {0, 0, 0, 0, 0, 0};
+        float m_totalAccuracy = 0.0f;
+        int m_totalJudgments = 0;
+        // UR bar settings
+        float m_urBarWidth = 300.0f;
+        float m_urBarHeight = 12.0f;
+        float m_goodFrames = 2.0f;
+        float m_earlyLateFrames = 5.0f;
+        float m_veryFrames = 8.0f;
+        // Replay press times (in seconds) for quick matching
+        std::vector<float> m_replayPressTimes;
+        std::vector<float> m_replayReleaseTimes;
     };
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+
+        log::info("[IsMyModUpdated] 1"); // increment this when making changes to force users to update their local replay JSON files (if needed)
 
         bool setting = Mod::get()->getSettingValue<bool>("show-inputs-ingame");
         log::info("[InputCircles] Setting show-inputs-ingame = {}", setting);
@@ -736,75 +800,572 @@ class $modify(MyPlayLayer, PlayLayer) {
         this->addChild(indicator, 10001);
         fields->m_indicator = indicator;
 
+        // ========== UR Bar Setup ==========
+        // Pre-compute replay press/release times in seconds for matching
+        for (auto& press : fields->m_presses) {
+            fields->m_replayPressTimes.push_back(
+                static_cast<float>(press.framePress) / static_cast<float>(fields->m_framerate));
+            fields->m_replayReleaseTimes.push_back(
+                static_cast<float>(press.frameRelease) / static_cast<float>(fields->m_framerate));
+        }
+        fields->m_replayPressUsed.resize(fields->m_presses.size(), false);
+        fields->m_replayReleaseUsed.resize(fields->m_presses.size(), false);
+
+        // Read UR bar settings
+        fields->m_urBarWidth = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-bar-width"));
+        fields->m_urBarHeight = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-bar-height"));
+        fields->m_goodFrames = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-good-frames"));
+        fields->m_earlyLateFrames = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-earlylate-frames"));
+        fields->m_veryFrames = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-very-frames"));
+
+        float urW = fields->m_urBarWidth;
+        float urH = fields->m_urBarHeight;
+        float veryF = fields->m_veryFrames;
+        float elF = fields->m_earlyLateFrames;
+        float gF = fields->m_goodFrames;
+        float totalFrameRange = veryF * 2.0f; // -veryF to +veryF
+        float pxPerFrame = urW / totalFrameRange;
+
+        // UR bar container (centered horizontally near top of screen)
+        auto urBar = CCNode::create();
+        urBar->setContentSize({urW, urH});
+        urBar->setAnchorPoint({0.5f, 0.5f});
+        float urX = winSize.width / 2.0f;
+        float urY = winSize.height - 30.0f;
+        urBar->setPosition({urX, urY});
+        urBar->setID("ur-bar"_spr);
+
+        // Zone colors
+        ccColor4B cVeryEarly = ccc4(255, 60, 60, 200);   // red
+        ccColor4B cEarly     = ccc4(255, 200, 50, 200);   // yellow
+        ccColor4B cGood      = ccc4(50, 255, 80, 200);    // green
+        ccColor4B cLate      = ccc4(255, 200, 50, 200);   // yellow
+        ccColor4B cVeryLate  = ccc4(255, 60, 60, 200);    // red
+
+        // Zone widths in pixels
+        float wVeryEarly = (veryF - elF) * pxPerFrame;
+        float wEarly     = (elF - gF) * pxPerFrame;
+        float wGood      = gF * 2.0f * pxPerFrame;
+        float wLate      = (elF - gF) * pxPerFrame;
+        float wVeryLate  = (veryF - elF) * pxPerFrame;
+
+        // Background
+        auto urBg = CCLayerColor::create(ccc4(0, 0, 0, 160), urW, urH);
+        urBg->setPosition({0.0f, 0.0f});
+        urBar->addChild(urBg, 0);
+
+        // Zones from left to right
+        float xOff = 0.0f;
+        auto zVE = CCLayerColor::create(cVeryEarly, wVeryEarly, urH);
+        zVE->setPosition({xOff, 0.0f}); urBar->addChild(zVE, 1); xOff += wVeryEarly;
+        auto zE = CCLayerColor::create(cEarly, wEarly, urH);
+        zE->setPosition({xOff, 0.0f}); urBar->addChild(zE, 1); xOff += wEarly;
+        auto zG = CCLayerColor::create(cGood, wGood, urH);
+        zG->setPosition({xOff, 0.0f}); urBar->addChild(zG, 1); xOff += wGood;
+        auto zL = CCLayerColor::create(cLate, wLate, urH);
+        zL->setPosition({xOff, 0.0f}); urBar->addChild(zL, 1); xOff += wLate;
+        auto zVL = CCLayerColor::create(cVeryLate, wVeryLate, urH);
+        zVL->setPosition({xOff, 0.0f}); urBar->addChild(zVL, 1);
+
+        // Center line (perfect timing marker)
+        auto centerLine = CCLayerColor::create(ccc4(255, 255, 255, 255), 2.0f, urH + 4.0f);
+        centerLine->setPosition({urW / 2.0f - 1.0f, -2.0f});
+        urBar->addChild(centerLine, 3);
+
+        this->addChild(urBar, 10002);
+        fields->m_urBar = urBar;
+
+        // Accuracy label (top-right corner)
+        auto accLabel = CCLabelBMFont::create("100.00%", "bigFont.fnt");
+        accLabel->setScale(0.35f);
+        accLabel->setAnchorPoint({1.0f, 1.0f});
+        accLabel->setPosition({winSize.width - 10.0f, winSize.height - 10.0f});
+        accLabel->setColor(ccc3(255, 255, 255));
+        accLabel->setOpacity(220);
+        accLabel->setID("accuracy-label"_spr);
+        this->addChild(accLabel, 10002);
+        fields->m_accuracyLabel = accLabel;
+
+        // Activate rhythm input capture
+        s_playerInputs.clear();
+        s_rhythmActive = true;
+        fields->m_processedInputIdx = 0;
+
+        log::info("[UR] Rhythm mode active. UR bar: {}x{} goodF={} elF={} veryF={}", 
+            urW, urH, gF, elF, veryF);
+
         return true;
     }
 
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
+        // Debug counter – log every ~120 frames. BEFORE any early return!
+        static int s_dbg = 0;
+        s_dbg++;
+        bool dbg = (s_dbg % 120 == 1);
+
+        if (dbg) log::info("[DBG] === postUpdate CALLED === frame={}", s_dbg);
+
         auto fields = m_fields.self();
-        if (!fields->m_active || !fields->m_circleLayer) return;
+        if (!fields->m_active || !fields->m_circleLayer) {
+            if (dbg) log::info("[DBG] EARLY EXIT: active={} circleLayer={}",
+                fields->m_active, fields->m_circleLayer ? "yes" : "NULL");
+            return;
+        }
 
         auto player = m_player1;
-        if (!player) return;
+        if (!player) {
+            if (dbg) log::info("[DBG] EARLY EXIT: player is NULL");
+            return;
+        }
 
-        // Current time and frame
+        if (dbg) log::info("[DBG] postUpdate ACTIVE frame={}", s_dbg);
+
         float playerX = player->getPositionX();
+        float currentTime = static_cast<float>(m_timePlayed);
 
-        // Settings values
+        if (dbg) log::info("[DBG] playerX={:.2f} currentTime={:.4f} historySize={}", playerX, currentTime, fields->m_posHistory.size());
+
+        // Record player position history for accurate world-X interpolation
+        // This correctly handles speed changes from speed portals
+        if (currentTime > 0.0f) {
+            if (!fields->m_posHistory.empty() && currentTime < fields->m_posHistory.back().first) {
+                // Time went backwards (reset/respawn), trim future entries
+                auto it = std::lower_bound(fields->m_posHistory.begin(), fields->m_posHistory.end(), currentTime,
+                    [](const std::pair<float,float>& p, float t) { return p.first < t; });
+                fields->m_posHistory.erase(it, fields->m_posHistory.end());
+            }
+            if (fields->m_posHistory.empty() || currentTime > fields->m_posHistory.back().first + 0.001f) {
+                fields->m_posHistory.push_back({currentTime, playerX});
+            }
+        }
+
         float bottomY = static_cast<float>(fields->m_barY);
         float barH = static_cast<float>(fields->m_barHeight);
 
-        // Once we have real speed data, place ALL dots at once
-        if (!fields->m_allPlaced && m_timePlayed > 0.1 && playerX > 10.0f) {
-            // Estimate speed from current movement
-            float speed = playerX / static_cast<float>(m_timePlayed);
-
-            log::info("[InputCircles] Placing all {} dots at once, speed={:.1f} units/sec", 
-                fields->m_presses.size(), speed);
-
-            for (auto& press : fields->m_presses) {
-                float worldXStart = static_cast<float>(press.framePress) / static_cast<float>(fields->m_framerate) * speed;
-                float worldXEnd = static_cast<float>(press.frameRelease) / static_cast<float>(fields->m_framerate) * speed;
-
-                ccColor4B color = (press.player == 1)
-                    ? fields->m_p1Color
-                    : fields->m_p2Color;
-
+        // Create dot nodes once (positions are computed below each frame)
+        if (!fields->m_dotsCreated && !fields->m_presses.empty()) {
+            for (size_t i = 0; i < fields->m_presses.size(); i++) {
+                auto& press = fields->m_presses[i];
+                ccColor4B color = (press.player == 1) ? fields->m_p1Color : fields->m_p2Color;
                 auto dot = CCLayerColor::create(color, 1.0f, barH);
                 dot->setAnchorPoint({0.0f, 0.5f});
                 dot->ignoreAnchorPointForPosition(false);
+                dot->setVisible(false);
                 fields->m_circleLayer->addChild(dot);
-
-                fields->m_dots.push_back({worldXStart, worldXEnd, dot});
+                fields->m_dots.push_back({i, dot});
             }
-            fields->m_allPlaced = true;
+            fields->m_dotsCreated = true;
+            log::info("[InputCircles] Created {} dot nodes", fields->m_presses.size());
         }
 
-        // Update ALL dot positions every frame to follow the level scroll
-        auto objLayerPos = m_objectLayer->getPosition();
-        float objScale = m_objectLayer->getScale();
+        // Interpolation helper: map a time value to a world X using recorded history.
+        // Uses binary search + linear interpolation between samples, and extrapolates
+        // at the edges using the local speed derivative.
+        auto& history = fields->m_posHistory;
+        auto interpolateWorldX = [&history](float time) -> std::optional<float> {
+            if (history.empty()) return std::nullopt;
+            if (time <= history.front().first) {
+                // Extrapolate backward from earliest data
+                if (history.size() >= 2) {
+                    auto& a = history[0];
+                    auto& b = history[1];
+                    float dt = b.first - a.first;
+                    if (dt > 0.0001f) {
+                        float speed = (b.second - a.second) / dt;
+                        return a.second + speed * (time - a.first);
+                    }
+                }
+                return history.front().second;
+            }
+            if (time >= history.back().first) {
+                // Extrapolate forward from latest data
+                if (history.size() >= 2) {
+                    auto& a = history[history.size() - 2];
+                    auto& b = history[history.size() - 1];
+                    float dt = b.first - a.first;
+                    if (dt > 0.0001f) {
+                        float speed = (b.second - a.second) / dt;
+                        return b.second + speed * (time - b.first);
+                    }
+                }
+                return history.back().second;
+            }
+            // Binary search for the right interval
+            auto it = std::lower_bound(history.begin(), history.end(), time,
+                [](const std::pair<float,float>& p, float t) { return p.first < t; });
+            if (it == history.begin()) return it->second;
+            auto prev = std::prev(it);
+            float t0 = prev->first, x0 = prev->second;
+            float t1 = it->first, x1 = it->second;
+            float frac = (time - t0) / (t1 - t0);
+            return x0 + frac * (x1 - x0);
+        };
 
-        for (auto& [worldXStart, worldXEnd, dot] : fields->m_dots) {
-            float screenXStart = worldXStart * objScale + objLayerPos.x;
-            float screenXEnd = worldXEnd * objScale + objLayerPos.x;
-            float screenWidth = std::max(screenXEnd - screenXStart, 2.0f);
-            dot->setPosition({screenXStart, bottomY});
+        // Update all dot positions using interpolated world coordinates.
+        // Use the player's actual screen position as the anchor point,
+        // and compute a pixels-per-world-unit ratio from the object layer.
+        // This correctly handles mirror portals because convertToWorldSpace
+        // goes through the full transform chain (including negative scaleX).
+        double framerate = fields->m_framerate;
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+
+        // Get player's ACTUAL screen position (we know this is always correct)
+        auto playerParent = player->getParent();
+        if (dbg) {
+            log::info("[DBG] player parent={} objectLayer={}",
+                playerParent ? "yes" : "NULL",
+                m_objectLayer ? "yes" : "NULL");
+            if (playerParent) {
+                log::info("[DBG] playerParent pos=({:.2f},{:.2f}) scale=({:.4f},{:.4f})",
+                    playerParent->getPositionX(), playerParent->getPositionY(),
+                    playerParent->getScaleX(), playerParent->getScaleY());
+            }
+            if (m_objectLayer) {
+                log::info("[DBG] objectLayer pos=({:.2f},{:.2f}) scale=({:.4f},{:.4f})",
+                    m_objectLayer->getPositionX(), m_objectLayer->getPositionY(),
+                    m_objectLayer->getScaleX(), m_objectLayer->getScaleY());
+                // Walk up parent chain
+                auto p = m_objectLayer->getParent();
+                int depth = 0;
+                while (p && depth < 5) {
+                    log::info("[DBG]   objectLayer parent[{}] pos=({:.2f},{:.2f}) scale=({:.4f},{:.4f})",
+                        depth, p->getPositionX(), p->getPositionY(),
+                        p->getScaleX(), p->getScaleY());
+                    p = p->getParent();
+                    depth++;
+                }
+            }
+        }
+
+        CCPoint playerScreenPos = playerParent
+            ? playerParent->convertToWorldSpace(player->getPosition())
+            : ccp(playerX, player->getPositionY());
+        float playerScreenX = playerScreenPos.x;
+
+        // Compute pixels-per-world-unit from two reference points on the object layer.
+        // After a mirror portal, this value becomes NEGATIVE, which correctly flips dot positions.
+        CCPoint ref0 = m_objectLayer->convertToWorldSpace(ccp(0.0f, 0.0f));
+        CCPoint ref1 = m_objectLayer->convertToWorldSpace(ccp(1000.0f, 0.0f));
+        float pixelsPerUnit = (ref1.x - ref0.x) / 1000.0f;
+
+        if (dbg) {
+            log::info("[DBG] playerScreenX={:.2f} ref0=({:.2f},{:.2f}) ref1=({:.2f},{:.2f}) ppu={:.6f}",
+                playerScreenX, ref0.x, ref0.y, ref1.x, ref1.y, pixelsPerUnit);
+        }
+
+        // Fallback: if scale is zero somehow, skip rendering
+        if (std::abs(pixelsPerUnit) < 0.0001f) {
+            if (dbg) log::info("[DBG] pixelsPerUnit too small, SKIPPING");
+            return;
+        }
+
+        for (auto& [pressIdx, dot] : fields->m_dots) {
+            auto& press = fields->m_presses[pressIdx];
+            float timeStart = static_cast<float>(press.framePress) / static_cast<float>(framerate);
+            float timeEnd = static_cast<float>(press.frameRelease) / static_cast<float>(framerate);
+
+            auto wxStart = interpolateWorldX(timeStart);
+            auto wxEnd = interpolateWorldX(timeEnd);
+            if (!wxStart.has_value() || !wxEnd.has_value()) {
+                dot->setVisible(false);
+                continue;
+            }
+
+            // Find the TRUE min/max world X across the entire press duration.
+            // This handles cases where the player reverses direction mid-press.
+            float minWX = std::min(wxStart.value(), wxEnd.value());
+            float maxWX = std::max(wxStart.value(), wxEnd.value());
+
+            float tMin = std::min(timeStart, timeEnd);
+            float tMax = std::max(timeStart, timeEnd);
+            auto itBegin = std::lower_bound(history.begin(), history.end(), tMin,
+                [](const std::pair<float,float>& p, float t) { return p.first < t; });
+            auto itEnd = std::upper_bound(history.begin(), history.end(), tMax,
+                [](float t, const std::pair<float,float>& p) { return t < p.first; });
+            for (auto it = itBegin; it != itEnd; ++it) {
+                minWX = std::min(minWX, it->second);
+                maxWX = std::max(maxWX, it->second);
+            }
+
+            // Convert to screen space relative to the player's known screen position
+            float sA = playerScreenX + (minWX - playerX) * pixelsPerUnit;
+            float sB = playerScreenX + (maxWX - playerX) * pixelsPerUnit;
+            float screenLeft = std::min(sA, sB);
+            float screenRight = std::max(sA, sB);
+
+            // Skip dots that are off screen
+            if (screenRight < -50.0f || screenLeft > winSize.width + 50.0f) {
+                dot->setVisible(false);
+                continue;
+            }
+
+            float screenWidth = std::max(screenRight - screenLeft, 2.0f);
+            dot->setPosition({screenLeft, bottomY});
             dot->setContentSize({screenWidth, barH});
+            dot->setVisible(true);
+
+            // Log first 3 visible dots
+            if (dbg && pressIdx < 3) {
+                log::info("[DBG] dot[{}] minWX={:.2f} maxWX={:.2f} sA={:.2f} sB={:.2f} screenLeft={:.2f} screenW={:.2f}",
+                    pressIdx, minWX, maxWX, sA, sB, screenLeft, screenWidth);
+            }
         }
 
         // Update indicator position to follow the player's screen X
         if (fields->m_indicator) {
-            float screenPlayerX = playerX * objScale + objLayerPos.x;
-            fields->m_indicator->setPosition({screenPlayerX, bottomY});
+            fields->m_indicator->setPosition({playerScreenX, bottomY});
+            if (dbg) log::info("[DBG] indicator pos=({:.2f},{:.2f})", playerScreenX, bottomY);
         }
+
+        // ========== UR Bar: Process player inputs ==========
+        if (fields->m_urBar && !fields->m_replayPressTimes.empty()) {
+            float fps = static_cast<float>(fields->m_framerate);
+            float veryF = fields->m_veryFrames;
+            float elF = fields->m_earlyLateFrames;
+            float gF = fields->m_goodFrames;
+            float urW = fields->m_urBarWidth;
+            float urH = fields->m_urBarHeight;
+            float pxPerFrame = urW / (veryF * 2.0f);
+
+            // Process new player inputs since last frame
+            while (fields->m_processedInputIdx < s_playerInputs.size()) {
+                auto& [inputTime, isPress] = s_playerInputs[fields->m_processedInputIdx];
+                fields->m_processedInputIdx++;
+
+                // Find closest unmatched replay event
+                auto& replayTimes = isPress ? fields->m_replayPressTimes : fields->m_replayReleaseTimes;
+                auto& usedFlags = isPress ? fields->m_replayPressUsed : fields->m_replayReleaseUsed;
+
+                int bestIdx = -1;
+                float bestDist = 999999.0f;
+                for (size_t i = 0; i < replayTimes.size(); i++) {
+                    if (usedFlags[i]) continue;
+                    float dist = std::abs(inputTime - replayTimes[i]);
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        bestIdx = static_cast<int>(i);
+                    }
+                }
+
+                if (bestIdx < 0) continue; // no unmatched replay event
+
+                float offsetSec = inputTime - replayTimes[bestIdx];
+                float offsetFrames = offsetSec * fps;
+
+                // Determine judgment
+                Judgment j;
+                float absOffset = std::abs(offsetFrames);
+                if (absOffset <= gF) {
+                    j = Judgment::Good;
+                } else if (absOffset <= elF) {
+                    j = (offsetFrames < 0) ? Judgment::Early : Judgment::Late;
+                } else if (absOffset <= veryF) {
+                    j = (offsetFrames < 0) ? Judgment::VeryEarly : Judgment::VeryLate;
+                } else {
+                    j = Judgment::Miss;
+                }
+
+                // Mark as used (only if not a miss)
+                if (j != Judgment::Miss) {
+                    usedFlags[bestIdx] = true;
+                }
+
+                // Record judgment
+                fields->m_judgmentCounts[static_cast<int>(j)]++;
+                fields->m_totalJudgments++;
+
+                // Compute accuracy contribution
+                float accValue = 0.0f;
+                switch (j) {
+                    case Judgment::Good:      accValue = 100.0f; break;
+                    case Judgment::Early:
+                    case Judgment::Late:      accValue = 33.33f; break;
+                    case Judgment::VeryEarly:
+                    case Judgment::VeryLate:  accValue = 16.67f; break;
+                    case Judgment::Miss:      accValue = 0.0f; break;
+                }
+                fields->m_totalAccuracy += accValue;
+
+                // Create tick mark on UR bar
+                float clampedOffset = std::max(-veryF, std::min(veryF, offsetFrames));
+                float tickX = (urW / 2.0f) + clampedOffset * pxPerFrame;
+                float tickW = 2.0f;
+                float tickH = urH + 6.0f;
+
+                // Tick color based on judgment
+                ccColor4B tickColor;
+                switch (j) {
+                    case Judgment::Good:      tickColor = ccc4(255, 255, 255, 255); break;
+                    case Judgment::Early:
+                    case Judgment::Late:      tickColor = ccc4(255, 220, 100, 255); break;
+                    case Judgment::VeryEarly:
+                    case Judgment::VeryLate:  tickColor = ccc4(255, 100, 100, 255); break;
+                    case Judgment::Miss:      tickColor = ccc4(180, 0, 0, 255); break;
+                }
+
+                auto tick = CCLayerColor::create(tickColor, tickW, tickH);
+                tick->setPosition({tickX - tickW / 2.0f, -3.0f});
+                fields->m_urBar->addChild(tick, 2);
+                fields->m_urTickNodes.push_back(tick);
+                fields->m_urTicks.push_back({offsetFrames, j, currentTime});
+
+                if (dbg) {
+                    log::info("[UR] input t={:.4f} replay={:.4f} offset={:.2f}f j={} acc={:.2f}%",
+                        inputTime, replayTimes[bestIdx], offsetFrames, static_cast<int>(j), accValue);
+                }
+            }
+
+            // Fade old ticks (older than 3 seconds)
+            for (size_t i = 0; i < fields->m_urTicks.size(); i++) {
+                float age = currentTime - fields->m_urTicks[i].timeCreated;
+                if (age > 3.0f && i < fields->m_urTickNodes.size()) {
+                    float opacity = std::max(0.0f, 1.0f - (age - 3.0f) / 2.0f);
+                    static_cast<CCLayerColor*>(fields->m_urTickNodes[i])->setOpacity(static_cast<GLubyte>(opacity * 255));
+                }
+            }
+
+            // Update accuracy label
+            if (fields->m_accuracyLabel && fields->m_totalJudgments > 0) {
+                float avgAcc = fields->m_totalAccuracy / static_cast<float>(fields->m_totalJudgments);
+                auto accText = fmt::format("{:.2f}%", avgAcc);
+                fields->m_accuracyLabel->setString(accText.c_str());
+
+                // Color based on accuracy
+                if (avgAcc >= 90.0f)      fields->m_accuracyLabel->setColor(ccc3(50, 255, 80));
+                else if (avgAcc >= 60.0f) fields->m_accuracyLabel->setColor(ccc3(255, 200, 50));
+                else                      fields->m_accuracyLabel->setColor(ccc3(255, 60, 60));
+            }
+        }
+    }
+
+    void levelComplete() {
+        PlayLayer::levelComplete();
+
+        auto fields = m_fields.self();
+        if (!fields->m_active) return;
+
+        s_rhythmActive = false;
+
+        // Log final stats
+        float finalAcc = (fields->m_totalJudgments > 0)
+            ? fields->m_totalAccuracy / static_cast<float>(fields->m_totalJudgments)
+            : 0.0f;
+        log::info("[UR] Level complete! Accuracy: {:.2f}% ({} judgments)", finalAcc, fields->m_totalJudgments);
+        log::info("[UR] Good:{} Early:{} Late:{} VeryEarly:{} VeryLate:{} Miss:{}",
+            fields->m_judgmentCounts[static_cast<int>(Judgment::Good)],
+            fields->m_judgmentCounts[static_cast<int>(Judgment::Early)],
+            fields->m_judgmentCounts[static_cast<int>(Judgment::Late)],
+            fields->m_judgmentCounts[static_cast<int>(Judgment::VeryEarly)],
+            fields->m_judgmentCounts[static_cast<int>(Judgment::VeryLate)],
+            fields->m_judgmentCounts[static_cast<int>(Judgment::Miss)]);
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
 
-        // Don't clear dots — they use world coordinates and are
-        // repositioned every frame via m_objectLayer transform,
-        // so they stay aligned after practice-mode respawns.
+        auto fields = m_fields.self();
+        if (fields->m_active && !fields->m_posHistory.empty()) {
+            // Trim history entries past the respawn time so we
+            // re-record accurate positions from the checkpoint onward
+            float respawnTime = static_cast<float>(m_timePlayed);
+            auto it = std::lower_bound(fields->m_posHistory.begin(), fields->m_posHistory.end(), respawnTime,
+                [](const std::pair<float,float>& p, float t) { return p.first < t; });
+            fields->m_posHistory.erase(it, fields->m_posHistory.end());
+        }
+
+        // Reset UR bar state
+        if (fields->m_active && fields->m_urBar) {
+            // Remove old tick nodes
+            for (auto* tick : fields->m_urTickNodes) {
+                if (tick) tick->removeFromParent();
+            }
+            fields->m_urTickNodes.clear();
+            fields->m_urTicks.clear();
+            fields->m_processedInputIdx = 0;
+
+            // Reset match tracking
+            std::fill(fields->m_replayPressUsed.begin(), fields->m_replayPressUsed.end(), false);
+            std::fill(fields->m_replayReleaseUsed.begin(), fields->m_replayReleaseUsed.end(), false);
+
+            // Reset accuracy
+            for (int i = 0; i < 6; i++) fields->m_judgmentCounts[i] = 0;
+            fields->m_totalAccuracy = 0.0f;
+            fields->m_totalJudgments = 0;
+
+            if (fields->m_accuracyLabel) {
+                fields->m_accuracyLabel->setString("0.00%");
+                fields->m_accuracyLabel->setColor(ccc3(255, 255, 255));
+            }
+
+            // Clear player inputs
+            s_playerInputs.clear();
+            s_rhythmActive = true;
+        }
+    }
+
+    void onQuit() {
+        s_rhythmActive = false;
+        s_playerInputs.clear();
+        PlayLayer::onQuit();
+    }
+};
+
+// ============================================================
+// EndLevelLayer – show rhythm game results
+// ============================================================
+class $modify(MyEndLevel, EndLevelLayer) {
+    void customSetup() {
+        EndLevelLayer::customSetup();
+
+        auto pl = PlayLayer::get();
+        if (!pl) return;
+
+        auto fields = static_cast<MyPlayLayer*>(pl)->m_fields.self();
+        if (!fields->m_active || fields->m_totalJudgments == 0) return;
+
+        float finalAcc = fields->m_totalAccuracy / static_cast<float>(fields->m_totalJudgments);
+        int good = fields->m_judgmentCounts[static_cast<int>(Judgment::Good)];
+        int early = fields->m_judgmentCounts[static_cast<int>(Judgment::Early)];
+        int late = fields->m_judgmentCounts[static_cast<int>(Judgment::Late)];
+        int veryEarly = fields->m_judgmentCounts[static_cast<int>(Judgment::VeryEarly)];
+        int veryLate = fields->m_judgmentCounts[static_cast<int>(Judgment::VeryLate)];
+        int miss = fields->m_judgmentCounts[static_cast<int>(Judgment::Miss)];
+
+        // Build results string
+        auto resultStr = fmt::format(
+            "Accuracy: {:.2f}%\n"
+            "Good: {}  Early: {}  Late: {}\n"
+            "V.Early: {}  V.Late: {}  Miss: {}",
+            finalAcc, good, early, late, veryEarly, veryLate, miss);
+
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+
+        // Background panel for results
+        auto bg = CCLayerColor::create(ccc4(0, 0, 0, 160), 280.0f, 70.0f);
+        bg->setPosition({winSize.width / 2.0f - 140.0f, 10.0f});
+        bg->setZOrder(100);
+        this->addChild(bg);
+
+        // Accuracy label (big)
+        auto accLabel = CCLabelBMFont::create(
+            fmt::format("Rhythm: {:.2f}%", finalAcc).c_str(),
+            "bigFont.fnt");
+        accLabel->setScale(0.5f);
+        accLabel->setPosition({winSize.width / 2.0f, 65.0f});
+        accLabel->setZOrder(101);
+        if (finalAcc >= 90.0f)      accLabel->setColor(ccc3(50, 255, 80));
+        else if (finalAcc >= 60.0f) accLabel->setColor(ccc3(255, 200, 50));
+        else                        accLabel->setColor(ccc3(255, 60, 60));
+        this->addChild(accLabel);
+
+        // Breakdown label
+        auto breakLabel = CCLabelBMFont::create(resultStr.c_str(), "chatFont.fnt");
+        breakLabel->setScale(0.6f);
+        breakLabel->setPosition({winSize.width / 2.0f, 35.0f});
+        breakLabel->setZOrder(101);
+        breakLabel->setColor(ccc3(220, 220, 220));
+        this->addChild(breakLabel);
     }
 };
