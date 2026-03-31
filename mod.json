@@ -55,6 +55,12 @@
 			"type": "rgba",
 			"default": [255, 255, 255, 220]
 		},
+		"indicator-style-line": {
+			"name": "Indicator Style: Line",
+			"description": "If enabled, the indicator is rendered as a vertical line. If disabled, it is rendered as a square.",
+			"type": "bool",
+			"default": false
+		},
 		"background-color": {
 			"name": "Background Color",
 			"description": "Color for the background strip behind the input bars.",
