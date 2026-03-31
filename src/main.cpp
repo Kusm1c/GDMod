@@ -1,13 +1,19 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/MenuLayer.hpp>
+#include <Geode/modify/LevelInfoLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/EndLevelLayer.hpp>
+#include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/utils/file.hpp>
 #include <Geode/utils/web.hpp>
 #include <Geode/loader/SettingV3.hpp>
 #include <optional>
 #include <map>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <chrono>
 
 #ifdef GEODE_IS_WINDOWS
 #include <commdlg.h>
@@ -15,6 +21,54 @@
 #endif
 
 using namespace geode::prelude;
+
+// ============================================================
+// Replay Player State
+// ============================================================
+
+// Struct to hold a press input's frame number
+struct ReplayPress {
+    uint64_t framePress;
+    uint64_t frameRelease;
+    int player; // 1 or 2
+};
+
+// Result of loading a matching replay: presses + framerate
+struct ReplayLoadResult {
+    std::vector<ReplayPress> presses;
+    double framerate = 240.0;
+};
+
+struct ReplayPlayerState {
+    bool isActive = false;
+    std::optional<ReplayLoadResult> replay;
+    float playbackSpeed = 1.0f;
+    bool isPaused = false;
+    float pauseTime = 0.0f; // When paused, the frozen time
+    float inputIndex = 0.0f; // Current position in replay inputs
+};
+
+static ReplayPlayerState g_replayPlayer;
+
+// ============================================================
+// Debug File Logging
+// ============================================================
+static const char* DEBUG_LOG_FILE = "GDMod_audio_debug.log";
+
+static void debugLogToFile(const std::string& msg) {
+    try {
+        std::ofstream file(DEBUG_LOG_FILE, std::ios::app);
+        if (file.is_open()) {
+            auto now = std::chrono::system_clock::now();
+            auto time = std::chrono::system_clock::to_time_t(now);
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+            char timestr[64];
+            std::strftime(timestr, sizeof(timestr), "%H:%M:%S", std::gmtime(&time));
+            file << fmt::format("{}.{:03d} {}\n", timestr, ms.count(), msg);
+            file.flush();
+        }
+    } catch (...) {}
+}
 
 // ============================================================
 // Supabase Configuration
@@ -29,6 +83,9 @@ static web::WebRequest supabaseRequest() {
         .header("Authorization", fmt::format("Bearer {}", SUPABASE_ANON_KEY))
         .header("Content-Type", "application/json");
 }
+// Forward declaration: implemented later
+static std::optional<ReplayLoadResult> loadMatchingReplay(int levelId);
+
 
 // ============================================================
 // GDR2 Binary Reader
@@ -498,21 +555,69 @@ class $modify(MyMenuLayer, MenuLayer) {
 };
 
 // ============================================================
+// LevelInfoLayer Hook – Add Watch Replay Button
+// ============================================================
+
+class $modify(MyLevelInfoLayer, LevelInfoLayer) {
+    bool init(GJGameLevel* level, bool selectLevel) {
+        if (!LevelInfoLayer::init(level, selectLevel)) return false;
+
+        // Add Watch Replay button
+        auto btnSprite = CCSprite::createWithSpriteFrameName("GJ_plainBtn_001.png");
+        auto label = CCLabelBMFont::create("Watch\nReplay", "bigFont.fnt");
+        label->setScale(0.3f);
+        label->setPosition(btnSprite->getContentSize() / 2);
+        btnSprite->addChild(label);
+
+        auto watchButton = CCMenuItemSpriteExtra::create(
+            btnSprite,
+            this,
+            menu_selector(MyLevelInfoLayer::onWatchReplay)
+        );
+        watchButton->setID("watch-replay-btn"_spr);
+
+        // Reliable placement independent of internal LevelInfoLayer menu IDs.
+        auto replayMenu = CCMenu::create();
+        replayMenu->setID("watch-replay-menu"_spr);
+        replayMenu->setPosition(CCPointZero);
+        this->addChild(replayMenu, 200);
+
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+        watchButton->setPosition({winSize.width - 64.0f, 86.0f});
+        replayMenu->addChild(watchButton);
+
+        return true;
+    }
+
+    void onWatchReplay(CCObject*) {
+        auto level = m_level;
+        if (!level) return;
+
+        // Set replay player state
+        int levelId = level->m_levelID;
+        auto replayResult = loadMatchingReplay(levelId);
+        if (!replayResult.has_value()) {
+            FLAlertLayer::create("Error", "No replay found for this level.", "OK")->show();
+            return;
+        }
+
+        g_replayPlayer.isActive = true;
+        g_replayPlayer.replay = std::move(replayResult.value());
+        g_replayPlayer.playbackSpeed = 1.0f;
+        g_replayPlayer.isPaused = false;
+        g_replayPlayer.pauseTime = 0.0f;
+        g_replayPlayer.inputIndex = 0.0f;
+
+        // Launch through LevelInfoLayer flow so scene transition is valid.
+        this->onPlay(nullptr);
+    }
+};
+
+// ============================================================
 // PlayLayer Hook – Show input circles in-game
 // ============================================================
 
 // Struct to hold a press input's frame number
-struct ReplayPress {
-    uint64_t framePress;
-    uint64_t frameRelease;
-    int player; // 1 or 2
-};
-
-// Result of loading a matching replay: presses + framerate
-struct ReplayLoadResult {
-    std::vector<ReplayPress> presses;
-    double framerate = 240.0;
-};
 
 // Try to find a matching replay for the given level ID
 // 1. Search locally by filename pattern: *-{levelId}.json
@@ -523,20 +628,24 @@ static std::optional<ReplayLoadResult> loadMatchingReplay(int levelId) {
     if (std::filesystem::exists(replaysDir)) {
         auto suffix = fmt::format("-{}.json", levelId);
         std::filesystem::path matchedFile;
-        int matchCount = 0;
+        std::filesystem::file_time_type matchedTime{};
+        bool hasMatch = false;
 
         for (auto& entry : std::filesystem::directory_iterator(replaysDir)) {
             if (!entry.is_regular_file()) continue;
             auto filename = entry.path().filename().string();
             if (filename.size() <= suffix.size()) continue;
             if (filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0) {
-                matchCount++;
-                matchedFile = entry.path();
-                if (matchCount > 1) break;
+                auto currentTime = entry.last_write_time();
+                if (!hasMatch || currentTime > matchedTime) {
+                    matchedFile = entry.path();
+                    matchedTime = currentTime;
+                    hasMatch = true;
+                }
             }
         }
 
-        if (matchCount == 1) {
+        if (hasMatch) {
             auto readRes = file::readString(matchedFile);
             if (readRes.isOk()) {
                 auto parseRes = matjson::parse(readRes.unwrap());
@@ -718,32 +827,379 @@ class $modify(MyPlayLayer, PlayLayer) {
         // Replay press times (in seconds) for quick matching
         std::vector<float> m_replayPressTimes;
         std::vector<float> m_replayReleaseTimes;
+
+        // ========== Replay Player Mode ==========
+        bool m_isReplayMode = false;
+        float m_replayCurrentTime = 0.0f;
+        size_t m_nextInputIdx = 0;
+        bool m_isPaused = false;
+        float m_pauseTime = 0.0f;
+        bool m_isSeeking = false;
+        float m_seekTargetTime = 0.0f;
+        float m_seekResumeSpeed = 1.0f;
+        bool m_replayHoldingJump = false;
+        CCNode* m_videoControlsLayer = nullptr;
+        CCLabelBMFont* m_timeLabel = nullptr;
+        CCLabelBMFont* m_speedLabel = nullptr;
+        CCLabelBMFont* m_playPauseLabel = nullptr;
+        float m_lastAudioSyncMs = -1.0f;
+        float m_lastAudioRate = 1.0f;
+        bool m_audioPausedByReplay = false;
+        int m_audioMusicID = -1;
+        bool m_musicBootstrapTried = false;
+        float m_nextMusicRetryAt = 0.0f;
+        float m_nextAudioDebugAt = 0.0f;
+        float m_lastAutoSeekAt = -1000.0f;
+        bool m_forcedPracticeMusic = false;
+        bool m_prevPracticeMusicSync = false;
+        int m_replayMusicInitialOffset = -1;  // Captured offset of music at first sync
     };
 
+    void applyReplayAudioSync(float levelTime, bool forceSeek) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode) return;
+
+        debugLogToFile(fmt::format("=== applyReplayAudioSync START levelTime={:.3f} forceSeek={} ===", levelTime, forceSeek));
+
+        auto* audio = FMODAudioEngine::sharedEngine();
+        if (!audio) {
+            debugLogToFile("ERROR: audio engine null");
+            return;
+        }
+        debugLogToFile(fmt::format("audio engine OK"));
+
+        auto isMusicSlotValid = [&](int musicID, int channelID) -> bool {
+            bool valid = (channelID != 0) || audio->isMusicPlaying(musicID);
+            debugLogToFile(fmt::format("  isMusicSlotValid musicID={} channelID={} playing={} -> {}", musicID, channelID, audio->isMusicPlaying(musicID), valid));
+            return valid;
+        };
+
+        auto resolveReplayMusic = [&]() -> int {
+            debugLogToFile(fmt::format("  resolveReplayMusic START m_audioMusicID={}", fields->m_audioMusicID));
+            if (fields->m_audioMusicID >= 0) {
+                int ch = audio->getMusicChannelID(fields->m_audioMusicID);
+                debugLogToFile(fmt::format("    checking cached musicID={} ch={}", fields->m_audioMusicID, ch));
+                if (isMusicSlotValid(fields->m_audioMusicID, ch) || fields->m_audioPausedByReplay) {
+                    debugLogToFile(fmt::format("    cached valid, returning ch={}", ch));
+                    return ch;
+                }
+            }
+
+            debugLogToFile("  scanning all music slots...");
+            for (int musicID = 0; musicID < 32; ++musicID) {
+                int ch = audio->getMusicChannelID(musicID);
+                debugLogToFile(fmt::format("    slot musicID={} ch={} valid={}", musicID, ch, isMusicSlotValid(musicID, ch)));
+                if (isMusicSlotValid(musicID, ch)) {
+                    fields->m_audioMusicID = musicID;
+                    debugLogToFile(fmt::format("    FOUND musicID={} ch={}", musicID, ch));
+                    return ch;
+                }
+            }
+
+            fields->m_audioMusicID = -1;
+            debugLogToFile("  NO MUSIC SLOT FOUND");
+            return -1;
+        };
+
+        int channelID = resolveReplayMusic();
+        debugLogToFile(fmt::format("resolved channelID={}", channelID));
+
+        // FIRST time we find the channel, capture the music's initial offset and resume
+        if (fields->m_audioMusicID >= 0 && channelID >= 0 && fields->m_lastAudioSyncMs < 0.0f) {
+            if (fields->m_replayMusicInitialOffset == -1) {
+                unsigned int musicMs = audio->getMusicTimeMS(channelID);
+                fields->m_replayMusicInitialOffset = static_cast<int>(musicMs);
+                debugLogToFile(fmt::format("CAPTURED initial music offset: {} ms", fields->m_replayMusicInitialOffset));
+            }
+            debugLogToFile("First audio sync: calling resumeAllMusic to start playback");
+            audio->resumeAllMusic();
+            log::info("[AUDIODBG] resumeAllMusic on first sync");
+        }
+
+        auto logAudioState = [&](const char* tag, float targetMs, unsigned int musicMs, float driftMs) {
+            if (levelTime < fields->m_nextAudioDebugAt) return;
+            fields->m_nextAudioDebugAt = levelTime + 0.5f;
+            bool playing = (fields->m_audioMusicID >= 0) ? audio->isMusicPlaying(fields->m_audioMusicID) : false;
+            debugLogToFile(fmt::format(
+                "[AUDIODBG] {} t={:.3f}s target={:.0f}ms music={} ch={} play={} paused={} seeking={} forceSeek={} speed={:.2f}x musicMs={} drift={:.1f}",
+                tag,
+                levelTime,
+                targetMs,
+                fields->m_audioMusicID,
+                channelID,
+                playing,
+                fields->m_isPaused,
+                fields->m_isSeeking,
+                forceSeek,
+                g_replayPlayer.playbackSpeed,
+                musicMs,
+                driftMs
+            ));
+        };
+
+        // Pause / resume music alongside replay state.
+        debugLogToFile(fmt::format("checking pause state: m_isPaused={} m_audioPausedByReplay={}", fields->m_isPaused, fields->m_audioPausedByReplay));
+        if (fields->m_isPaused) {
+            if (!fields->m_audioPausedByReplay && fields->m_audioMusicID >= 0) {
+                debugLogToFile(fmt::format("PAUSE: calling pauseMusic musicID={}", fields->m_audioMusicID));
+                audio->pauseMusic(fields->m_audioMusicID);
+                fields->m_audioPausedByReplay = true;
+                log::info("[AUDIODBG] pauseMusic music={} ch={}", fields->m_audioMusicID, channelID);
+            }
+            logAudioState("paused", std::max(0.0f, levelTime * 1000.0f), 0, 0.0f);
+            return;
+        }
+
+        if (fields->m_audioPausedByReplay) {
+            if (fields->m_audioMusicID >= 0) {
+                audio->resumeMusic(fields->m_audioMusicID);
+                log::info("[AUDIODBG] resumeMusic music={} ch={}", fields->m_audioMusicID, channelID);
+            }
+            fields->m_audioPausedByReplay = false;
+            channelID = resolveReplayMusic();
+        }
+
+        if (fields->m_audioMusicID < 0 || channelID < 0) {
+            logAudioState("no-music", std::max(0.0f, levelTime * 1000.0f), 0, 0.0f);
+            return;
+        }
+
+        float speed = std::clamp(g_replayPlayer.playbackSpeed, 0.25f, 4.0f);
+        if (std::abs(speed - fields->m_lastAudioRate) > 0.001f) {
+            // For MusicChannel target, FMOD API expects musicID, not raw channel ID.
+            audio->setChannelPitch(fields->m_audioMusicID, AudioTargetType::MusicChannel, speed);
+            fields->m_lastAudioRate = speed;
+        }
+
+        float targetMs = std::max(0.0f, levelTime * 1000.0f);
+        if (fields->m_replayMusicInitialOffset > 0) {
+            targetMs += fields->m_replayMusicInitialOffset;
+        }
+        unsigned int musicMs = audio->getMusicTimeMS(channelID);
+        float driftMs = std::abs(targetMs - static_cast<float>(musicMs));
+
+        // Auto-seek only on large sustained drift; aggressive correction near t=0 can mute by rewinding repeatedly.
+        bool allowAutoSeek = (
+            !forceSeek &&
+            !fields->m_isSeeking &&
+            !fields->m_isPaused &&
+            targetMs >= 250.0f &&
+            (levelTime - fields->m_lastAutoSeekAt) >= 1.0f &&
+            driftMs > 700.0f
+        );
+
+        if (forceSeek || fields->m_lastAudioSyncMs < 0.0f || allowAutoSeek) {
+            debugLogToFile(fmt::format(
+                "[AUDIODBG] setMusicTimeMS music={} ch={} target={:.0f}ms musicMs={} drift={:.1f} forceSeek={}",
+                fields->m_audioMusicID,
+                channelID,
+                targetMs,
+                musicMs,
+                driftMs,
+                forceSeek
+            ));
+            debugLogToFile(fmt::format("CALL: audio->setMusicTimeMS({}, true, {})", static_cast<unsigned int>(targetMs), fields->m_audioMusicID));
+            audio->setMusicTimeMS(static_cast<unsigned int>(targetMs), true, fields->m_audioMusicID);
+            debugLogToFile("CALL returned");
+            if (!forceSeek) {
+                fields->m_lastAutoSeekAt = levelTime;
+            }
+        }
+        fields->m_lastAudioSyncMs = targetMs;
+        logAudioState("tick", targetMs, musicMs, driftMs);
+        debugLogToFile(fmt::format("=== applyReplayAudioSync END ==="));
+    }
+
+    void ensureReplayMusicStarted(bool forceSeekToCurrent) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode) return;
+
+        debugLogToFile(fmt::format("=== ensureReplayMusicStarted START forceSeekToCurrent={} ===", forceSeekToCurrent));
+        log::info("[AUDIODBG] ensureReplayMusicStarted state-only t={:.3f}s practiceMusicSync={}", static_cast<float>(m_timePlayed), this->m_practiceMusicSync);
+
+        fields->m_audioMusicID = -1;
+        fields->m_musicBootstrapTried = false;
+        fields->m_audioPausedByReplay = false;
+        fields->m_lastAudioSyncMs = -1.0f;
+        fields->m_nextAudioDebugAt = 0.0f;
+        fields->m_lastAutoSeekAt = -1000.0f;
+        fields->m_replayMusicInitialOffset = -1;  // Reset offset capture
+        debugLogToFile("audio state reset");
+
+        if (forceSeekToCurrent) {
+            debugLogToFile("calling applyReplayAudioSync with forceSeekToCurrent");
+            applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
+        }
+        debugLogToFile(fmt::format("=== ensureReplayMusicStarted END ==="));
+    }
+
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        debugLogToFile("=== PlayLayer::init START ===");
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
+            debugLogToFile("PlayLayer::init FAILED");
+            return false;
+        }
+        debugLogToFile("PlayLayer::init succeeded");
+
+        auto fields = m_fields.self();
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+
+        // ========== Replay Player Mode Setup ==========
+        if (g_replayPlayer.isActive && g_replayPlayer.replay.has_value()) {
+            debugLogToFile("ENTERING REPLAY MODE");
+            fields->m_isReplayMode = true;
+            fields->m_replayCurrentTime = 0.0f;
+            fields->m_nextInputIdx = 0;
+            fields->m_isPaused = false;
+            fields->m_pauseTime = 0.0f;
+            fields->m_isSeeking = false;
+            fields->m_seekTargetTime = 0.0f;
+            fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
+            fields->m_replayHoldingJump = false;
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(g_replayPlayer.playbackSpeed);
+            fields->m_prevPracticeMusicSync = this->m_practiceMusicSync;
+            fields->m_forcedPracticeMusic = false;
+            this->togglePracticeMode(true);
+            ensureReplayMusicStarted(false);
+
+            // Setup video controls layer (bottom controls)
+            auto ctrlLayer = CCNode::create();
+            ctrlLayer->setContentSize({winSize.width, 60.0f});
+            ctrlLayer->setAnchorPoint({0.0f, 0.0f});
+            ctrlLayer->setPosition({0.0f, 0.0f});
+            ctrlLayer->setID("replay-controls"_spr);
+
+            // Background bar for controls
+            auto ctrlBg = CCLayerColor::create(ccc4(0, 0, 0, 180), winSize.width, 60.0f);
+            ctrlBg->setPosition({0.0f, 0.0f});
+            ctrlLayer->addChild(ctrlBg, 0);
+
+            // Time label (current time / total time)
+            auto timeLabel = CCLabelBMFont::create("00:00 / 00:00", "chatFont.fnt");
+            timeLabel->setScale(0.6f);
+            timeLabel->setAnchorPoint({0.0f, 0.5f});
+            timeLabel->setPosition({10.0f, 30.0f});
+            timeLabel->setColor(ccc3(255, 255, 255));
+            ctrlLayer->addChild(timeLabel, 1);
+            fields->m_timeLabel = timeLabel;
+
+            // Speed label (current playback speed)
+            auto speedLabel = CCLabelBMFont::create("1.00x", "chatFont.fnt");
+            speedLabel->setScale(0.6f);
+            speedLabel->setAnchorPoint({1.0f, 0.5f});
+            speedLabel->setPosition({winSize.width - 10.0f, 30.0f});
+            speedLabel->setColor(ccc3(255, 200, 100));
+            ctrlLayer->addChild(speedLabel, 1);
+            fields->m_speedLabel = speedLabel;
+
+            // Centered row layout for replay control buttons
+            float controlsY = 30.0f;
+            float buttonSpacing = 56.0f;
+            float centerX = winSize.width * 0.5f;
+
+            // Play/Pause button
+            auto playText = CCLabelBMFont::create("Pause", "bigFont.fnt");
+            playText->setScale(0.4f);
+            auto playBtn = CCMenuItemSpriteExtra::create(
+                playText,
+                this,
+                menu_selector(MyPlayLayer::onReplayPlayPause)
+            );
+            playBtn->setPosition({centerX - (2.0f * buttonSpacing), controlsY});
+            fields->m_playPauseLabel = playText;
+
+            // Speed down button (-0.25x)
+            auto speedDownText = CCLabelBMFont::create("-", "bigFont.fnt");
+            speedDownText->setScale(0.5f);
+            auto speedDownBtn = CCMenuItemSpriteExtra::create(
+                speedDownText,
+                this,
+                menu_selector(MyPlayLayer::onReplaySpeedDown)
+            );
+            speedDownBtn->setPosition({centerX - buttonSpacing, controlsY});
+
+            // Speed up button (+0.25x)
+            auto speedUpText = CCLabelBMFont::create("+", "bigFont.fnt");
+            speedUpText->setScale(0.5f);
+            auto speedUpBtn = CCMenuItemSpriteExtra::create(
+                speedUpText,
+                this,
+                menu_selector(MyPlayLayer::onReplaySpeedUp)
+            );
+            speedUpBtn->setPosition({centerX, controlsY});
+
+            // Rewind button
+            auto rewindText = CCLabelBMFont::create("<<", "bigFont.fnt");
+            rewindText->setScale(0.4f);
+            auto rewindBtn = CCMenuItemSpriteExtra::create(
+                rewindText,
+                this,
+                menu_selector(MyPlayLayer::onReplayRewind)
+            );
+            rewindBtn->setPosition({centerX + buttonSpacing, controlsY});
+
+            // Skip forward button (+5s)
+            auto skipForwardText = CCLabelBMFont::create(">>", "bigFont.fnt");
+            skipForwardText->setScale(0.4f);
+            auto skipForwardBtn = CCMenuItemSpriteExtra::create(
+                skipForwardText,
+                this,
+                menu_selector(MyPlayLayer::onReplaySkipForward)
+            );
+            skipForwardBtn->setPosition({centerX + (2.0f * buttonSpacing), controlsY});
+
+            auto controlMenu = CCMenu::create();
+            controlMenu->addChild(playBtn);
+            controlMenu->addChild(speedDownBtn);
+            controlMenu->addChild(speedUpBtn);
+            controlMenu->addChild(rewindBtn);
+            controlMenu->addChild(skipForwardBtn);
+            controlMenu->setPosition({0.0f, 0.0f});
+            controlMenu->setID("replay-menu"_spr);
+            ctrlLayer->addChild(controlMenu, 2);
+
+            this->addChild(ctrlLayer, 10100);
+            fields->m_videoControlsLayer = ctrlLayer;
+            fields->m_lastAudioSyncMs = -1.0f;
+            fields->m_lastAudioRate = g_replayPlayer.playbackSpeed;
+            fields->m_audioPausedByReplay = false;
+            fields->m_audioMusicID = -1;
+            fields->m_nextMusicRetryAt = 0.25f;
+            fields->m_nextAudioDebugAt = 0.0f;
+            fields->m_lastAutoSeekAt = -1000.0f;
+            fields->m_replayMusicInitialOffset = -1;
+
+            log::info("[ReplayPlayer] Initialized replay player mode with {} presses", fields->m_isReplayMode);
+        }
 
         log::info("[IsMyModUpdated] 1"); // increment this when making changes to force users to update their local replay JSON files (if needed)
 
         bool setting = Mod::get()->getSettingValue<bool>("show-inputs-ingame");
         log::info("[InputCircles] Setting show-inputs-ingame = {}", setting);
-        if (!setting) return true;
+        if (!setting && !fields->m_isReplayMode) return true;
 
         int levelId = level->m_levelID;
         log::info("[InputCircles] Level ID = {}", levelId);
 
-        auto loadResult = loadMatchingReplay(levelId);
-        if (!loadResult.has_value()) {
-            log::info("[InputCircles] No matching replay found for level {}", levelId);
-            return true;
+        // Load replay for visualization (input circles mode)
+        if (!fields->m_isReplayMode) {
+            auto loadResult = loadMatchingReplay(levelId);
+            if (!loadResult.has_value()) {
+                log::info("[InputCircles] No matching replay found for level {}", levelId);
+                return true;
+            }
+
+            log::info("[InputCircles] Loaded {} presses, framerate={}", loadResult->presses.size(), loadResult->framerate);
+
+            fields->m_presses = std::move(loadResult->presses);
+            fields->m_framerate = loadResult->framerate;
+            fields->m_active = true;
+        } else {
+            // In replay mode, use the replay from g_replayPlayer
+            if (g_replayPlayer.replay.has_value()) {
+                fields->m_framerate = g_replayPlayer.replay->framerate;
+            }
         }
-
-        log::info("[InputCircles] Loaded {} presses, framerate={}", loadResult->presses.size(), loadResult->framerate);
-
-        auto fields = m_fields.self();
-        fields->m_presses = std::move(loadResult->presses);
-        fields->m_framerate = loadResult->framerate;
-        fields->m_active = true;
 
         // Read settings
         fields->m_barHeight = Mod::get()->getSettingValue<int64_t>("bar-height");
@@ -760,8 +1216,8 @@ class $modify(MyPlayLayer, PlayLayer) {
         // Create background strip spanning the full screen width at bar height
         float initBarH = static_cast<float>(fields->m_barHeight);
         float initBottomY = static_cast<float>(fields->m_barY);
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
-        auto bgStrip = CCLayerColor::create(bgc, winSize.width, initBarH);
+        auto gameplayWinSize = CCDirector::sharedDirector()->getWinSize();
+        auto bgStrip = CCLayerColor::create(bgc, gameplayWinSize.width, initBarH);
         bgStrip->setPosition({0.0f, initBottomY - initBarH / 2.0f});
         bgStrip->setID("input-bg-strip"_spr);
         this->addChild(bgStrip, 9999);
@@ -900,6 +1356,109 @@ class $modify(MyPlayLayer, PlayLayer) {
     void postUpdate(float dt) {
         PlayLayer::postUpdate(dt);
 
+        auto fields = m_fields.self();
+
+        // ========== Replay Player Mode: Auto-inject inputs ==========
+        if (fields->m_isReplayMode && g_replayPlayer.replay.has_value()) {
+            auto& replay = g_replayPlayer.replay.value();
+            auto scheduler = CCDirector::sharedDirector()->getScheduler();
+            float targetScale = fields->m_isSeeking ? 4.0f : (fields->m_isPaused ? 0.0f : g_replayPlayer.playbackSpeed);
+            scheduler->setTimeScale(std::max(0.0f, targetScale));
+            debugLogToFile(fmt::format("postUpdate dt={} targetScale={} currentTimeScale={}", dt, targetScale, scheduler->getTimeScale()));
+
+            float currentTime = static_cast<float>(m_timePlayed);
+            fields->m_replayCurrentTime = currentTime;
+            if (fields->m_isPaused) {
+                fields->m_pauseTime = currentTime;
+            }
+            debugLogToFile(fmt::format("postUpdate currentTime={:.3f} isPaused={} isSeeking={}", currentTime, fields->m_isPaused, fields->m_isSeeking));
+
+            // One-shot bootstrap: if replay starts with no active music slot,
+            // start level music exactly once to recover from silent startup.
+            if (!fields->m_musicBootstrapTried && currentTime >= 0.15f) {
+                debugLogToFile(fmt::format("bootstrap check at currentTime={:.3f}", currentTime));
+                fields->m_musicBootstrapTried = true;
+                if (auto* audio = FMODAudioEngine::sharedEngine()) {
+                    bool hasMusic = false;
+                    for (int musicID = 0; musicID < 32; ++musicID) {
+                        if (audio->isMusicPlaying(musicID)) {
+                            debugLogToFile(fmt::format("  found active music musicID={}", musicID));
+                            hasMusic = true;
+                            break;
+                        }
+                    }
+                    debugLogToFile(fmt::format("  hasMusic after scan={}", hasMusic));
+                    if (!hasMusic) {
+                        debugLogToFile("  NO MUSIC FOUND - BOOTSTRAPPING");
+                        debugLogToFile("  calling prepareMusic(false)");
+                        this->prepareMusic(false);
+                        debugLogToFile("  calling startMusic()");
+                        this->startMusic();
+                        debugLogToFile("  calling resumeAllMusic()");
+                        audio->resumeAllMusic();
+                        log::info("[AUDIODBG] bootstrapMusic prepare+start at t={:.3f}s", currentTime);
+                        debugLogToFile("  bootstrap complete");
+                    }
+                }
+            }
+
+            debugLogToFile(fmt::format("calling applyReplayAudioSync currentTime={:.3f} isSeeking={}", currentTime, fields->m_isSeeking));
+            applyReplayAudioSync(currentTime, fields->m_isSeeking);
+            debugLogToFile("applyReplayAudioSync returned");
+
+            // Auto-inject inputs from replay that should occur now
+            while (fields->m_nextInputIdx < replay.presses.size()) {
+                auto& press = replay.presses[fields->m_nextInputIdx];
+                float pressTime = static_cast<float>(press.framePress) / static_cast<float>(replay.framerate);
+                float releaseTime = static_cast<float>(press.frameRelease) / static_cast<float>(replay.framerate);
+
+                if (currentTime >= releaseTime) {
+                    // Release and advance to next replay press
+                    if (fields->m_replayHoldingJump) {
+                        this->handleButton(false, 1, true);
+                        fields->m_replayHoldingJump = false;
+                    }
+                    fields->m_nextInputIdx++;
+                    continue;
+                }
+
+                if (currentTime >= pressTime) {
+                    // Press for the current replay event
+                    if (!fields->m_replayHoldingJump) {
+                        this->handleButton(true, 1, true);
+                        fields->m_replayHoldingJump = true;
+                    }
+                }
+                break;
+            }
+
+            if (fields->m_isSeeking && currentTime >= fields->m_seekTargetTime) {
+                debugLogToFile(fmt::format("seek complete currentTime={:.3f} >= seekTarget={:.3f}", currentTime, fields->m_seekTargetTime));
+                fields->m_isSeeking = false;
+                scheduler->setTimeScale(fields->m_isPaused ? 0.0f : g_replayPlayer.playbackSpeed);
+            }
+
+            // Update labels
+            if (fields->m_speedLabel) {
+                auto speedStr = fields->m_isSeeking
+                    ? fmt::format("{:.2f}x (seek)", g_replayPlayer.playbackSpeed)
+                    : fmt::format("{:.2f}x", g_replayPlayer.playbackSpeed);
+                fields->m_speedLabel->setString(speedStr.c_str());
+            }
+
+            if (fields->m_playPauseLabel) {
+                fields->m_playPauseLabel->setString(fields->m_isPaused ? "Play" : "Pause");
+            }
+
+            if (fields->m_timeLabel) {
+                float totalTime = replay.framerate > 0
+                    ? static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate)
+                    : 0.0f;
+                auto timeStr = fmt::format("{} / {}", formatTime(currentTime), formatTime(totalTime));
+                fields->m_timeLabel->setString(timeStr.c_str());
+            }
+        }
+
         // Debug counter – log every ~120 frames. BEFORE any early return!
         static int s_dbg = 0;
         s_dbg++;
@@ -907,7 +1466,6 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         if (dbg) log::info("[DBG] === postUpdate CALLED === frame={}", s_dbg);
 
-        auto fields = m_fields.self();
         if (!fields->m_active || !fields->m_circleLayer) {
             if (dbg) log::info("[DBG] EARLY EXIT: active={} circleLayer={}",
                 fields->m_active, fields->m_circleLayer ? "yes" : "NULL");
@@ -1039,9 +1597,7 @@ class $modify(MyPlayLayer, PlayLayer) {
             }
         }
 
-        CCPoint playerScreenPos = playerParent
-            ? playerParent->convertToWorldSpace(player->getPosition())
-            : ccp(playerX, player->getPositionY());
+        CCPoint playerScreenPos = playerParent ? playerParent->convertToWorldSpace(player->getPosition()) : ccp(playerX, player->getPositionY());
         float playerScreenX = playerScreenPos.x;
 
         // Compute pixels-per-world-unit from two reference points on the object layer.
@@ -1260,12 +1816,124 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_judgmentCounts[static_cast<int>(Judgment::VeryEarly)],
             fields->m_judgmentCounts[static_cast<int>(Judgment::VeryLate)],
             fields->m_judgmentCounts[static_cast<int>(Judgment::Miss)]);
+
+        if (fields->m_isReplayMode) {
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
+        }
+    }
+
+    // Helper: format time in MM:SS
+    static std::string formatTime(float seconds) {
+        int mins = static_cast<int>(seconds) / 60;
+        int secs = static_cast<int>(seconds) % 60;
+        return fmt::format("{:02d}:{:02d}", mins, secs);
+    }
+
+    // ========== Replay Player Controls ==========
+    void onReplayPlayPause(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode) return;
+
+        fields->m_isPaused = !fields->m_isPaused;
+        if (fields->m_isPaused) {
+            fields->m_pauseTime = static_cast<float>(m_timePlayed);
+        }
+        if (!fields->m_isSeeking) {
+            float scale = fields->m_isPaused ? 0.0f : g_replayPlayer.playbackSpeed;
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(scale);
+        }
+        applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
+    }
+
+    void onReplaySpeedUp(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode) return;
+
+        g_replayPlayer.playbackSpeed = std::min(4.0f, g_replayPlayer.playbackSpeed + 0.25f);
+        if (!fields->m_isPaused && !fields->m_isSeeking) {
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(g_replayPlayer.playbackSpeed);
+        }
+        applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
+    }
+
+    void onReplaySpeedDown(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode) return;
+
+        g_replayPlayer.playbackSpeed = std::max(0.25f, g_replayPlayer.playbackSpeed - 0.25f);
+        if (!fields->m_isPaused && !fields->m_isSeeking) {
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(g_replayPlayer.playbackSpeed);
+        }
+        applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
+    }
+
+    void onReplayRewind(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode || !g_replayPlayer.replay.has_value()) return;
+
+        float currentTime = static_cast<float>(m_timePlayed);
+        float target = std::max(0.0f, currentTime - 5.0f);
+
+        fields->m_isPaused = false;
+        fields->m_nextInputIdx = 0;
+
+        if (target <= 0.05f) {
+            fields->m_isSeeking = false;
+            fields->m_seekTargetTime = 0.0f;
+            this->resetLevel();
+            applyReplayAudioSync(0.0f, true);
+            return;
+        }
+
+        fields->m_isSeeking = true;
+        fields->m_seekTargetTime = target;
+        fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
+        this->resetLevel();
+        applyReplayAudioSync(0.0f, true);
+    }
+
+    void onReplaySkipForward(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode || !g_replayPlayer.replay.has_value()) return;
+
+        auto& replay = g_replayPlayer.replay.value();
+        float totalTime = replay.framerate > 0
+            ? static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate)
+            : 0.0f;
+        float currentTime = static_cast<float>(m_timePlayed);
+        float target = std::min(totalTime, currentTime + 5.0f);
+
+        fields->m_isPaused = false;
+        fields->m_isSeeking = true;
+        fields->m_seekTargetTime = target;
+        fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
+        applyReplayAudioSync(target, true);
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
 
         auto fields = m_fields.self();
+        if (fields->m_isReplayMode) {
+            this->togglePracticeMode(true);
+            fields->m_nextInputIdx = 0;
+            fields->m_replayCurrentTime = 0.0f;
+            fields->m_pauseTime = 0.0f;
+            fields->m_replayHoldingJump = false;
+            float scale = fields->m_isSeeking ? 4.0f : g_replayPlayer.playbackSpeed;
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(scale);
+            fields->m_lastAudioSyncMs = -1.0f;
+            fields->m_audioPausedByReplay = false;
+            fields->m_audioMusicID = -1;
+            fields->m_musicBootstrapTried = false;
+            fields->m_nextMusicRetryAt = 0.25f;
+            fields->m_nextAudioDebugAt = 0.0f;
+            fields->m_lastAutoSeekAt = -1000.0f;
+            fields->m_replayMusicInitialOffset = -1;
+            fields->m_lastAutoSeekAt = -1000.0f;
+            applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
+        }
+
         if (fields->m_active && !fields->m_posHistory.empty()) {
             // Trim history entries past the respawn time so we
             // re-record accurate positions from the checkpoint onward
@@ -1306,6 +1974,25 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 
     void onQuit() {
+        auto fields = m_fields.self();
+        if (fields->m_isReplayMode) {
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
+            if (auto* audio = FMODAudioEngine::sharedEngine()) {
+                for (int musicID = 0; musicID < 32; ++musicID) {
+                    int channelID = audio->getMusicChannelID(musicID);
+                    if (channelID >= 0) {
+                        audio->setChannelPitch(musicID, AudioTargetType::MusicChannel, 1.0f);
+                    }
+                }
+            }
+            g_replayPlayer.isActive = false;
+            g_replayPlayer.replay.reset();
+            g_replayPlayer.playbackSpeed = 1.0f;
+            g_replayPlayer.isPaused = false;
+            g_replayPlayer.pauseTime = 0.0f;
+            g_replayPlayer.inputIndex = 0.0f;
+        }
+
         s_rhythmActive = false;
         s_playerInputs.clear();
         PlayLayer::onQuit();
@@ -1348,10 +2035,8 @@ class $modify(MyEndLevel, EndLevelLayer) {
         bg->setZOrder(100);
         this->addChild(bg);
 
-        // Accuracy label (big)
-        auto accLabel = CCLabelBMFont::create(
-            fmt::format("Rhythm: {:.2f}%", finalAcc).c_str(),
-            "bigFont.fnt");
+        auto accText = fmt::format("Rhythm: {:.2f}%", finalAcc);
+        auto accLabel = CCLabelBMFont::create(accText.c_str(), "bigFont.fnt");
         accLabel->setScale(0.5f);
         accLabel->setPosition({winSize.width / 2.0f, 65.0f});
         accLabel->setZOrder(101);
