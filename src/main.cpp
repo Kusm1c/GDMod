@@ -5,6 +5,7 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/EndLevelLayer.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
+#include <Geode/binding/Slider.hpp>
 #include <Geode/utils/file.hpp>
 #include <Geode/utils/web.hpp>
 #include <Geode/loader/SettingV3.hpp>
@@ -14,6 +15,8 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <cmath>
+#include <limits>
 
 #ifdef GEODE_IS_WINDOWS
 #include <commdlg.h>
@@ -46,16 +49,22 @@ struct ReplayPlayerState {
     bool isPaused = false;
     float pauseTime = 0.0f; // When paused, the frozen time
     float inputIndex = 0.0f; // Current position in replay inputs
+    bool isEditMode = false;
+    int levelId = 0;
+    std::filesystem::path sourceReplayPath;
 };
 
 static ReplayPlayerState g_replayPlayer;
+static std::optional<std::filesystem::path> g_lastMatchedLocalReplayPath;
 
 // ============================================================
 // Debug File Logging
 // ============================================================
 static const char* DEBUG_LOG_FILE = "GDMod_audio_debug.log";
+static constexpr bool ENABLE_ULTRA_AUDIO_FILE_DEBUG = false;
 
 static void debugLogToFile(const std::string& msg) {
+    if (!ENABLE_ULTRA_AUDIO_FILE_DEBUG) return;
     try {
         std::ofstream file(DEBUG_LOG_FILE, std::ios::app);
         if (file.is_open()) {
@@ -85,6 +94,7 @@ static web::WebRequest supabaseRequest() {
 }
 // Forward declaration: implemented later
 static std::optional<ReplayLoadResult> loadMatchingReplay(int levelId);
+static bool saveReplayToLocalJson(int levelId, const ReplayLoadResult& replay, std::filesystem::path preferredPath = {});
 
 
 // ============================================================
@@ -576,6 +586,19 @@ class $modify(MyLevelInfoLayer, LevelInfoLayer) {
         );
         watchButton->setID("watch-replay-btn"_spr);
 
+        auto editBtnSprite = CCSprite::createWithSpriteFrameName("GJ_plainBtn_001.png");
+        auto editLabel = CCLabelBMFont::create("Edit\nReplay", "bigFont.fnt");
+        editLabel->setScale(0.28f);
+        editLabel->setPosition(editBtnSprite->getContentSize() / 2);
+        editBtnSprite->addChild(editLabel);
+
+        auto editButton = CCMenuItemSpriteExtra::create(
+            editBtnSprite,
+            this,
+            menu_selector(MyLevelInfoLayer::onEditReplay)
+        );
+        editButton->setID("edit-replay-btn"_spr);
+
         // Reliable placement independent of internal LevelInfoLayer menu IDs.
         auto replayMenu = CCMenu::create();
         replayMenu->setID("watch-replay-menu"_spr);
@@ -584,7 +607,9 @@ class $modify(MyLevelInfoLayer, LevelInfoLayer) {
 
         auto winSize = CCDirector::sharedDirector()->getWinSize();
         watchButton->setPosition({winSize.width - 64.0f, 86.0f});
+        editButton->setPosition({winSize.width - 154.0f, 86.0f});
         replayMenu->addChild(watchButton);
+        replayMenu->addChild(editButton);
 
         return true;
     }
@@ -607,6 +632,34 @@ class $modify(MyLevelInfoLayer, LevelInfoLayer) {
         g_replayPlayer.isPaused = false;
         g_replayPlayer.pauseTime = 0.0f;
         g_replayPlayer.inputIndex = 0.0f;
+        g_replayPlayer.isEditMode = false;
+        g_replayPlayer.levelId = levelId;
+        g_replayPlayer.sourceReplayPath = g_lastMatchedLocalReplayPath.value_or(std::filesystem::path{});
+
+        // Launch through LevelInfoLayer flow so scene transition is valid.
+        this->onPlay(nullptr);
+    }
+
+    void onEditReplay(CCObject*) {
+        auto level = m_level;
+        if (!level) return;
+
+        int levelId = level->m_levelID;
+        auto replayResult = loadMatchingReplay(levelId);
+        if (!replayResult.has_value()) {
+            FLAlertLayer::create("Error", "No replay found for this level.", "OK")->show();
+            return;
+        }
+
+        g_replayPlayer.isActive = true;
+        g_replayPlayer.replay = std::move(replayResult.value());
+        g_replayPlayer.playbackSpeed = 1.0f;
+        g_replayPlayer.isPaused = false;
+        g_replayPlayer.pauseTime = 0.0f;
+        g_replayPlayer.inputIndex = 0.0f;
+        g_replayPlayer.isEditMode = true;
+        g_replayPlayer.levelId = levelId;
+        g_replayPlayer.sourceReplayPath = g_lastMatchedLocalReplayPath.value_or(std::filesystem::path{});
 
         // Launch through LevelInfoLayer flow so scene transition is valid.
         this->onPlay(nullptr);
@@ -623,6 +676,8 @@ class $modify(MyLevelInfoLayer, LevelInfoLayer) {
 // 1. Search locally by filename pattern: *-{levelId}.json
 // 2. If not found locally, query Supabase
 static std::optional<ReplayLoadResult> loadMatchingReplay(int levelId) {
+    g_lastMatchedLocalReplayPath.reset();
+
     // --- Local search first ---
     auto replaysDir = Mod::get()->getSaveDir() / "replay";
     if (std::filesystem::exists(replaysDir)) {
@@ -679,6 +734,7 @@ static std::optional<ReplayLoadResult> loadMatchingReplay(int levelId) {
                                 result.presses.push_back({frame, frame + 1, key.first});
                             }
                             if (!result.presses.empty()) {
+                                g_lastMatchedLocalReplayPath = matchedFile;
                                 log::info("[InputCircles] Found local replay for level {}", levelId);
                                 return result;
                             }
@@ -747,6 +803,54 @@ static std::optional<ReplayLoadResult> loadMatchingReplay(int levelId) {
     if (result.presses.empty()) return std::nullopt;
     log::info("[Supabase] Loaded {} presses from Supabase for level {}", result.presses.size(), levelId);
     return result;
+}
+
+static bool saveReplayToLocalJson(int levelId, const ReplayLoadResult& replay, std::filesystem::path preferredPath) {
+    if (replay.presses.empty()) {
+        return false;
+    }
+
+    auto replaysDir = Mod::get()->getSaveDir() / "replay";
+    std::error_code ec;
+    std::filesystem::create_directories(replaysDir, ec);
+
+    std::filesystem::path outPath = preferredPath;
+    if (outPath.empty()) {
+        auto ts = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        outPath = replaysDir / fmt::format("edited-{}-{}.json", ts, levelId);
+    }
+
+    matjson::Value root;
+    root["framerate"] = replay.framerate;
+    root["level_id"] = levelId;
+
+    auto inputs = matjson::Value::array();
+    for (auto const& press : replay.presses) {
+        matjson::Value pressEv;
+        pressEv["action"] = "press";
+        pressEv["frame"] = static_cast<int64_t>(press.framePress);
+        pressEv["player"] = static_cast<int64_t>(press.player);
+        pressEv["button_id"] = static_cast<int64_t>(1);
+        inputs.push(pressEv);
+
+        matjson::Value releaseEv;
+        releaseEv["action"] = "release";
+        releaseEv["frame"] = static_cast<int64_t>(press.frameRelease);
+        releaseEv["player"] = static_cast<int64_t>(press.player);
+        releaseEv["button_id"] = static_cast<int64_t>(1);
+        inputs.push(releaseEv);
+    }
+    root["inputs"] = inputs;
+
+    auto writeRes = file::writeString(outPath, root.dump(2));
+    if (writeRes.isErr()) {
+        log::warn("[ReplayEditor] Failed to save replay {}", outPath.string());
+        return false;
+    }
+    g_lastMatchedLocalReplayPath = outPath;
+    log::info("[ReplayEditor] Saved {} inputs to {}", replay.presses.size(), outPath.string());
+    return true;
 }
 
 // ============================================================
@@ -853,6 +957,30 @@ class $modify(MyPlayLayer, PlayLayer) {
         bool m_forcedPracticeMusic = false;
         bool m_prevPracticeMusicSync = false;
         int m_replayMusicInitialOffset = -1;  // Captured offset of music at first sync
+
+        // ========== Replay Edit Mode ==========
+        bool m_isReplayEditMode = false;
+        size_t m_editSelectedIdx = 0;
+        CCNode* m_editPanel = nullptr;
+        CCNode* m_editInputsPanel = nullptr;
+        CCMenu* m_editInputsMenu = nullptr;
+        CCLabelBMFont* m_editTitleLabel = nullptr;
+        CCLabelBMFont* m_editPressLabel = nullptr;
+        CCLabelBMFont* m_editReleaseLabel = nullptr;
+        CCLabelBMFont* m_editHintLabel = nullptr;
+        Slider* m_editPressSlider = nullptr;
+        Slider* m_editReleaseSlider = nullptr;
+        bool m_editUpdatingSliders = false;
+        bool m_editPreviewPending = false;
+        float m_lastEditPreviewAt = -1000.0f;
+        CCNode* m_editTimeline = nullptr;
+        CCMenu* m_editTimelineMenu = nullptr;
+        CCLayerColor* m_editTimelineCursor = nullptr;
+        CCLabelBMFont* m_editTimelineLabel = nullptr;
+        float m_editTimelineWindowStart = 0.0f;
+        float m_editTimelineWindowEnd = 0.0f;
+        float m_lastTimelineCenterTime = -1000.0f;
+        size_t m_lastTimelineSelectedIdx = std::numeric_limits<size_t>::max();
     };
 
     void applyReplayAudioSync(float levelTime, bool forceSeek) {
@@ -1033,6 +1161,450 @@ class $modify(MyPlayLayer, PlayLayer) {
         debugLogToFile(fmt::format("=== ensureReplayMusicStarted END ==="));
     }
 
+    float replayTotalTimeSeconds() const {
+        if (!g_replayPlayer.replay.has_value()) return 0.0f;
+        auto const& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty() || replay.framerate <= 0.0) return 0.0f;
+        return static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate);
+    }
+
+    uint64_t replayMaxFrame() const {
+        if (!g_replayPlayer.replay.has_value()) return 1;
+        auto const& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty()) return 1;
+        uint64_t maxFrame = replay.presses.back().frameRelease;
+        return std::max<uint64_t>(maxFrame, 1ull);
+    }
+
+    void clampSelectedReplayInput() {
+        auto fields = m_fields.self();
+        if (!g_replayPlayer.replay.has_value()) return;
+        auto& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty()) return;
+
+        if (fields->m_editSelectedIdx >= replay.presses.size()) {
+            fields->m_editSelectedIdx = replay.presses.size() - 1;
+        }
+
+        auto& p = replay.presses[fields->m_editSelectedIdx];
+        if (p.frameRelease <= p.framePress) {
+            p.frameRelease = p.framePress + 1;
+        }
+    }
+
+    void rebuildReplayRuntimeFromCurrentState() {
+        auto fields = m_fields.self();
+        if (!g_replayPlayer.replay.has_value()) return;
+
+        std::sort(g_replayPlayer.replay->presses.begin(), g_replayPlayer.replay->presses.end(),
+            [](ReplayPress const& a, ReplayPress const& b) {
+                return a.framePress < b.framePress;
+            }
+        );
+
+        clampSelectedReplayInput();
+        fields->m_nextInputIdx = 0;
+        fields->m_replayHoldingJump = false;
+
+        float currentTime = static_cast<float>(m_timePlayed);
+        auto const& replay = g_replayPlayer.replay.value();
+        for (size_t i = 0; i < replay.presses.size(); ++i) {
+            float releaseTime = static_cast<float>(replay.presses[i].frameRelease) / static_cast<float>(replay.framerate);
+            if (releaseTime < currentTime) {
+                fields->m_nextInputIdx = i + 1;
+                continue;
+            }
+            break;
+        }
+    }
+
+    void updateReplayEditLabels() {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+        auto const& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty()) return;
+
+        auto const& p = replay.presses[fields->m_editSelectedIdx];
+        float pressTime = static_cast<float>(p.framePress) / static_cast<float>(replay.framerate);
+        float releaseTime = static_cast<float>(p.frameRelease) / static_cast<float>(replay.framerate);
+
+        if (fields->m_editTitleLabel) {
+            fields->m_editTitleLabel->setString(
+                fmt::format("Edit Replay {} / {}", fields->m_editSelectedIdx + 1, replay.presses.size()).c_str()
+            );
+        }
+        if (fields->m_editPressLabel) {
+            fields->m_editPressLabel->setString(
+                fmt::format("Press: {} ({:.3f}s)", p.framePress, pressTime).c_str()
+            );
+        }
+        if (fields->m_editReleaseLabel) {
+            fields->m_editReleaseLabel->setString(
+                fmt::format("Release: {} ({:.3f}s)", p.frameRelease, releaseTime).c_str()
+            );
+        }
+        if (fields->m_editHintLabel) {
+            fields->m_editHintLabel->setString("Replay runs live. Edits apply to upcoming inputs.");
+        }
+
+        uint64_t maxFrame = replayMaxFrame();
+        fields->m_editUpdatingSliders = true;
+        if (fields->m_editPressSlider) {
+            fields->m_editPressSlider->setValue(static_cast<float>(p.framePress) / static_cast<float>(maxFrame));
+        }
+        if (fields->m_editReleaseSlider) {
+            fields->m_editReleaseSlider->setValue(static_cast<float>(p.frameRelease) / static_cast<float>(maxFrame));
+        }
+        fields->m_editUpdatingSliders = false;
+
+        if (fields->m_editInputsMenu) {
+            fields->m_editInputsMenu->removeAllChildrenWithCleanup(true);
+
+            constexpr size_t kVisibleRows = 7;
+            size_t start = 0;
+            if (fields->m_editSelectedIdx > kVisibleRows / 2) {
+                start = fields->m_editSelectedIdx - (kVisibleRows / 2);
+            }
+            if (start + kVisibleRows > replay.presses.size()) {
+                if (replay.presses.size() > kVisibleRows) {
+                    start = replay.presses.size() - kVisibleRows;
+                } else {
+                    start = 0;
+                }
+            }
+
+            float rowY = 64.0f;
+            for (size_t i = start; i < replay.presses.size() && i < start + kVisibleRows; ++i) {
+                auto const& row = replay.presses[i];
+                bool isSel = (i == fields->m_editSelectedIdx);
+                auto rowText = fmt::format(
+                    "{}{}: P{} R{}{}",
+                    isSel ? "> " : "",
+                    i + 1,
+                    row.framePress,
+                    row.frameRelease,
+                    isSel ? " <" : ""
+                );
+
+                auto rowLabel = CCLabelBMFont::create(rowText.c_str(), "chatFont.fnt");
+                rowLabel->setScale(0.45f);
+                rowLabel->setAnchorPoint({0.0f, 0.5f});
+                rowLabel->setColor(isSel ? ccc3(255, 235, 120) : ccc3(220, 220, 220));
+
+                auto rowBtn = CCMenuItemSpriteExtra::create(
+                    rowLabel,
+                    this,
+                    menu_selector(MyPlayLayer::onReplayEditSelectInput)
+                );
+                rowBtn->setTag(static_cast<int>(i));
+                rowBtn->setAnchorPoint({0.0f, 0.5f});
+                rowBtn->setPosition({10.0f, rowY});
+                fields->m_editInputsMenu->addChild(rowBtn);
+
+                rowY -= 10.0f;
+            }
+        }
+
+        rebuildEditTimeline(false);
+    }
+
+    void rebuildEditTimeline(bool force) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+        if (!fields->m_editTimelineMenu || !fields->m_editTimeline) return;
+
+        auto const& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty() || replay.framerate <= 0.0) return;
+
+        float totalTime = replayTotalTimeSeconds();
+        float currentTime = static_cast<float>(m_timePlayed);
+        float center = std::clamp(currentTime, 0.0f, totalTime);
+        float windowDuration = 6.0f;
+
+        float start = std::max(0.0f, center - windowDuration * 0.5f);
+        float end = std::min(totalTime, start + windowDuration);
+        if (end - start < windowDuration) {
+            start = std::max(0.0f, end - windowDuration);
+        }
+
+        if (!force) {
+            bool selectedUnchanged = (fields->m_lastTimelineSelectedIdx == fields->m_editSelectedIdx);
+            bool centerUnchanged = std::abs(fields->m_lastTimelineCenterTime - center) < 0.12f;
+            if (selectedUnchanged && centerUnchanged) {
+                fields->m_editTimelineWindowStart = start;
+                fields->m_editTimelineWindowEnd = end;
+                return;
+            }
+        }
+
+        fields->m_lastTimelineCenterTime = center;
+        fields->m_lastTimelineSelectedIdx = fields->m_editSelectedIdx;
+        fields->m_editTimelineWindowStart = start;
+        fields->m_editTimelineWindowEnd = end;
+
+        fields->m_editTimelineMenu->removeAllChildrenWithCleanup(true);
+
+        float timelineWidth = fields->m_editTimeline->getContentSize().width;
+        float timelineHeight = fields->m_editTimeline->getContentSize().height;
+        float duration = std::max(0.001f, end - start);
+
+        auto toX = [&](float t) {
+            float n = (t - start) / duration;
+            return std::clamp(n, 0.0f, 1.0f) * timelineWidth;
+        };
+
+        for (size_t i = 0; i < replay.presses.size(); ++i) {
+            auto const& press = replay.presses[i];
+            float t0 = static_cast<float>(press.framePress) / static_cast<float>(replay.framerate);
+            float t1 = static_cast<float>(press.frameRelease) / static_cast<float>(replay.framerate);
+            if (t1 < start || t0 > end) continue;
+
+            float x0 = toX(t0);
+            float x1 = toX(t1);
+            float w = std::max(2.0f, std::abs(x1 - x0));
+            float xLeft = std::min(x0, x1);
+            bool selected = (i == fields->m_editSelectedIdx);
+
+            auto color = selected ? ccc4(255, 235, 120, 220) : ccc4(120, 190, 255, 170);
+            auto seg = CCLayerColor::create(color, w, timelineHeight - 6.0f);
+            seg->setAnchorPoint({0.0f, 0.0f});
+            seg->setPosition({xLeft, 3.0f});
+
+            auto btn = CCMenuItemSpriteExtra::create(
+                seg,
+                this,
+                menu_selector(MyPlayLayer::onReplayEditSelectInput)
+            );
+            btn->setTag(static_cast<int>(i));
+            btn->setAnchorPoint({0.0f, 0.0f});
+            btn->setPosition({xLeft, 3.0f});
+            fields->m_editTimelineMenu->addChild(btn);
+        }
+
+        if (fields->m_editTimelineLabel) {
+            fields->m_editTimelineLabel->setString(
+                fmt::format("Timeline {:.2f}s/{:.2f}s", currentTime, totalTime).c_str()
+            );
+        }
+    }
+
+    void updateEditTimelineCursor() {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !fields->m_editTimelineCursor || !fields->m_editTimeline) return;
+        float start = fields->m_editTimelineWindowStart;
+        float end = std::max(start + 0.001f, fields->m_editTimelineWindowEnd);
+        float duration = end - start;
+        float t = static_cast<float>(m_timePlayed);
+        float n = std::clamp((t - start) / duration, 0.0f, 1.0f);
+        float x = n * fields->m_editTimeline->getContentSize().width;
+        fields->m_editTimelineCursor->setPosition({x, 0.0f});
+    }
+
+    void previewReplayAtSelectedInput() {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+        auto const& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty()) return;
+
+        auto const& p = replay.presses[fields->m_editSelectedIdx];
+        float target = std::max(0.0f, (static_cast<float>(p.framePress) / static_cast<float>(replay.framerate)) - 0.2f);
+
+        if (target <= 0.05f) {
+            fields->m_isSeeking = false;
+            fields->m_seekTargetTime = 0.0f;
+            fields->m_isPaused = true;
+            if (static_cast<float>(m_timePlayed) > 0.05f) {
+                this->resetLevel();
+            }
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(0.0f);
+            applyReplayAudioSync(0.0f, true);
+            return;
+        }
+
+        fields->m_isPaused = false;
+        fields->m_isSeeking = true;
+        fields->m_seekTargetTime = target;
+        fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
+        fields->m_isPaused = true;
+        this->resetLevel();
+        applyReplayAudioSync(0.0f, true);
+    }
+
+    void queueReplayEditPreview() {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode) return;
+        fields->m_editPreviewPending = true;
+    }
+
+    void editSelectedInputFrame(bool editPress, int deltaFrames) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+        auto& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty()) return;
+
+        auto& p = replay.presses[fields->m_editSelectedIdx];
+        auto applyDelta = [&](uint64_t value) -> uint64_t {
+            int64_t next = static_cast<int64_t>(value) + static_cast<int64_t>(deltaFrames);
+            if (next < 0) next = 0;
+            return static_cast<uint64_t>(next);
+        };
+
+        if (editPress) {
+            p.framePress = applyDelta(p.framePress);
+            if (p.frameRelease <= p.framePress) {
+                p.frameRelease = p.framePress + 1;
+            }
+        } else {
+            p.frameRelease = applyDelta(p.frameRelease);
+            if (p.frameRelease <= p.framePress) {
+                p.frameRelease = p.framePress + 1;
+            }
+        }
+
+        rebuildReplayRuntimeFromCurrentState();
+        updateReplayEditLabels();
+    }
+
+    void onReplayEditPrev(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+        if (fields->m_editSelectedIdx > 0) {
+            fields->m_editSelectedIdx--;
+        }
+        updateReplayEditLabels();
+    }
+
+    void onReplayEditNext(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+        auto const count = g_replayPlayer.replay->presses.size();
+        if (fields->m_editSelectedIdx + 1 < count) {
+            fields->m_editSelectedIdx++;
+        }
+        updateReplayEditLabels();
+    }
+
+    void onReplayEditSelectInput(CCObject* sender) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+
+        auto* btn = typeinfo_cast<CCNode*>(sender);
+        if (!btn) return;
+
+        int idx = btn->getTag();
+        if (idx < 0) return;
+        size_t uidx = static_cast<size_t>(idx);
+        if (uidx >= g_replayPlayer.replay->presses.size()) return;
+
+        fields->m_editSelectedIdx = uidx;
+        updateReplayEditLabels();
+    }
+
+    void onReplayEditPressMinus(CCObject*) { editSelectedInputFrame(true, -1); }
+    void onReplayEditPressPlus(CCObject*) { editSelectedInputFrame(true, +1); }
+    void onReplayEditReleaseMinus(CCObject*) { editSelectedInputFrame(false, -1); }
+    void onReplayEditReleasePlus(CCObject*) { editSelectedInputFrame(false, +1); }
+
+    void onReplayEditSave(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+        rebuildReplayRuntimeFromCurrentState();
+
+        bool ok = saveReplayToLocalJson(
+            g_replayPlayer.levelId,
+            g_replayPlayer.replay.value(),
+            g_replayPlayer.sourceReplayPath
+        );
+
+        if (ok) {
+            FLAlertLayer::create("Replay Editor", "Saved replay edits.", "OK")->show();
+        } else {
+            FLAlertLayer::create("Replay Editor", "Failed to save replay edits.", "OK")->show();
+        }
+    }
+
+    void onReplayEditJumpToCurrent(CCObject*) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
+
+        auto const& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty() || replay.framerate <= 0.0) return;
+
+        uint64_t currentFrame = static_cast<uint64_t>(
+            std::llround(static_cast<double>(m_timePlayed) * replay.framerate)
+        );
+
+        size_t bestIdx = 0;
+        uint64_t bestDist = std::numeric_limits<uint64_t>::max();
+
+        for (size_t i = 0; i < replay.presses.size(); ++i) {
+            auto const& p = replay.presses[i];
+
+            if (currentFrame >= p.framePress && currentFrame <= p.frameRelease) {
+                bestIdx = i;
+                bestDist = 0;
+                break;
+            }
+
+            uint64_t dist = 0;
+            if (currentFrame < p.framePress) {
+                dist = p.framePress - currentFrame;
+            } else {
+                dist = currentFrame - p.frameRelease;
+            }
+
+            if (dist < bestDist) {
+                bestDist = dist;
+                bestIdx = i;
+            }
+        }
+
+        fields->m_editSelectedIdx = bestIdx;
+        updateReplayEditLabels();
+    }
+
+    void onReplayEditPressSlider(CCObject* sender) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || fields->m_editUpdatingSliders || !g_replayPlayer.replay.has_value()) return;
+
+        auto* slider = typeinfo_cast<Slider*>(sender);
+        if (!slider) return;
+
+        auto& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty()) return;
+
+        uint64_t maxFrame = replayMaxFrame();
+        auto& p = replay.presses[fields->m_editSelectedIdx];
+        p.framePress = static_cast<uint64_t>(std::round(std::clamp(slider->getValue(), 0.0f, 1.0f) * static_cast<float>(maxFrame)));
+        if (p.frameRelease <= p.framePress) {
+            p.frameRelease = p.framePress + 1;
+        }
+
+        rebuildReplayRuntimeFromCurrentState();
+        updateReplayEditLabels();
+    }
+
+    void onReplayEditReleaseSlider(CCObject* sender) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayEditMode || fields->m_editUpdatingSliders || !g_replayPlayer.replay.has_value()) return;
+
+        auto* slider = typeinfo_cast<Slider*>(sender);
+        if (!slider) return;
+
+        auto& replay = g_replayPlayer.replay.value();
+        if (replay.presses.empty()) return;
+
+        uint64_t maxFrame = replayMaxFrame();
+        auto& p = replay.presses[fields->m_editSelectedIdx];
+        p.frameRelease = static_cast<uint64_t>(std::round(std::clamp(slider->getValue(), 0.0f, 1.0f) * static_cast<float>(maxFrame)));
+        if (p.frameRelease <= p.framePress) {
+            p.frameRelease = p.framePress + 1;
+        }
+
+        rebuildReplayRuntimeFromCurrentState();
+        updateReplayEditLabels();
+    }
+
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         debugLogToFile("=== PlayLayer::init START ===");
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
@@ -1048,15 +1620,19 @@ class $modify(MyPlayLayer, PlayLayer) {
         if (g_replayPlayer.isActive && g_replayPlayer.replay.has_value()) {
             debugLogToFile("ENTERING REPLAY MODE");
             fields->m_isReplayMode = true;
+            fields->m_isReplayEditMode = g_replayPlayer.isEditMode;
             fields->m_replayCurrentTime = 0.0f;
             fields->m_nextInputIdx = 0;
-            fields->m_isPaused = false;
+            fields->m_isPaused = g_replayPlayer.isPaused;
             fields->m_pauseTime = 0.0f;
             fields->m_isSeeking = false;
             fields->m_seekTargetTime = 0.0f;
             fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
             fields->m_replayHoldingJump = false;
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(g_replayPlayer.playbackSpeed);
+            fields->m_editSelectedIdx = 0;
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(
+                fields->m_isPaused ? 0.0f : g_replayPlayer.playbackSpeed
+            );
             fields->m_prevPracticeMusicSync = this->m_practiceMusicSync;
             fields->m_forcedPracticeMusic = false;
             this->togglePracticeMode(true);
@@ -1098,7 +1674,7 @@ class $modify(MyPlayLayer, PlayLayer) {
             float centerX = winSize.width * 0.5f;
 
             // Play/Pause button
-            auto playText = CCLabelBMFont::create("Pause", "bigFont.fnt");
+            auto playText = CCLabelBMFont::create(fields->m_isPaused ? "Play" : "Pause", "bigFont.fnt");
             playText->setScale(0.4f);
             auto playBtn = CCMenuItemSpriteExtra::create(
                 playText,
@@ -1168,6 +1744,110 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_nextAudioDebugAt = 0.0f;
             fields->m_lastAutoSeekAt = -1000.0f;
             fields->m_replayMusicInitialOffset = -1;
+
+            if (fields->m_isReplayEditMode) {
+                auto editPanel = CCNode::create();
+                editPanel->setContentSize({winSize.width, 74.0f});
+                editPanel->setAnchorPoint({0.0f, 0.0f});
+                editPanel->setPosition({0.0f, 60.0f});
+                editPanel->setID("replay-edit-panel"_spr);
+
+                auto editBg = CCLayerColor::create(ccc4(0, 0, 0, 160), winSize.width, 74.0f);
+                editBg->setPosition({0.0f, 0.0f});
+                editPanel->addChild(editBg, 0);
+
+                auto title = CCLabelBMFont::create("Edit Replay", "chatFont.fnt");
+                title->setScale(0.7f);
+                title->setAnchorPoint({0.0f, 0.5f});
+                title->setPosition({10.0f, 56.0f});
+                editPanel->addChild(title, 1);
+                fields->m_editTitleLabel = title;
+
+                auto pressLabel = CCLabelBMFont::create("Press: -", "chatFont.fnt");
+                pressLabel->setScale(0.6f);
+                pressLabel->setAnchorPoint({0.0f, 0.5f});
+                pressLabel->setPosition({10.0f, 36.0f});
+                editPanel->addChild(pressLabel, 1);
+                fields->m_editPressLabel = pressLabel;
+
+                auto releaseLabel = CCLabelBMFont::create("Release: -", "chatFont.fnt");
+                releaseLabel->setScale(0.6f);
+                releaseLabel->setAnchorPoint({0.0f, 0.5f});
+                releaseLabel->setPosition({10.0f, 18.0f});
+                editPanel->addChild(releaseLabel, 1);
+                fields->m_editReleaseLabel = releaseLabel;
+
+                auto pressSlider = Slider::create(this, menu_selector(MyPlayLayer::onReplayEditPressSlider), 0.45f);
+                pressSlider->setPosition({230.0f, 36.0f});
+                pressSlider->setValue(0.0f);
+                pressSlider->setLiveDragging(false);
+                editPanel->addChild(pressSlider, 1);
+                fields->m_editPressSlider = pressSlider;
+
+                auto releaseSlider = Slider::create(this, menu_selector(MyPlayLayer::onReplayEditReleaseSlider), 0.45f);
+                releaseSlider->setPosition({230.0f, 18.0f});
+                releaseSlider->setValue(0.0f);
+                releaseSlider->setLiveDragging(false);
+                editPanel->addChild(releaseSlider, 1);
+                fields->m_editReleaseSlider = releaseSlider;
+
+                auto hintLabel = CCLabelBMFont::create("", "chatFont.fnt");
+                hintLabel->setScale(0.45f);
+                hintLabel->setAnchorPoint({1.0f, 0.5f});
+                hintLabel->setPosition({winSize.width - 10.0f, 56.0f});
+                hintLabel->setColor(ccc3(180, 220, 255));
+                editPanel->addChild(hintLabel, 1);
+                fields->m_editHintLabel = hintLabel;
+
+                auto mkTxtBtn = [&](const char* text, SEL_MenuHandler cb, CCPoint pos) {
+                    auto txt = CCLabelBMFont::create(text, "bigFont.fnt");
+                    txt->setScale(0.34f);
+                    auto btn = CCMenuItemSpriteExtra::create(txt, this, cb);
+                    btn->setPosition(pos);
+                    return btn;
+                };
+
+                auto editMenu = CCMenu::create();
+                editMenu->setPosition({0.0f, 0.0f});
+                editMenu->addChild(mkTxtBtn("Prev", menu_selector(MyPlayLayer::onReplayEditPrev), {winSize.width - 330.0f, 36.0f}));
+                editMenu->addChild(mkTxtBtn("Next", menu_selector(MyPlayLayer::onReplayEditNext), {winSize.width - 270.0f, 36.0f}));
+                editMenu->addChild(mkTxtBtn("Now", menu_selector(MyPlayLayer::onReplayEditJumpToCurrent), {winSize.width - 230.0f, 56.0f}));
+                editMenu->addChild(mkTxtBtn("P-", menu_selector(MyPlayLayer::onReplayEditPressMinus), {winSize.width - 210.0f, 36.0f}));
+                editMenu->addChild(mkTxtBtn("P+", menu_selector(MyPlayLayer::onReplayEditPressPlus), {winSize.width - 170.0f, 36.0f}));
+                editMenu->addChild(mkTxtBtn("R-", menu_selector(MyPlayLayer::onReplayEditReleaseMinus), {winSize.width - 120.0f, 36.0f}));
+                editMenu->addChild(mkTxtBtn("R+", menu_selector(MyPlayLayer::onReplayEditReleasePlus), {winSize.width - 80.0f, 36.0f}));
+                editMenu->addChild(mkTxtBtn("Save", menu_selector(MyPlayLayer::onReplayEditSave), {winSize.width - 35.0f, 36.0f}));
+                editPanel->addChild(editMenu, 2);
+
+                this->addChild(editPanel, 10101);
+                fields->m_editPanel = editPanel;
+
+                auto inputsPanel = CCNode::create();
+                inputsPanel->setContentSize({260.0f, 80.0f});
+                inputsPanel->setAnchorPoint({0.0f, 0.0f});
+                inputsPanel->setPosition({10.0f, 136.0f});
+                inputsPanel->setID("replay-edit-inputs-panel"_spr);
+
+                auto inputsBg = CCLayerColor::create(ccc4(0, 0, 0, 150), 260.0f, 80.0f);
+                inputsBg->setPosition({0.0f, 0.0f});
+                inputsPanel->addChild(inputsBg, 0);
+
+                auto inputsTitle = CCLabelBMFont::create("Inputs (click to select)", "chatFont.fnt");
+                inputsTitle->setScale(0.5f);
+                inputsTitle->setAnchorPoint({0.0f, 0.5f});
+                inputsTitle->setPosition({8.0f, 72.0f});
+                inputsPanel->addChild(inputsTitle, 1);
+
+                auto inputsMenu = CCMenu::create();
+                inputsMenu->setPosition({0.0f, 0.0f});
+                inputsPanel->addChild(inputsMenu, 2);
+
+                this->addChild(inputsPanel, 10102);
+                fields->m_editInputsPanel = inputsPanel;
+                fields->m_editInputsMenu = inputsMenu;
+
+                updateReplayEditLabels();
+            }
 
             log::info("[ReplayPlayer] Initialized replay player mode with {} presses", fields->m_isReplayMode);
         }
@@ -1256,7 +1936,50 @@ class $modify(MyPlayLayer, PlayLayer) {
         this->addChild(indicator, 10001);
         fields->m_indicator = indicator;
 
+        // ========== UR Bar Setup / Edit Timeline Setup ==========
+        if (fields->m_isReplayEditMode) {
+            float timelineW = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-bar-width"));
+            float timelineH = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-bar-height"));
+            float timelineX = winSize.width / 2.0f;
+            float timelineY = winSize.height - 30.0f;
+
+            auto timeline = CCNode::create();
+            timeline->setContentSize({timelineW, timelineH});
+            timeline->setAnchorPoint({0.5f, 0.5f});
+            timeline->setPosition({timelineX, timelineY});
+            timeline->setID("replay-edit-timeline"_spr);
+
+            auto timelineBg = CCLayerColor::create(ccc4(0, 0, 0, 190), timelineW, timelineH);
+            timelineBg->setPosition({0.0f, 0.0f});
+            timeline->addChild(timelineBg, 0);
+
+            auto timelineMenu = CCMenu::create();
+            timelineMenu->setPosition({0.0f, 0.0f});
+            timeline->addChild(timelineMenu, 1);
+
+            auto cursor = CCLayerColor::create(ccc4(255, 255, 255, 255), 2.0f, timelineH + 4.0f);
+            cursor->setPosition({0.0f, -2.0f});
+            timeline->addChild(cursor, 2);
+
+            this->addChild(timeline, 10002);
+            fields->m_editTimeline = timeline;
+            fields->m_editTimelineMenu = timelineMenu;
+            fields->m_editTimelineCursor = cursor;
+
+            auto tlLabel = CCLabelBMFont::create("Timeline", "chatFont.fnt");
+            tlLabel->setScale(0.45f);
+            tlLabel->setAnchorPoint({0.5f, 0.0f});
+            tlLabel->setPosition({timelineX, timelineY + timelineH * 0.5f + 4.0f});
+            tlLabel->setColor(ccc3(220, 230, 255));
+            this->addChild(tlLabel, 10003);
+            fields->m_editTimelineLabel = tlLabel;
+
+            rebuildEditTimeline(true);
+            updateEditTimelineCursor();
+        }
+
         // ========== UR Bar Setup ==========
+        if (!fields->m_isReplayEditMode) {
         // Pre-compute replay press/release times in seconds for matching
         for (auto& press : fields->m_presses) {
             fields->m_replayPressTimes.push_back(
@@ -1349,6 +2072,11 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         log::info("[UR] Rhythm mode active. UR bar: {}x{} goodF={} elF={} veryF={}", 
             urW, urH, gF, elF, veryF);
+        } else {
+            // In replay edit mode, UR gameplay scoring UI is replaced by timeline UI.
+            s_playerInputs.clear();
+            s_rhythmActive = false;
+        }
 
         return true;
     }
@@ -1402,9 +2130,14 @@ class $modify(MyPlayLayer, PlayLayer) {
                 }
             }
 
-            debugLogToFile(fmt::format("calling applyReplayAudioSync currentTime={:.3f} isSeeking={}", currentTime, fields->m_isSeeking));
-            applyReplayAudioSync(currentTime, fields->m_isSeeking);
-            debugLogToFile("applyReplayAudioSync returned");
+            // In edit mode, avoid running expensive continuous audio sync while fully paused.
+            // Manual preview/seek actions already force a sync when needed.
+            bool shouldSyncAudio = !(fields->m_isReplayEditMode && fields->m_isPaused && !fields->m_isSeeking);
+            if (shouldSyncAudio) {
+                debugLogToFile(fmt::format("calling applyReplayAudioSync currentTime={:.3f} isSeeking={}", currentTime, fields->m_isSeeking));
+                applyReplayAudioSync(currentTime, fields->m_isSeeking);
+                debugLogToFile("applyReplayAudioSync returned");
+            }
 
             // Auto-inject inputs from replay that should occur now
             while (fields->m_nextInputIdx < replay.presses.size()) {
@@ -1457,6 +2190,14 @@ class $modify(MyPlayLayer, PlayLayer) {
                 auto timeStr = fmt::format("{} / {}", formatTime(currentTime), formatTime(totalTime));
                 fields->m_timeLabel->setString(timeStr.c_str());
             }
+
+            if (fields->m_isReplayEditMode) {
+                rebuildEditTimeline(false);
+                updateEditTimelineCursor();
+            }
+
+            // Edit mode follows replay playback continuously; edits are applied live
+            // via replay data updates without forced reset/seek preview.
         }
 
         // Debug counter – log every ~120 frames. BEFORE any early return!
@@ -1920,7 +2661,7 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_replayCurrentTime = 0.0f;
             fields->m_pauseTime = 0.0f;
             fields->m_replayHoldingJump = false;
-            float scale = fields->m_isSeeking ? 4.0f : g_replayPlayer.playbackSpeed;
+            float scale = fields->m_isSeeking ? 4.0f : (fields->m_isPaused ? 0.0f : g_replayPlayer.playbackSpeed);
             CCDirector::sharedDirector()->getScheduler()->setTimeScale(scale);
             fields->m_lastAudioSyncMs = -1.0f;
             fields->m_audioPausedByReplay = false;
@@ -1991,6 +2732,9 @@ class $modify(MyPlayLayer, PlayLayer) {
             g_replayPlayer.isPaused = false;
             g_replayPlayer.pauseTime = 0.0f;
             g_replayPlayer.inputIndex = 0.0f;
+            g_replayPlayer.isEditMode = false;
+            g_replayPlayer.levelId = 0;
+            g_replayPlayer.sourceReplayPath.clear();
         }
 
         s_rhythmActive = false;
