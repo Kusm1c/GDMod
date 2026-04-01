@@ -2,12 +2,15 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/EndLevelLayer.hpp>
+#include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/binding/Slider.hpp>
 #include <fstream>
 #include <chrono>
 #include <cmath>
+#include <deque>
 #include <limits>
+#include <memory>
 #include <utility>
 
 using namespace geode::prelude;
@@ -63,15 +66,32 @@ struct URTick {
 // Static bridge: captures player inputs from GJBaseGameLayer::handleButton
 static std::vector<std::pair<float, bool>> s_playerInputs; // (time, isPress)
 static bool s_rhythmActive = false;
+static bool s_replayInputInjectionActive = false;
 
 class $modify(MyGJBGL, GJBaseGameLayer) {
     void handleButton(bool push, int button, bool isPlayer1) {
+        bool replayMode = g_replayPlayer.isActive && g_replayPlayer.replay.has_value();
+
+        if (s_replayInputInjectionActive) {
+            GJBaseGameLayer::handleButton(push, button, isPlayer1);
+            return;
+        }
+
+        if (replayMode) {
+            if (s_rhythmActive && isPlayer1 && button == 1) {
+                float time = static_cast<float>(m_gameState.m_currentProgress);
+                auto pl = PlayLayer::get();
+                if (pl) time = static_cast<float>(pl->m_timePlayed);
+                s_playerInputs.push_back({time, push});
+            }
+            return;
+        }
+
         GJBaseGameLayer::handleButton(push, button, isPlayer1);
         if (s_rhythmActive && isPlayer1 && button == 1) {
             float time = static_cast<float>(m_gameState.m_currentProgress);
-            // Use m_timePlayed from the game layer for accurate timing
-            auto pl = PlayLayer::get();
-            if (pl) time = static_cast<float>(pl->m_timePlayed);
+            auto plTime = PlayLayer::get();
+            if (plTime) time = static_cast<float>(plTime->m_timePlayed);
             s_playerInputs.push_back({time, push});
         }
     }
@@ -79,6 +99,14 @@ class $modify(MyGJBGL, GJBaseGameLayer) {
 
 class $modify(MyPlayLayer, PlayLayer) {
     struct Fields {
+        struct ReplayStepSnapshot {
+            uint64_t frame = 0;
+            float time = 0.0f;
+            size_t nextInputIdx = 0;
+            bool replayHoldingJump = false;
+            std::shared_ptr<CheckpointObject> checkpoint;
+        };
+
         std::vector<ReplayPress> m_presses;
         CCNode* m_circleLayer = nullptr;
         CCNode* m_indicator = nullptr; // hollow square following the player
@@ -131,6 +159,12 @@ class $modify(MyPlayLayer, PlayLayer) {
         bool m_isSeeking = false;
         float m_seekTargetTime = 0.0f;
         float m_seekResumeSpeed = 1.0f;
+        bool m_snapshotRestoreDirty = false;
+        float m_snapshotRestoreTime = 0.0f;
+        bool m_frameStepActive = false;
+        int m_frameStepRemaining = 0;
+        uint64_t m_frameStepLastFrame = 0;
+        std::deque<ReplayStepSnapshot> m_replayStepHistory;
         bool m_replayHoldingJump = false;
         CCNode* m_videoControlsLayer = nullptr;
         CCLabelBMFont* m_timeLabel = nullptr;
@@ -215,6 +249,157 @@ class $modify(MyPlayLayer, PlayLayer) {
         return 0.0001f;
     }
 
+    void captureReplayStepSnapshot(uint64_t liveFrame, float currentTime) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode) return;
+
+        Fields::ReplayStepSnapshot snap;
+        snap.frame = liveFrame;
+        snap.time = currentTime;
+        snap.nextInputIdx = fields->m_nextInputIdx;
+        snap.replayHoldingJump = fields->m_replayHoldingJump;
+
+        if (auto* checkpoint = this->createCheckpoint()) {
+            checkpoint->retain();
+            snap.checkpoint = std::shared_ptr<CheckpointObject>(checkpoint, [](CheckpointObject* value) {
+                value->release();
+            });
+        }
+
+        if (!fields->m_replayStepHistory.empty() && fields->m_replayStepHistory.back().frame == liveFrame) {
+            fields->m_replayStepHistory.back() = snap;
+        } else {
+            fields->m_replayStepHistory.push_back(snap);
+            constexpr size_t kMaxHistory = 2400;
+            if (fields->m_replayStepHistory.size() > kMaxHistory) {
+                fields->m_replayStepHistory.pop_front();
+            }
+        }
+    }
+
+    bool restoreReplayStepSnapshot(uint64_t targetFrame) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode) return false;
+        if (fields->m_replayStepHistory.empty()) return false;
+
+        const Fields::ReplayStepSnapshot* best = nullptr;
+        for (auto it = fields->m_replayStepHistory.rbegin(); it != fields->m_replayStepHistory.rend(); ++it) {
+            if (it->frame <= targetFrame) {
+                best = &(*it);
+                break;
+            }
+        }
+        if (!best) return false;
+
+        fields->m_isPaused = true;
+        fields->m_isSeeking = false;
+        fields->m_seekTargetTime = 0.0f;
+        fields->m_frameStepActive = false;
+        fields->m_frameStepRemaining = 0;
+        fields->m_replayCurrentTime = best->time;
+        fields->m_pauseTime = best->time;
+        fields->m_snapshotRestoreDirty = false;
+        fields->m_snapshotRestoreTime = 0.0f;
+        fields->m_nextInputIdx = best->nextInputIdx;
+        fields->m_replayHoldingJump = best->replayHoldingJump;
+
+        if (best->checkpoint) {
+            this->loadFromCheckpoint(best->checkpoint.get());
+            this->removeAllCheckpoints();
+            this->storeCheckpoint(best->checkpoint.get());
+            this->m_currentCheckpoint = best->checkpoint.get();
+            this->m_activatedCheckpoint = nullptr;
+            this->m_tryPlaceCheckpoint = false;
+        }
+
+        m_timePlayed = best->time;
+        m_gameState.m_currentProgress = best->time;
+
+        // Recompute camera immediately so paused frame-step view matches restored player position.
+        this->resetCamera();
+        this->updateCamera(0.0f);
+
+        CCDirector::sharedDirector()->getScheduler()->setTimeScale(pausedUiTimeScale());
+        applyReplayAudioSync(best->time, true);
+
+        g_replayExternalCommands.liveFrame.store(best->frame);
+        g_replayExternalCommands.livePaused.store(true);
+        g_replayExternalCommands.liveReplayActive.store(true);
+        return true;
+    }
+
+    void stepReplayByFramesNoReset(int stepFrames) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode) return;
+        if (!g_replayPlayer.replay.has_value()) return;
+
+        auto& replay = g_replayPlayer.replay.value();
+        if (replay.framerate <= 0.0 || replay.presses.empty()) return;
+
+        float frameSeconds = 1.0f / static_cast<float>(replay.framerate);
+        float totalTime = static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate);
+        float currentTime = static_cast<float>(m_timePlayed);
+        float target = std::clamp(currentTime + static_cast<float>(stepFrames) * frameSeconds, 0.0f, totalTime);
+
+        if (stepFrames > 0) {
+            fields->m_isPaused = false;
+            fields->m_isSeeking = false;
+            fields->m_seekTargetTime = 0.0f;
+            fields->m_snapshotRestoreDirty = false;
+            fields->m_frameStepActive = true;
+            fields->m_frameStepRemaining = std::max(1, fields->m_frameStepRemaining + stepFrames);
+            fields->m_frameStepLastFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
+            return;
+        }
+
+        // Backward stepping restores from recorded snapshots for instant precision.
+        uint64_t currentFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
+        uint64_t targetFrame = (currentFrame > static_cast<uint64_t>(-stepFrames))
+            ? (currentFrame - static_cast<uint64_t>(-stepFrames))
+            : 0;
+        if (restoreReplayStepSnapshot(targetFrame)) {
+            return;
+        }
+
+        // Fallback when history is empty (e.g. first backward step right after load).
+        fields->m_isPaused = true;
+        fields->m_frameStepActive = false;
+        fields->m_frameStepRemaining = 0;
+        fields->m_snapshotRestoreDirty = false;
+        fields->m_isSeeking = (target > 0.05f);
+        fields->m_seekTargetTime = target;
+        fields->m_seekResumeSpeed = 1.0f;
+        fields->m_nextInputIdx = 0;
+        bool shouldHold = false;
+        for (size_t i = 0; i < replay.presses.size(); ++i) {
+            float pressTime = static_cast<float>(replay.presses[i].framePress) / static_cast<float>(replay.framerate);
+            float releaseTime = static_cast<float>(replay.presses[i].frameRelease) / static_cast<float>(replay.framerate);
+            if (target >= releaseTime) {
+                fields->m_nextInputIdx = i + 1;
+                continue;
+            }
+            if (target >= pressTime && target < releaseTime) {
+                shouldHold = true;
+                fields->m_nextInputIdx = i;
+            }
+            break;
+        }
+
+        if (shouldHold != fields->m_replayHoldingJump) {
+            s_replayInputInjectionActive = true;
+            this->handleButton(shouldHold, 1, true);
+            s_replayInputInjectionActive = false;
+        }
+        fields->m_replayHoldingJump = shouldHold;
+        this->resetLevel();
+        applyReplayAudioSync(0.0f, true);
+
+        g_replayExternalCommands.liveFrame.store(static_cast<uint64_t>(std::llround(static_cast<double>(target) * replay.framerate)));
+        g_replayExternalCommands.livePaused.store(true);
+        g_replayExternalCommands.liveReplayActive.store(true);
+    }
+
     void processExternalCommandsAlwaysRunning(float dt) {
         auto fields = m_fields.self();
         if (!fields->m_isReplayMode) return;
@@ -237,6 +422,8 @@ class $modify(MyPlayLayer, PlayLayer) {
             bool targetPaused = (desiredPaused == 1);
             traceDebug("[CMDDBG] setPausedState={} targetPaused={} currentPaused={} liveFrame={}", 
                 desiredPaused, targetPaused, fields->m_isPaused, liveFrame);
+            fields->m_frameStepActive = false;
+            fields->m_frameStepRemaining = 0;
             if (fields->m_isPaused != targetPaused) {
                 traceDebug("[POSTDBG] BEFORE onReplayPlayPause isPaused={}", fields->m_isPaused);
                 onReplayPlayPause(nullptr);
@@ -251,32 +438,10 @@ class $modify(MyPlayLayer, PlayLayer) {
         int stepFrames = g_replayExternalCommands.stepFrameRequests.exchange(0);
         if (stepFrames != 0 && replay.framerate > 0.0) {
             uint64_t calcFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate)) + stepFrames;
-            float totalTime = static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate);
-            float stepSeconds = static_cast<float>(stepFrames) / static_cast<float>(replay.framerate);
-            float target = std::clamp(currentTime + stepSeconds, 0.0f, totalTime);
-
-            traceDebug("[CMDDBG] STEP: stepFrames={} currentTime={:.3f}s calcFrame={} target={:.3f}s", 
-                stepFrames, currentTime, calcFrame, target);
-
-            fields->m_isPaused = true;
-            fields->m_isSeeking = false;
-            fields->m_nextInputIdx = 0;
-
-            if (target <= 0.05f) {
-                traceDebug("[CMDDBG] STEP -> resetLevel (near start)");
-                this->resetLevel();
-                applyReplayAudioSync(0.0f, true);
-            } else {
-                traceDebug("[CMDDBG] STEP -> seeking");
-                fields->m_isSeeking = true;
-                fields->m_seekTargetTime = target;
-                fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
-                this->resetLevel();
-                applyReplayAudioSync(0.0f, true);
-            }
-
-            currentTime = static_cast<float>(m_timePlayed);
-            fields->m_replayCurrentTime = currentTime;
+            traceDebug("[CMDDBG] STEP without reset: stepFrames={} currentTime={:.3f}s targetFrame={}", 
+                stepFrames, currentTime, calcFrame);
+            stepReplayByFramesNoReset(stepFrames);
+            currentTime = fields->m_replayCurrentTime;
         }
         traceDebug("[POSTDBG] DONE stepFrameRequests");
     }
@@ -1300,7 +1465,10 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_isSeeking = false;
             fields->m_seekTargetTime = 0.0f;
             fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
+            fields->m_snapshotRestoreDirty = false;
+            fields->m_snapshotRestoreTime = 0.0f;
             fields->m_replayHoldingJump = false;
+            fields->m_replayStepHistory.clear();
             fields->m_editSelectedIdx = 0;
             CCDirector::sharedDirector()->getScheduler()->setTimeScale(
                 fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed
@@ -1913,6 +2081,7 @@ class $modify(MyPlayLayer, PlayLayer) {
         // Activate rhythm input capture
         s_playerInputs.clear();
         s_rhythmActive = true;
+        s_replayInputInjectionActive = false;
         fields->m_processedInputIdx = 0;
 
         log::info("[UR] Rhythm mode active. UR bar: {}x{} goodF={} elF={} veryF={}", 
@@ -1938,7 +2107,9 @@ class $modify(MyPlayLayer, PlayLayer) {
             traceDebug("[POSTDBG] START replay mode block");
             auto& replay = g_replayPlayer.replay.value();
             auto scheduler = CCDirector::sharedDirector()->getScheduler();
-            float targetScale = fields->m_isSeeking ? 4.0f : (fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed);
+            float targetScale = fields->m_isSeeking
+                ? 4.0f
+                : (fields->m_frameStepActive ? 1.0f : (fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed));
             scheduler->setTimeScale(std::max(0.0f, targetScale));
             debugLogToFile(fmt::format("postUpdate dt={} targetScale={} currentTimeScale={}", dt, targetScale, scheduler->getTimeScale()));
 
@@ -1952,6 +2123,24 @@ class $modify(MyPlayLayer, PlayLayer) {
                 liveFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
                 g_replayExternalCommands.liveFrame.store(liveFrame);
             }
+
+            if (fields->m_frameStepActive && replay.framerate > 0.0) {
+                if (liveFrame > fields->m_frameStepLastFrame) {
+                    int advanced = static_cast<int>(liveFrame - fields->m_frameStepLastFrame);
+                    fields->m_frameStepRemaining -= advanced;
+                    fields->m_frameStepLastFrame = liveFrame;
+                }
+                if (fields->m_frameStepRemaining <= 0) {
+                    fields->m_frameStepActive = false;
+                    fields->m_frameStepRemaining = 0;
+                    fields->m_isPaused = true;
+                    fields->m_pauseTime = currentTime;
+                    scheduler->setTimeScale(pausedUiTimeScale());
+                    fields->m_lastAudioSyncMs = -1.0f;
+                    applyReplayAudioSync(currentTime, true);
+                }
+            }
+
             g_replayExternalCommands.livePaused.store(fields->m_isPaused);
             g_replayExternalCommands.liveReplayActive.store(true);
             // Log state only on state changes
@@ -1971,7 +2160,11 @@ class $modify(MyPlayLayer, PlayLayer) {
                 traceDebug("[CMDDBG] RESTART command received");
                 fields->m_isPaused = true;
                 fields->m_isSeeking = false;
+                fields->m_frameStepActive = false;
+                fields->m_frameStepRemaining = 0;
                 fields->m_seekTargetTime = 0.0f;
+                fields->m_snapshotRestoreDirty = false;
+                fields->m_snapshotRestoreTime = 0.0f;
                 fields->m_nextInputIdx = 0;
                 this->resetLevel();
                 applyReplayAudioSync(0.0f, true);
@@ -2028,7 +2221,9 @@ class $modify(MyPlayLayer, PlayLayer) {
                 if (currentTime >= releaseTime) {
                     // Release and advance to next replay press
                     if (fields->m_replayHoldingJump) {
+                        s_replayInputInjectionActive = true;
                         this->handleButton(false, 1, true);
+                        s_replayInputInjectionActive = false;
                         fields->m_replayHoldingJump = false;
                     }
                     fields->m_nextInputIdx++;
@@ -2038,7 +2233,9 @@ class $modify(MyPlayLayer, PlayLayer) {
                 if (currentTime >= pressTime) {
                     // Press for the current replay event
                     if (!fields->m_replayHoldingJump) {
+                        s_replayInputInjectionActive = true;
                         this->handleButton(true, 1, true);
+                        s_replayInputInjectionActive = false;
                         fields->m_replayHoldingJump = true;
                     }
                 }
@@ -2071,6 +2268,8 @@ class $modify(MyPlayLayer, PlayLayer) {
                 auto timeStr = fmt::format("{} / {}", formatTime(currentTime), formatTime(totalTime));
                 fields->m_timeLabel->setString(timeStr.c_str());
             }
+
+            captureReplayStepSnapshot(liveFrame, currentTime);
 
             if (fields->m_isReplayEditMode) {
                 rebuildEditTimeline(false);
@@ -2457,10 +2656,20 @@ class $modify(MyPlayLayer, PlayLayer) {
         auto fields = m_fields.self();
         if (!fields->m_isReplayMode) return;
 
-        fields->m_isPaused = !fields->m_isPaused;
-        if (fields->m_isPaused) {
+        bool wasPaused = fields->m_isPaused;
+        if (!wasPaused) {
+            fields->m_isPaused = true;
             fields->m_pauseTime = static_cast<float>(m_timePlayed);
+        } else {
+            if (fields->m_snapshotRestoreDirty) {
+                fields->m_snapshotRestoreDirty = false;
+            }
+
+            fields->m_isPaused = false;
+            fields->m_isSeeking = false;
+            fields->m_seekTargetTime = 0.0f;
         }
+
         if (!fields->m_isSeeking) {
             float scale = fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed;
             CCDirector::sharedDirector()->getScheduler()->setTimeScale(scale);
@@ -2670,6 +2879,11 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_nextInputIdx = 0;
             fields->m_replayCurrentTime = 0.0f;
             fields->m_pauseTime = 0.0f;
+            fields->m_snapshotRestoreDirty = false;
+            fields->m_snapshotRestoreTime = 0.0f;
+            fields->m_frameStepActive = false;
+            fields->m_frameStepRemaining = 0;
+            fields->m_replayStepHistory.clear();
             fields->m_replayHoldingJump = false;
             float scale = fields->m_isSeeking ? 4.0f : (fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed);
             CCDirector::sharedDirector()->getScheduler()->setTimeScale(scale);
@@ -2723,6 +2937,7 @@ class $modify(MyPlayLayer, PlayLayer) {
             // Clear player inputs
             s_playerInputs.clear();
             s_rhythmActive = true;
+            s_replayInputInjectionActive = false;
         }
     }
 
@@ -2754,6 +2969,7 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         s_rhythmActive = false;
         s_playerInputs.clear();
+        s_replayInputInjectionActive = false;
         PlayLayer::onQuit();
     }
 };
