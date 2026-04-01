@@ -188,15 +188,22 @@ namespace {
 
     static void followLiveFrame(ExternalReplayEditor* editor) {
         if (!editor) return;
-        if (!editor->followPlayhead) return;
         bool active = g_replayExternalCommands.liveReplayActive.load();
         if (!active) return;
+        bool livePaused = g_replayExternalCommands.livePaused.load();
 
         int width = std::max(kTimelineMinWidth, editor->timelineWidth);
         uint64_t windowFrames = static_cast<uint64_t>((width / 8) * std::max(1, editor->framesPerCell));
         if (windowFrames < 2) windowFrames = 2;
 
         uint64_t liveFrame = g_replayExternalCommands.liveFrame.load();
+        if (!livePaused) {
+            editor->timelineStartFrame = (liveFrame > windowFrames / 3) ? (liveFrame - windowFrames / 3) : 0;
+            return;
+        }
+
+        if (!editor->followPlayhead) return;
+
         uint64_t leftBound = editor->timelineStartFrame + windowFrames / 8;
         uint64_t rightBound = editor->timelineStartFrame + (windowFrames * 7) / 8;
         
@@ -258,6 +265,29 @@ namespace {
         int localX = std::clamp(clientX - kTimelineLeft, 0, width - 1);
         uint64_t cellFrame = static_cast<uint64_t>((localX / 8) * editor->framesPerCell);
         editor->timelineStartFrame = (anchorFrame > cellFrame) ? (anchorFrame - cellFrame) : 0;
+    }
+
+    static void setTimelineAutoFollow(ExternalReplayEditor* editor, bool enabled) {
+        if (!editor) return;
+        editor->followPlayhead = enabled;
+        if (editor->hwnd) {
+            SetWindowTextW(
+                GetDlgItem(editor->hwnd, IDC_BTN_CTRL_FOLLOW),
+                enabled ? L"Auto-follow:On" : L"Auto-follow:Off"
+            );
+        }
+    }
+
+    static uint64_t clampNonNegativeFrame(int64_t frame);
+
+    static void panTimelineByFrames(ExternalReplayEditor* editor, int64_t deltaFrames) {
+        if (!editor) return;
+
+        if (deltaFrames == 0) return;
+        setTimelineAutoFollow(editor, false);
+
+        int64_t next = static_cast<int64_t>(editor->timelineStartFrame) + deltaFrames;
+        editor->timelineStartFrame = clampNonNegativeFrame(next);
     }
 
     static uint64_t clampNonNegativeFrame(int64_t frame) {
@@ -377,7 +407,10 @@ namespace {
 
         auto const count = editor->replay.presses.size();
         editor->index = std::min(editor->index, count - 1);
-        ensureSelectedInputVisible(editor);
+        bool liveActive = g_replayExternalCommands.liveReplayActive.load();
+        if (!liveActive) {
+            ensureSelectedInputVisible(editor);
+        }
 
         auto const& press = editor->replay.presses[editor->index];
         auto label = fmt::format("Input {} / {} | Player {}", editor->index + 1, count, press.player);
@@ -823,14 +856,12 @@ namespace {
                 } else if (id == IDC_BTN_CLOSE) {
                     DestroyWindow(hwnd);
                 } else if (id == IDC_BTN_TL_LEFT) {
-                    int width = std::max(kTimelineMinWidth, editor->timelineWidth);
-                    uint64_t step = static_cast<uint64_t>((width / 8) * editor->framesPerCell / 2);
-                    editor->timelineStartFrame = (editor->timelineStartFrame > step) ? editor->timelineStartFrame - step : 0;
+                    int64_t step = static_cast<int64_t>(std::max<uint64_t>(1, timelineWindowFrames(editor) / 2));
+                    panTimelineByFrames(editor, -step);
                     refreshEditorUi(editor);
                 } else if (id == IDC_BTN_TL_RIGHT) {
-                    int width = std::max(kTimelineMinWidth, editor->timelineWidth);
-                    uint64_t step = static_cast<uint64_t>((width / 8) * editor->framesPerCell / 2);
-                    editor->timelineStartFrame += std::max<uint64_t>(step, 1);
+                    int64_t step = static_cast<int64_t>(std::max<uint64_t>(1, timelineWindowFrames(editor) / 2));
+                    panTimelineByFrames(editor, step);
                     refreshEditorUi(editor);
                 } else if (id == IDC_BTN_ZOOM_OUT) {
                     editor->framesPerCell = std::min(32, editor->framesPerCell * 2);
@@ -863,8 +894,7 @@ namespace {
                     traceDebug("[UIDBG] -> setPausedState=1 restartRequested=true");
                     refocusGameWindow(editor);
                 } else if (id == IDC_BTN_CTRL_FOLLOW) {
-                    editor->followPlayhead = !editor->followPlayhead;
-                    SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_CTRL_FOLLOW), editor->followPlayhead ? L"Auto-follow:On" : L"Auto-follow:Off");
+                    setTimelineAutoFollow(editor, !editor->followPlayhead);
                     refreshEditorUi(editor);
                 }
                 return 0;
@@ -873,6 +903,9 @@ namespace {
             case WM_TIMER:
                 if (editor && wParam == 1) {
                     followLiveFrame(editor);
+                    if (editor->followPlayhead) {
+                        SetWindowTextW(GetDlgItem(hwnd, IDC_BTN_CTRL_FOLLOW), L"Auto-follow:On");
+                    }
                     refreshEditorUi(editor);
                 }
                 return 0;
@@ -884,7 +917,14 @@ namespace {
                 if (!isPointInTimeline(editor, pt.x, pt.y)) return 0;
 
                 int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-                zoomTimelineAtX(editor, pt.x, delta > 0);
+                bool ctrlDown = (GET_KEYSTATE_WPARAM(wParam) & MK_CONTROL) != 0;
+                if (ctrlDown) {
+                    zoomTimelineAtX(editor, pt.x, delta > 0);
+                } else {
+                    int64_t window = static_cast<int64_t>(std::max<uint64_t>(1, timelineWindowFrames(editor)));
+                    int64_t step = std::max<int64_t>(1, window / 4);
+                    panTimelineByFrames(editor, delta > 0 ? -step : step);
+                }
                 refreshEditorUi(editor);
                 refocusGameWindow(editor);
                 return 0;
