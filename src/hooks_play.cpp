@@ -3,6 +3,8 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/EndLevelLayer.hpp>
 #include <Geode/binding/CheckpointObject.hpp>
+#include <Geode/binding/GameObject.hpp>
+#include <Geode/binding/OBB2D.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/binding/Slider.hpp>
 #include <fstream>
@@ -11,6 +13,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <unordered_set>
 #include <utility>
 
 using namespace geode::prelude;
@@ -20,6 +23,7 @@ using namespace geode::prelude;
 // ============================================================
 static const char* DEBUG_LOG_FILE = "GDMod_debug.txt";
 static constexpr bool ENABLE_ULTRA_AUDIO_FILE_DEBUG = false;
+static constexpr bool ENABLE_RUNTIME_HITBOX_OVERLAY = true;
 
 [[maybe_unused]] static void debugLogToFileImpl(const std::string& msg) {
     try {
@@ -109,6 +113,8 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         std::vector<ReplayPress> m_presses;
         CCNode* m_circleLayer = nullptr;
+        CCDrawNode* m_runtimeHitboxOverlay = nullptr;
+        bool m_runtimeHitboxCaptured = false;
         CCNode* m_indicator = nullptr; // hollow square following the player
         CCLabelBMFont* m_indicatorStyleLabel = nullptr;
         double m_framerate = 240.0;
@@ -166,6 +172,8 @@ class $modify(MyPlayLayer, PlayLayer) {
         uint64_t m_frameStepLastFrame = 0;
         std::deque<ReplayStepSnapshot> m_replayStepHistory;
         bool m_replayHoldingJump = false;
+        uint64_t m_replayFrameCursor = 0;
+        bool m_replayFrameCursorValid = false;
         CCNode* m_videoControlsLayer = nullptr;
         CCLabelBMFont* m_timeLabel = nullptr;
         CCLabelBMFont* m_speedLabel = nullptr;
@@ -302,6 +310,8 @@ class $modify(MyPlayLayer, PlayLayer) {
         fields->m_snapshotRestoreTime = 0.0f;
         fields->m_nextInputIdx = best->nextInputIdx;
         fields->m_replayHoldingJump = best->replayHoldingJump;
+        fields->m_replayFrameCursor = best->frame;
+        fields->m_replayFrameCursorValid = true;
 
         if (best->checkpoint) {
             this->loadFromCheckpoint(best->checkpoint.get());
@@ -349,6 +359,8 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_frameStepActive = true;
             fields->m_frameStepRemaining = std::max(1, fields->m_frameStepRemaining + stepFrames);
             fields->m_frameStepLastFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
+            fields->m_replayFrameCursor = fields->m_frameStepLastFrame;
+            fields->m_replayFrameCursorValid = true;
             CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
             return;
         }
@@ -392,6 +404,8 @@ class $modify(MyPlayLayer, PlayLayer) {
             s_replayInputInjectionActive = false;
         }
         fields->m_replayHoldingJump = shouldHold;
+        fields->m_replayFrameCursor = static_cast<uint64_t>(std::llround(static_cast<double>(target) * replay.framerate));
+        fields->m_replayFrameCursorValid = true;
         this->resetLevel();
         applyReplayAudioSync(0.0f, true);
 
@@ -404,6 +418,7 @@ class $modify(MyPlayLayer, PlayLayer) {
         auto fields = m_fields.self();
         if (!fields->m_isReplayMode) return;
         if (!g_replayPlayer.replay.has_value()) return;
+        if (!ensureReplayRuntimeReady("processExternalCommandsAlwaysRunning")) return;
 
         auto& replay = g_replayPlayer.replay.value();
         float currentTime = static_cast<float>(m_timePlayed);
@@ -707,11 +722,106 @@ class $modify(MyPlayLayer, PlayLayer) {
         debugLogToFile(fmt::format("=== ensureReplayMusicStarted END ==="));
     }
 
+    bool ensureReplayRuntimeReady(char const* context) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode || !g_replayPlayer.replay.has_value()) return false;
+
+        auto& replay = g_replayPlayer.replay.value();
+        if (replay.framerate <= 0.0 || replay.presses.empty()) {
+            log::warn("[ReplaySafety] Disabled replay runtime in {} (invalid replay payload)", context);
+            fields->m_isReplayMode = false;
+            fields->m_isPaused = true;
+            fields->m_isSeeking = false;
+            fields->m_frameStepActive = false;
+            fields->m_frameStepRemaining = 0;
+            fields->m_replayHoldingJump = false;
+            fields->m_replayFrameCursorValid = false;
+            g_replayPlayer.isActive = false;
+            return false;
+        }
+
+        if (fields->m_nextInputIdx > replay.presses.size()) {
+            fields->m_nextInputIdx = replay.presses.size();
+        }
+        return true;
+    }
+
     float replayTotalTimeSeconds() const {
         if (!g_replayPlayer.replay.has_value()) return 0.0f;
         auto const& replay = g_replayPlayer.replay.value();
         if (replay.presses.empty() || replay.framerate <= 0.0) return 0.0f;
         return static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate);
+    }
+
+    uint64_t replayFrameAtTime(float timeSeconds) const {
+        if (!g_replayPlayer.replay.has_value()) return 0;
+        auto const& replay = g_replayPlayer.replay.value();
+        if (replay.framerate <= 0.0) return 0;
+        return static_cast<uint64_t>(std::llround(static_cast<double>(timeSeconds) * replay.framerate));
+    }
+
+    void primeReplayFrameCursor(float timeSeconds) {
+        auto fields = m_fields.self();
+        fields->m_replayFrameCursor = replayFrameAtTime(timeSeconds);
+        fields->m_replayFrameCursorValid = true;
+    }
+
+    void pumpReplayInputsThroughFrame(uint64_t currentFrame) {
+        auto fields = m_fields.self();
+        if (!fields->m_isReplayMode || !g_replayPlayer.replay.has_value()) return;
+
+        auto& replay = g_replayPlayer.replay.value();
+        if (replay.framerate <= 0.0 || replay.presses.empty()) {
+            fields->m_replayFrameCursor = currentFrame;
+            fields->m_replayFrameCursorValid = true;
+            return;
+        }
+
+        uint64_t startFrame = fields->m_replayFrameCursorValid
+            ? fields->m_replayFrameCursor
+            : (currentFrame == 0 ? std::numeric_limits<uint64_t>::max() : currentFrame - 1);
+
+        if (currentFrame < startFrame) {
+            fields->m_replayFrameCursor = currentFrame;
+            fields->m_replayFrameCursorValid = true;
+            return;
+        }
+
+        for (uint64_t frame = startFrame + 1; frame <= currentFrame; ++frame) {
+            while (fields->m_nextInputIdx < replay.presses.size()) {
+                auto& press = replay.presses[fields->m_nextInputIdx];
+
+                if (press.frameRelease < frame) {
+                    fields->m_nextInputIdx++;
+                    continue;
+                }
+
+                if (press.framePress > frame) {
+                    break;
+                }
+
+                if (press.framePress <= frame && !fields->m_replayHoldingJump) {
+                    s_replayInputInjectionActive = true;
+                    this->handleButton(true, 1, true);
+                    s_replayInputInjectionActive = false;
+                    fields->m_replayHoldingJump = true;
+                }
+
+                if (press.frameRelease <= frame && fields->m_replayHoldingJump) {
+                    s_replayInputInjectionActive = true;
+                    this->handleButton(false, 1, true);
+                    s_replayInputInjectionActive = false;
+                    fields->m_replayHoldingJump = false;
+                    fields->m_nextInputIdx++;
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        fields->m_replayFrameCursor = currentFrame;
+        fields->m_replayFrameCursorValid = true;
     }
 
     uint64_t replayMaxFrame() const {
@@ -762,6 +872,9 @@ class $modify(MyPlayLayer, PlayLayer) {
             }
             break;
         }
+
+        fields->m_replayFrameCursor = replayFrameAtTime(currentTime);
+        fields->m_replayFrameCursorValid = true;
     }
 
     void updateReplayEditLabels() {
@@ -1442,19 +1555,218 @@ class $modify(MyPlayLayer, PlayLayer) {
         updateReplayEditLabels();
     }
 
+    bool captureRuntimeHitboxesForLevel(GJGameLevel* level) {
+        if (!level || level->m_levelID <= 0) return false;
+
+        auto isHazardType = [](GameObjectType t) {
+            return t == GameObjectType::Hazard || t == GameObjectType::AnimatedHazard;
+        };
+        auto isSolidType = [](GameObjectType t) {
+            return t == GameObjectType::Solid || t == GameObjectType::Slope || t == GameObjectType::CollisionObject;
+        };
+
+        ReplayRuntimeHitboxSnapshot snapshot;
+        snapshot.levelId = level->m_levelID;
+        snapshot.captureMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count()
+        );
+        snapshot.minX = std::numeric_limits<float>::max();
+        snapshot.minY = std::numeric_limits<float>::max();
+        snapshot.maxX = -std::numeric_limits<float>::max();
+        snapshot.maxY = -std::numeric_limits<float>::max();
+
+        std::unordered_set<GameObject*> seen;
+        size_t reserveGuess = static_cast<size_t>(m_solidCollisionObjects.size() + m_hazardCollisionObjects.size());
+        if (m_objects) reserveGuess += static_cast<size_t>(m_objects->count());
+        if (m_collisionBlocks) reserveGuess += static_cast<size_t>(m_collisionBlocks->count());
+        seen.reserve(std::max<size_t>(64, reserveGuess));
+
+        auto collectObject = [&](GameObject* obj, bool sourceSolid, bool sourceHazard) {
+            if (!obj) return;
+
+                bool isHazard = sourceHazard || isHazardType(obj->m_objectType);
+                bool isSolid = sourceSolid || isSolidType(obj->m_objectType);
+                if (obj->m_isPassable) {
+                    isSolid = false;
+                }
+                if (!isSolid && !isHazard) {
+                    return;
+                }
+
+                auto [_, inserted] = seen.insert(obj);
+                if (!inserted) {
+                    if (isSolid) snapshot.solidCount++;
+                    if (isHazard) snapshot.hazardCount++;
+                    return;
+                }
+
+                auto rect = obj->getObjectRect();
+                if (!std::isfinite(rect.size.width) || !std::isfinite(rect.size.height)) return;
+                if (!std::isfinite(rect.origin.x) || !std::isfinite(rect.origin.y)) return;
+                if (rect.size.width <= 0.01f || rect.size.height <= 0.01f) return;
+
+                ReplayRuntimeHitboxRect hb;
+                hb.objectId = obj->m_objectID;
+                hb.objectType = static_cast<int>(obj->m_objectType);
+                hb.isSolid = isSolid;
+                hb.isHazard = isHazard;
+
+                if (auto* obb = obj->getOrientedBox(); obb) {
+                    hb.shape = ReplayRuntimeHitboxRect::Shape::OrientedQuad;
+                    hb.corners = obb->m_corners;
+
+                    float minX = hb.corners[0].x;
+                    float minY = hb.corners[0].y;
+                    float maxX = hb.corners[0].x;
+                    float maxY = hb.corners[0].y;
+                    for (auto const& c : hb.corners) {
+                        minX = std::min(minX, c.x);
+                        minY = std::min(minY, c.y);
+                        maxX = std::max(maxX, c.x);
+                        maxY = std::max(maxY, c.y);
+                    }
+                    hb.x = (minX + maxX) * 0.5f;
+                    hb.y = (minY + maxY) * 0.5f;
+                    hb.width = std::max(1.0f, maxX - minX);
+                    hb.height = std::max(1.0f, maxY - minY);
+                } else {
+                    float radius = std::max(obj->m_scaleX, obj->m_scaleY) * obj->m_objectRadius;
+                    bool likelyCircle = radius > 0.2f && (hb.objectType == static_cast<int>(GameObjectType::Hazard) ||
+                        hb.objectType == static_cast<int>(GameObjectType::AnimatedHazard));
+
+                    if (likelyCircle) {
+                        hb.shape = ReplayRuntimeHitboxRect::Shape::Circle;
+                        hb.x = obj->getPositionX();
+                        hb.y = obj->getPositionY();
+                        hb.radius = radius;
+                        hb.width = radius * 2.0f;
+                        hb.height = radius * 2.0f;
+                    } else {
+                        hb.shape = ReplayRuntimeHitboxRect::Shape::Rectangle;
+                        hb.x = rect.origin.x + rect.size.width * 0.5f;
+                        hb.y = rect.origin.y + rect.size.height * 0.5f;
+                        hb.width = rect.size.width;
+                        hb.height = rect.size.height;
+                    }
+                }
+
+                snapshot.hitboxes.push_back(hb);
+
+                float left = hb.x - hb.width * 0.5f;
+                float right = hb.x + hb.width * 0.5f;
+                float bottom = hb.y - hb.height * 0.5f;
+                float top = hb.y + hb.height * 0.5f;
+                snapshot.minX = std::min(snapshot.minX, left);
+                snapshot.maxX = std::max(snapshot.maxX, right);
+                snapshot.minY = std::min(snapshot.minY, bottom);
+                snapshot.maxY = std::max(snapshot.maxY, top);
+
+                if (isSolid) snapshot.solidCount++;
+                if (isHazard) snapshot.hazardCount++;
+        };
+
+        auto collectFromVector = [&](gd::vector<GameObject*>& objects, bool sourceSolid, bool sourceHazard) {
+            for (auto* obj : objects) {
+                collectObject(obj, sourceSolid, sourceHazard);
+            }
+        };
+
+        auto collectFromArray = [&](cocos2d::CCArray* objects, bool sourceSolid, bool sourceHazard) {
+            if (!objects) return;
+            auto count = objects->count();
+            for (unsigned i = 0; i < count; ++i) {
+                auto* obj = typeinfo_cast<GameObject*>(objects->objectAtIndex(i));
+                collectObject(obj, sourceSolid, sourceHazard);
+            }
+        };
+
+        // Broad pass first for full-level coverage, then collision vectors for correctness parity.
+        collectFromArray(m_objects, false, false);
+        collectFromArray(m_collisionBlocks, true, false);
+        collectFromVector(m_solidCollisionObjects, true, false);
+        collectFromVector(m_hazardCollisionObjects, false, true);
+
+        if (snapshot.hitboxes.empty()) return false;
+        if (!std::isfinite(snapshot.minX) || !std::isfinite(snapshot.maxX)) return false;
+
+        storeRuntimeHitboxSnapshot(std::move(snapshot));
+        log::info(
+            "[RuntimeHitbox] captured level={} unique={} solidRefs={} hazardRefs={}",
+            level->m_levelID,
+            seen.size(),
+            m_solidCollisionObjects.size(),
+            m_hazardCollisionObjects.size()
+        );
+
+        if constexpr (ENABLE_RUNTIME_HITBOX_OVERLAY) {
+            auto fields = m_fields.self();
+            if (!fields->m_runtimeHitboxOverlay && m_debugDrawNode && m_debugDrawNode->getParent()) {
+                auto* dn = CCDrawNode::create();
+                dn->setBlendFunc({GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA});
+                dn->setID("runtime-hitbox-overlay"_spr);
+                dn->m_bUseArea = false;
+                m_debugDrawNode->getParent()->addChild(dn, 1408);
+                fields->m_runtimeHitboxOverlay = dn;
+            }
+
+            if (auto* dn = fields->m_runtimeHitboxOverlay) {
+                dn->clear();
+                for (auto const& hb : snapshot.hitboxes) {
+                    cocos2d::ccColor4F border = hb.isHazard
+                        ? cocos2d::ccColor4F{1.0f, 0.30f, 0.30f, 0.95f}
+                        : (hb.isSolid ? cocos2d::ccColor4F{0.45f, 0.70f, 1.0f, 0.95f} : cocos2d::ccColor4F{0.85f, 0.85f, 0.85f, 0.80f});
+                    cocos2d::ccColor4F fill = hb.isHazard
+                        ? cocos2d::ccColor4F{1.0f, 0.30f, 0.30f, 0.18f}
+                        : (hb.isSolid ? cocos2d::ccColor4F{0.45f, 0.70f, 1.0f, 0.16f} : cocos2d::ccColor4F{0.85f, 0.85f, 0.85f, 0.10f});
+
+                    if (hb.shape == ReplayRuntimeHitboxRect::Shape::OrientedQuad) {
+                        std::array<cocos2d::CCPoint, 4> poly = hb.corners;
+                        dn->drawPolygon(poly.data(), 4, fill, 0.35f, border);
+                        continue;
+                    }
+
+                    if (hb.shape == ReplayRuntimeHitboxRect::Shape::Circle && hb.radius > 0.01f) {
+                        dn->drawCircle({hb.x, hb.y}, hb.radius, fill, 0.35f, border, 20);
+                        continue;
+                    }
+
+                    float halfW = std::max(1.0f, hb.width) * 0.5f;
+                    float halfH = std::max(1.0f, hb.height) * 0.5f;
+                    std::array<cocos2d::CCPoint, 4> rectPts {
+                        cocos2d::CCPoint{hb.x - halfW, hb.y - halfH},
+                        cocos2d::CCPoint{hb.x - halfW, hb.y + halfH},
+                        cocos2d::CCPoint{hb.x + halfW, hb.y + halfH},
+                        cocos2d::CCPoint{hb.x + halfW, hb.y - halfH}
+                    };
+                    dn->drawPolygon(rectPts.data(), 4, fill, 0.35f, border);
+                }
+            }
+        }
+
+        return true;
+    }
+
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         debugLogToFile("=== PlayLayer::init START ===");
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) {
             debugLogToFile("PlayLayer::init FAILED");
             return false;
         }
-        debugLogToFile("PlayLayer::init succeeded");
 
         auto fields = m_fields.self();
+        fields->m_runtimeHitboxCaptured = captureRuntimeHitboxesForLevel(level);
+        debugLogToFile("PlayLayer::init succeeded");
         auto winSize = CCDirector::sharedDirector()->getWinSize();
 
         // ========== Replay Player Mode Setup ==========
         if (g_replayPlayer.isActive && g_replayPlayer.replay.has_value()) {
+            if (g_replayPlayer.replay->presses.empty() || g_replayPlayer.replay->framerate <= 0.0) {
+                log::warn("[ReplaySafety] Ignoring invalid replay payload during PlayLayer init");
+                g_replayPlayer.isActive = false;
+                g_replayPlayer.replay.reset();
+            } else {
             debugLogToFile("ENTERING REPLAY MODE");
             fields->m_isReplayMode = true;
             fields->m_isReplayEditMode = g_replayPlayer.isEditMode;
@@ -1468,6 +1780,8 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_snapshotRestoreDirty = false;
             fields->m_snapshotRestoreTime = 0.0f;
             fields->m_replayHoldingJump = false;
+            fields->m_replayFrameCursor = 0;
+            fields->m_replayFrameCursorValid = false;
             fields->m_replayStepHistory.clear();
             fields->m_editSelectedIdx = 0;
             CCDirector::sharedDirector()->getScheduler()->setTimeScale(
@@ -1809,6 +2123,7 @@ class $modify(MyPlayLayer, PlayLayer) {
             }
 
             log::info("[ReplayPlayer] Initialized replay player mode with {} presses", fields->m_isReplayMode);
+            }
         }
 
         log::info("[IsMyModUpdated] 1"); // increment this when making changes to force users to update their local replay JSON files (if needed)
@@ -2096,14 +2411,20 @@ class $modify(MyPlayLayer, PlayLayer) {
     }
 
     void postUpdate(float dt) {
-        log::info("[POSTDBG-ENTRY] postUpdate called dt={}", dt);
+        traceDebug("[POSTDBG-ENTRY] postUpdate called dt={}", dt);
         PlayLayer::postUpdate(dt);
 
         auto fields = m_fields.self();
+        if (!fields->m_runtimeHitboxCaptured && m_level && m_objects && m_objects->count() > 0) {
+            fields->m_runtimeHitboxCaptured = captureRuntimeHitboxesForLevel(m_level);
+        }
         g_replayExternalCommands.liveReplayActive.store(false);
 
         // ========== Replay Player Mode: Auto-inject inputs ==========
         if (fields->m_isReplayMode && g_replayPlayer.replay.has_value()) {
+            if (!ensureReplayRuntimeReady("postUpdate")) {
+                return;
+            }
             traceDebug("[POSTDBG] START replay mode block");
             auto& replay = g_replayPlayer.replay.value();
             auto scheduler = CCDirector::sharedDirector()->getScheduler();
@@ -2122,6 +2443,11 @@ class $modify(MyPlayLayer, PlayLayer) {
             if (replay.framerate > 0.0) {
                 liveFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
                 g_replayExternalCommands.liveFrame.store(liveFrame);
+            }
+
+            if (!fields->m_replayFrameCursorValid) {
+                fields->m_replayFrameCursor = liveFrame == 0 ? std::numeric_limits<uint64_t>::max() : liveFrame - 1;
+                fields->m_replayFrameCursorValid = true;
             }
 
             if (fields->m_frameStepActive && replay.framerate > 0.0) {
@@ -2166,6 +2492,8 @@ class $modify(MyPlayLayer, PlayLayer) {
                 fields->m_snapshotRestoreDirty = false;
                 fields->m_snapshotRestoreTime = 0.0f;
                 fields->m_nextInputIdx = 0;
+                fields->m_replayHoldingJump = false;
+                fields->m_replayFrameCursorValid = false;
                 this->resetLevel();
                 applyReplayAudioSync(0.0f, true);
                 currentTime = static_cast<float>(m_timePlayed);
@@ -2212,35 +2540,8 @@ class $modify(MyPlayLayer, PlayLayer) {
                 debugLogToFile("applyReplayAudioSync returned");
             }
 
-            // Auto-inject inputs from replay that should occur now
-            while (fields->m_nextInputIdx < replay.presses.size()) {
-                auto& press = replay.presses[fields->m_nextInputIdx];
-                float pressTime = static_cast<float>(press.framePress) / static_cast<float>(replay.framerate);
-                float releaseTime = static_cast<float>(press.frameRelease) / static_cast<float>(replay.framerate);
-
-                if (currentTime >= releaseTime) {
-                    // Release and advance to next replay press
-                    if (fields->m_replayHoldingJump) {
-                        s_replayInputInjectionActive = true;
-                        this->handleButton(false, 1, true);
-                        s_replayInputInjectionActive = false;
-                        fields->m_replayHoldingJump = false;
-                    }
-                    fields->m_nextInputIdx++;
-                    continue;
-                }
-
-                if (currentTime >= pressTime) {
-                    // Press for the current replay event
-                    if (!fields->m_replayHoldingJump) {
-                        s_replayInputInjectionActive = true;
-                        this->handleButton(true, 1, true);
-                        s_replayInputInjectionActive = false;
-                        fields->m_replayHoldingJump = true;
-                    }
-                }
-                break;
-            }
+            // Advance inputs across the exact frames we crossed, so skipped frames and step modes stay deterministic.
+            pumpReplayInputsThroughFrame(liveFrame);
 
             if (fields->m_isSeeking && currentTime >= fields->m_seekTargetTime) {
                 debugLogToFile(fmt::format("seek complete currentTime={:.3f} >= seekTarget={:.3f}", currentTime, fields->m_seekTargetTime));

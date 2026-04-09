@@ -13,14 +13,32 @@ using namespace geode::prelude;
 ReplayPlayerState g_replayPlayer;
 ReplayExternalCommands g_replayExternalCommands;
 std::optional<std::filesystem::path> g_lastMatchedLocalReplayPath;
+std::mutex g_runtimeHitboxSnapshotsMutex;
+std::unordered_map<int, ReplayRuntimeHitboxSnapshot> g_runtimeHitboxSnapshots;
 #ifdef GEODE_IS_WINDOWS
 #endif
+
+void storeRuntimeHitboxSnapshot(ReplayRuntimeHitboxSnapshot snapshot) {
+    if (snapshot.levelId <= 0) return;
+    std::scoped_lock lock(g_runtimeHitboxSnapshotsMutex);
+    g_runtimeHitboxSnapshots[snapshot.levelId] = std::move(snapshot);
+}
+
+std::optional<ReplayRuntimeHitboxSnapshot> getRuntimeHitboxSnapshot(int levelId) {
+    if (levelId <= 0) return std::nullopt;
+    std::scoped_lock lock(g_runtimeHitboxSnapshotsMutex);
+    auto it = g_runtimeHitboxSnapshots.find(levelId);
+    if (it == g_runtimeHitboxSnapshots.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
 
 // ============================================================
 // Debug File Logging
 // ============================================================
 static const char* DEBUG_LOG_FILE = "GDMod_audio_debug.log";
-static constexpr bool ENABLE_ULTRA_AUDIO_FILE_DEBUG = false;
+[[maybe_unused]] static constexpr bool ENABLE_ULTRA_AUDIO_FILE_DEBUG = false;
 
 [[maybe_unused]] static void debugLogToFileImpl(const std::string& msg) {
     try {
@@ -233,6 +251,9 @@ Result<GDR2Replay> parseGDR2(ByteVector& data) {
     for (size_t i = 0; i < deathCount; i++) {
         uint64_t delta;
         if (!reader.readVarint(delta)) return Err("Failed to read death frame delta");
+        if (delta > std::numeric_limits<uint64_t>::max() - prevDeath) {
+            return Err("Death frame delta overflows");
+        }
         replay.deaths.push_back(delta + prevDeath);
         prevDeath += delta;
     }
@@ -243,6 +264,7 @@ Result<GDR2Replay> parseGDR2(ByteVector& data) {
 
     size_t p1InputCount;
     if (!reader.readSize(p1InputCount)) return Err("Failed to read P1 input count");
+    if (p1InputCount > inputCount) return Err("P1 input count exceeds total input count");
 
     bool hasInputExt = !replay.inputTag.empty();
 
@@ -259,12 +281,20 @@ Result<GDR2Replay> parseGDR2(ByteVector& data) {
             // Platformer: [ ...delta | button(2) | down(1) ]
             input.down = packed & 1;
             input.button = (packed >> 1) & 3;
-            input.frame = (packed >> 3) + frame;
+            uint64_t delta = packed >> 3;
+            if (delta > std::numeric_limits<uint64_t>::max() - frame) {
+                return Err("Platformer input frame delta overflows");
+            }
+            input.frame = delta + frame;
         } else {
             // Non-platformer: [ ...delta | down(1) ]
             input.down = packed & 1;
             input.button = 1; // default to Jump
-            input.frame = (packed >> 1) + frame;
+            uint64_t delta = packed >> 1;
+            if (delta > std::numeric_limits<uint64_t>::max() - frame) {
+                return Err("Input frame delta overflows");
+            }
+            input.frame = delta + frame;
         }
 
         input.player2 = (p1Read >= p1InputCount);
@@ -295,6 +325,53 @@ Result<GDR2Replay> parseGDR2(ByteVector& data) {
     );
 
     return Ok(std::move(replay));
+}
+
+static bool parseReplayEventsFromJsonArray(const std::vector<matjson::Value>& arr, ReplayLoadResult& result) {
+    std::map<std::pair<int, int>, uint64_t> lastPress;
+
+    for (auto const& inp : arr) {
+        if (!inp.contains("action") || !inp.contains("frame")) continue;
+
+        auto action = inp["action"].asString().unwrapOr("");
+        auto frameRes = inp["frame"].asInt();
+        if (frameRes.isErr()) continue;
+
+        int64_t signedFrame = frameRes.unwrap();
+        if (signedFrame < 0) continue;
+        uint64_t frame = static_cast<uint64_t>(signedFrame);
+
+        int player = static_cast<int>(inp["player"].asInt().unwrapOr(1));
+        if (player != 1 && player != 2) continue;
+
+        int buttonId = static_cast<int>(inp["button_id"].asInt().unwrapOr(1));
+        if (buttonId < 1) continue;
+
+        auto key = std::make_pair(player, buttonId);
+        if (action == "press") {
+            lastPress[key] = frame;
+        } else if (action == "release") {
+            auto it = lastPress.find(key);
+            if (it != lastPress.end()) {
+                uint64_t pressFrame = it->second;
+                uint64_t releaseFrame = std::max(frame, pressFrame + 1);
+                result.presses.push_back({pressFrame, releaseFrame, player});
+                lastPress.erase(it);
+            }
+        }
+    }
+
+    for (auto const& [key, frame] : lastPress) {
+        result.presses.push_back({frame, frame + 1, key.first});
+    }
+
+    std::sort(result.presses.begin(), result.presses.end(), [](auto const& a, auto const& b) {
+        if (a.framePress != b.framePress) return a.framePress < b.framePress;
+        if (a.frameRelease != b.frameRelease) return a.frameRelease < b.frameRelease;
+        return a.player < b.player;
+    });
+
+    return !result.presses.empty();
 }
 
 // ============================================================
@@ -500,28 +577,7 @@ std::optional<ReplayLoadResult> loadMatchingReplay(int levelId) {
                         auto arrRes = parsed["inputs"].asArray();
                         if (arrRes.isOk()) {
                             auto& arr = arrRes.unwrap();
-                            std::map<std::pair<int,int>, uint64_t> lastPress;
-                            for (auto& inp : arr) {
-                                if (!inp.contains("action")) continue;
-                                auto action = inp["action"].asString().unwrapOr("");
-                                uint64_t frame = static_cast<uint64_t>(inp["frame"].asInt().unwrapOr(0));
-                                int player = static_cast<int>(inp["player"].asInt().unwrapOr(1));
-                                int buttonId = static_cast<int>(inp["button_id"].asInt().unwrapOr(1));
-                                auto key = std::make_pair(player, buttonId);
-                                if (action == "press") {
-                                    lastPress[key] = frame;
-                                } else if (action == "release") {
-                                    auto it = lastPress.find(key);
-                                    if (it != lastPress.end()) {
-                                        result.presses.push_back({it->second, frame, player});
-                                        lastPress.erase(it);
-                                    }
-                                }
-                            }
-                            for (auto& [key, frame] : lastPress) {
-                                result.presses.push_back({frame, frame + 1, key.first});
-                            }
-                            if (!result.presses.empty()) {
+                            if (parseReplayEventsFromJsonArray(arr, result)) {
                                 g_lastMatchedLocalReplayPath = matchedFile;
                                 log::info("[InputCircles] Found local replay for level {}", levelId);
                                 return result;
@@ -567,27 +623,7 @@ std::optional<ReplayLoadResult> loadMatchingReplay(int levelId) {
     auto arrRes3 = replayData["inputs"].asArray();
     if (arrRes3.isErr()) return std::nullopt;
     auto& arr3 = arrRes3.unwrap();
-    std::map<std::pair<int,int>, uint64_t> lastPress;
-    for (auto& inp : arr3) {
-        if (!inp.contains("action")) continue;
-        auto action = inp["action"].asString().unwrapOr("");
-        uint64_t frame = static_cast<uint64_t>(inp["frame"].asInt().unwrapOr(0));
-        int player = static_cast<int>(inp["player"].asInt().unwrapOr(1));
-        int buttonId = static_cast<int>(inp["button_id"].asInt().unwrapOr(1));
-        auto key = std::make_pair(player, buttonId);
-        if (action == "press") {
-            lastPress[key] = frame;
-        } else if (action == "release") {
-            auto it = lastPress.find(key);
-            if (it != lastPress.end()) {
-                result.presses.push_back({it->second, frame, player});
-                lastPress.erase(it);
-            }
-        }
-    }
-    for (auto& [key, frame] : lastPress) {
-        result.presses.push_back({frame, frame + 1, key.first});
-    }
+    if (!parseReplayEventsFromJsonArray(arr3, result)) return std::nullopt;
     if (result.presses.empty()) return std::nullopt;
     log::info("[Supabase] Loaded {} presses from Supabase for level {}", result.presses.size(), levelId);
     return result;

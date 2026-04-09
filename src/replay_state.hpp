@@ -4,6 +4,11 @@
 #include <atomic>
 #include <optional>
 #include <filesystem>
+#include <cstdint>
+#include <array>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -40,9 +45,46 @@ struct ReplayExternalCommands {
     std::atomic<bool> liveReplayActive {false};
 };
 
+struct ReplayRuntimeHitboxRect {
+    enum class Shape : uint8_t {
+        Rectangle,
+        Circle,
+        OrientedQuad
+    };
+
+    Shape shape = Shape::Rectangle;
+    int objectId = 0;
+    int objectType = -1;
+    float x = 0.0f;
+    float y = 0.0f;
+    float width = 0.0f;
+    float height = 0.0f;
+    float radius = 0.0f;
+    std::array<cocos2d::CCPoint, 4> corners {};
+    bool isSolid = false;
+    bool isHazard = false;
+};
+
+struct ReplayRuntimeHitboxSnapshot {
+    int levelId = 0;
+    uint64_t captureMs = 0;
+    std::vector<ReplayRuntimeHitboxRect> hitboxes;
+    float minX = 0.0f;
+    float maxX = 0.0f;
+    float minY = 0.0f;
+    float maxY = 0.0f;
+    size_t solidCount = 0;
+    size_t hazardCount = 0;
+};
+
 extern ReplayPlayerState g_replayPlayer;
 extern ReplayExternalCommands g_replayExternalCommands;
 extern std::optional<std::filesystem::path> g_lastMatchedLocalReplayPath;
+extern std::mutex g_runtimeHitboxSnapshotsMutex;
+extern std::unordered_map<int, ReplayRuntimeHitboxSnapshot> g_runtimeHitboxSnapshots;
+
+void storeRuntimeHitboxSnapshot(ReplayRuntimeHitboxSnapshot snapshot);
+std::optional<ReplayRuntimeHitboxSnapshot> getRuntimeHitboxSnapshot(int levelId);
 
 std::optional<ReplayLoadResult> loadMatchingReplay(int levelId);
 bool saveReplayToLocalJson(int levelId, const ReplayLoadResult& replay, std::filesystem::path preferredPath = {});
