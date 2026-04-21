@@ -677,5 +677,48 @@ bool saveReplayToLocalJson(int levelId, const ReplayLoadResult& replay, std::fil
     return true;
 }
 
+bool deleteMatchingReplay(int levelId) {
+    auto replaysDir = Mod::get()->getSaveDir() / "replay";
+    if (!std::filesystem::exists(replaysDir)) {
+        return false;
+    }
+
+    auto suffix = fmt::format("-{}.json", levelId);
+    std::filesystem::path matchedFile;
+    std::filesystem::file_time_type matchedTime{};
+    bool hasMatch = false;
+
+    for (auto& entry : std::filesystem::directory_iterator(replaysDir)) {
+        if (!entry.is_regular_file()) continue;
+        auto filename = entry.path().filename().string();
+        if (filename.size() <= suffix.size()) continue;
+        if (filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            auto currentTime = entry.last_write_time();
+            if (!hasMatch || currentTime > matchedTime) {
+                matchedFile = entry.path();
+                matchedTime = currentTime;
+                hasMatch = true;
+            }
+        }
+    }
+
+    if (!hasMatch) {
+        return false;
+    }
+
+    std::error_code ec;
+    bool removed = std::filesystem::remove(matchedFile, ec);
+    if (!removed || ec) {
+        return false;
+    }
+
+    if (g_lastMatchedLocalReplayPath && *g_lastMatchedLocalReplayPath == matchedFile) {
+        g_lastMatchedLocalReplayPath.reset();
+    }
+
+    log::info("[ReplayEditor] Deleted replay {}", matchedFile.string());
+    return true;
+}
+
 // ============================================================
 
