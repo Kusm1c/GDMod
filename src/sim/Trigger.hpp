@@ -1,0 +1,78 @@
+#pragma once
+#include "util.hpp"
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <optional>
+
+namespace gdsim {
+
+// GD trigger engine (move / rotate / toggle …). gdsim is otherwise a static-level
+// simulator; this animates collision objects so trigger-driven obstacles are in
+// the right place at each frame.
+//
+// KEY PROPERTY exploited for the solver: the player's X advances at a fixed,
+// input-independent rate, so the frame at which any X-activated trigger fires —
+// and therefore every moved object's position at frame F — is a deterministic
+// function of F, shared across all search branches and stable under the solver's
+// rollback/inject. So positions are precomputed/cached per frame, not per branch.
+
+enum class TriggerKind { Move, Rotate, Toggle, Alpha, Spawn, Follow };
+
+struct Trigger {
+    TriggerKind kind = TriggerKind::Move;
+    float    x = 0.f;             // activation X (the trigger object's position.x)
+    int      targetGroup = 0;     // group to affect / spawn (field 51)
+
+    // Spawn trigger (1268): when it fires, every spawn-triggered trigger that is a
+    // MEMBER of targetGroup (has it in its own groups, field 57) fires at this
+    // trigger's fireFrame + spawnDelay. ownGroups = a trigger's own membership, so
+    // a spawn can find its targets.
+    std::vector<int> ownGroups;   // field 57 (this trigger's own groups)
+    float    spawnDelay = 0.f;    // field 63 (seconds)
+
+    // Move (kind == Move)
+    float    moveX = 0.f, moveY = 0.f;   // total offset (units), fields 28/29
+    // Rotate (kind == Rotate)
+    float    degrees = 0.f;       // field 68
+    int      centerGroup = 0;     // field 71 (rotate about this group's centre)
+    // Follow (kind == Follow): target group copies followGroup's movement, scaled.
+    int      followGroup = 0;     // field 71 (group whose motion is copied)
+    float    followXMod = 1.f;    // field 72 (X follow multiplier)
+    float    followYMod = 1.f;    // field 73 (Y follow multiplier)
+    // Toggle/Alpha
+    bool     toggleOn = true;     // field 56 (activate group = show/enable)
+    float    alpha = 1.f;         // field 35
+
+    float    duration = 0.f;      // field 10 (seconds)
+    int      easing  = 0;         // field 30 (easing type)
+    float    easeRate = 2.f;      // field 85 (easing rate)
+
+    bool     touchTriggered = false; // field 11 (fires on player touch, not X)
+    bool     spawnTriggered = false; // field 62 (fired by a spawn trigger, not X)
+
+    int      fireFrame = -1;      // precomputed frame this trigger activates (X mode)
+    // Positioned BEHIND the player's spawn X. GD builds the level's initial state
+    // with such triggers already applied (the same fast-forward a Start Pos does) —
+    // the player never crosses them, so they must NOT animate from frame 1. Held at
+    // their END value from frame 0.
+    bool     preApplied = false;
+};
+
+// Static (start-of-level) record for a movable collision object, kept so its
+// per-frame position can be recomputed from scratch each frame as start + offset.
+struct MovableObject {
+    int   objIndex;   // index into Level::movable (the live, mutated ObjectContainer)
+    Vec2D startPos;   // original position
+    float startRot;   // original rotation
+};
+
+// Eased progress for GD easing `type` with `rate` (field 85). t,result ∈ [0,1].
+float easeValue(float t, int type, float rate);
+
+// Parsing helpers (defined in Trigger.cpp).
+bool isTriggerId(int id);
+std::vector<int> parseGroups(const std::string& field57);
+std::optional<Trigger> parseTrigger(int id, const std::unordered_map<int, std::string>& fields);
+
+} // namespace gdsim

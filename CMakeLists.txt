@@ -8,13 +8,20 @@ else()
 endif()
 set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
-project(Rhythmgame VERSION 1.0.0)
-
-# Add all source files inside src (recursively)
+project(Pathfinder VERSION 1.0.0)
+# Add all source files inside src (recursively), excluding src/gdp-2.2 — that's
+# reference-only decompiled physics pseudocode (named/typed camila314/gdp source),
+# not real buildable code (uses Ghidra/IDA-style types, no real headers).
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
+list(FILTER SOURCES EXCLUDE REGEX "src/gdp-2\\.2/")
 
 # Set up the mod binary
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
+
+# src/sim is a standalone physics library (the offline validation tools build it
+# with a bare compiler). In the mod build, route its numeric parsing / logging
+# shims (see src/sim/util.hpp) through Geode's APIs.
+target_compile_definitions(${PROJECT_NAME} PRIVATE GDSIM_USE_GEODE)
 
 if (NOT DEFINED ENV{GEODE_SDK})
     message(FATAL_ERROR "Unable to find Geode SDK! Please define GEODE_SDK environment variable to point to Geode")

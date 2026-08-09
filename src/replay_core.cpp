@@ -1,4 +1,4 @@
-#include "replay_state.hpp"
+﻿#include "replay_state.hpp"
 #include <Geode/utils/file.hpp>
 #include <Geode/utils/web.hpp>
 #include <map>
@@ -7,12 +7,16 @@
 #include <iomanip>
 #include <chrono>
 #include <cmath>
+#include <cctype>
+#include <utility>
 
 using namespace geode::prelude;
 
 ReplayPlayerState g_replayPlayer;
 ReplayExternalCommands g_replayExternalCommands;
 std::optional<std::filesystem::path> g_lastMatchedLocalReplayPath;
+std::atomic<bool> g_autoRepairRequested{false};
+std::atomic<bool> g_confirmRequested{false};
 std::mutex g_runtimeHitboxSnapshotsMutex;
 std::unordered_map<int, ReplayRuntimeHitboxSnapshot> g_runtimeHitboxSnapshots;
 #ifdef GEODE_IS_WINDOWS
@@ -205,6 +209,198 @@ struct GDR2Replay {
     std::vector<GDR2Input> inputs;
 };
 
+Result<GDR2Replay> parseGDR2(ByteVector& data);   // defined below
+
+// ============================================================
+// GDR (v1) Parser — MessagePack format (xdBot / GDReplayFormat)
+// ============================================================
+// The classic ".gdr" is a MessagePack-encoded map { author, bot{name,version}, framerate,
+// gameVersion, level{id,name}, inputs:[{ "2p", "btn", "down", "frame" }], frameFixes:[...], … }.
+// We reuse GDR2Replay so replayToJson stays the single conversion path. A minimal reader that
+// can extract the fields we need and recursively SKIP everything else (the huge frameFixes
+// array, extensions, …). All multi-byte msgpack values are big-endian.
+namespace {
+class MsgpackReader {
+    const uint8_t* d; size_t n; size_t pos = 0;
+public:
+    MsgpackReader(const uint8_t* data, size_t size) : d(data), n(size) {}
+    bool u8(uint8_t& v)  { if (pos >= n) return false; v = d[pos++]; return true; }
+    bool peek(uint8_t& v){ if (pos >= n) return false; v = d[pos];   return true; }
+    bool be(uint64_t& v, int bytes) { v = 0; for (int i = 0; i < bytes; i++) { if (pos >= n) return false; v = (v << 8) | d[pos++]; } return true; }
+    bool skipBytes(uint64_t len) { if (pos + len > n) return false; pos += (size_t)len; return true; }
+    bool readBytes(void* out, size_t len) { if (pos + len > n) return false; memcpy(out, d + pos, len); pos += len; return true; }
+
+    bool readStr(std::string& s) {
+        uint8_t b; if (!u8(b)) return false;
+        uint64_t len;
+        if (b >= 0xa0 && b <= 0xbf)      len = b & 0x1f;
+        else if (b == 0xd9) { if (!be(len, 1)) return false; }
+        else if (b == 0xda) { if (!be(len, 2)) return false; }
+        else if (b == 0xdb) { if (!be(len, 4)) return false; }
+        else return false;
+        s.resize((size_t)len);
+        return len == 0 || readBytes(&s[0], (size_t)len);
+    }
+    bool readMap(size_t& count) {
+        uint8_t b; if (!u8(b)) return false; uint64_t c;
+        if (b >= 0x80 && b <= 0x8f) { count = b & 0x0f; return true; }
+        if (b == 0xde) { if (!be(c, 2)) return false; count = (size_t)c; return true; }
+        if (b == 0xdf) { if (!be(c, 4)) return false; count = (size_t)c; return true; }
+        return false;
+    }
+    bool readArray(size_t& count) {
+        uint8_t b; if (!u8(b)) return false; uint64_t c;
+        if (b >= 0x90 && b <= 0x9f) { count = b & 0x0f; return true; }
+        if (b == 0xdc) { if (!be(c, 2)) return false; count = (size_t)c; return true; }
+        if (b == 0xdd) { if (!be(c, 4)) return false; count = (size_t)c; return true; }
+        return false;
+    }
+    bool readInt(int64_t& v) {
+        uint8_t b; if (!u8(b)) return false;
+        if (b <= 0x7f) { v = b; return true; }
+        if (b >= 0xe0) { v = (int8_t)b; return true; }
+        uint64_t u;
+        switch (b) {
+            case 0xcc: if (!be(u,1)) return false; v = (int64_t)u; return true;
+            case 0xcd: if (!be(u,2)) return false; v = (int64_t)u; return true;
+            case 0xce: if (!be(u,4)) return false; v = (int64_t)u; return true;
+            case 0xcf: if (!be(u,8)) return false; v = (int64_t)u; return true;
+            case 0xd0: if (!be(u,1)) return false; v = (int8_t)u;  return true;
+            case 0xd1: if (!be(u,2)) return false; v = (int16_t)u; return true;
+            case 0xd2: if (!be(u,4)) return false; v = (int32_t)u; return true;
+            case 0xd3: if (!be(u,8)) return false; v = (int64_t)u; return true;
+            case 0xca: { if (!be(u,4)) return false; uint32_t t=(uint32_t)u; float f; memcpy(&f,&t,4); v=(int64_t)std::llround(f); return true; }
+            case 0xcb: { if (!be(u,8)) return false; double f; memcpy(&f,&u,8); v=(int64_t)std::llround(f); return true; }
+            default: return false;
+        }
+    }
+    bool readNum(double& v) {
+        uint8_t b; if (!peek(b)) return false;
+        if (b == 0xca) { u8(b); uint64_t u; if (!be(u,4)) return false; uint32_t t=(uint32_t)u; float f; memcpy(&f,&t,4); v=f; return true; }
+        if (b == 0xcb) { u8(b); uint64_t u; if (!be(u,8)) return false; double f; memcpy(&f,&u,8); v=f; return true; }
+        int64_t iv; if (!readInt(iv)) return false; v = (double)iv; return true;
+    }
+    bool readBool(bool& v) {
+        uint8_t b; if (!u8(b)) return false;
+        if (b == 0xc2) { v = false; return true; }
+        if (b == 0xc3) { v = true;  return true; }
+        if (b <= 0x7f) { v = (b != 0); return true; }   // tolerate int-as-bool
+        return false;
+    }
+    // Recursively skip any single value (used for frameFixes / unknown keys).
+    bool skip() {
+        uint8_t b; if (!u8(b)) return false;
+        if (b <= 0x7f || b >= 0xe0) return true;                     // fixint
+        if (b >= 0x80 && b <= 0x8f) { size_t c=b&0x0f; for (size_t i=0;i<c*2;i++) if(!skip()) return false; return true; }
+        if (b >= 0x90 && b <= 0x9f) { size_t c=b&0x0f; for (size_t i=0;i<c;  i++) if(!skip()) return false; return true; }
+        if (b >= 0xa0 && b <= 0xbf) return skipBytes(b & 0x1f);      // fixstr
+        uint64_t l;
+        switch (b) {
+            case 0xc0: case 0xc2: case 0xc3: return true;            // nil/false/true
+            case 0xcc: case 0xd0: return skipBytes(1);
+            case 0xcd: case 0xd1: return skipBytes(2);
+            case 0xce: case 0xd2: case 0xca: return skipBytes(4);
+            case 0xcf: case 0xd3: case 0xcb: return skipBytes(8);
+            case 0xd9: if(!be(l,1))return false; return skipBytes(l);
+            case 0xda: if(!be(l,2))return false; return skipBytes(l);
+            case 0xdb: if(!be(l,4))return false; return skipBytes(l);
+            case 0xc4: if(!be(l,1))return false; return skipBytes(l);
+            case 0xc5: if(!be(l,2))return false; return skipBytes(l);
+            case 0xc6: if(!be(l,4))return false; return skipBytes(l);
+            case 0xdc: { if(!be(l,2))return false; for(uint64_t i=0;i<l;i++)   if(!skip())return false; return true; }
+            case 0xdd: { if(!be(l,4))return false; for(uint64_t i=0;i<l;i++)   if(!skip())return false; return true; }
+            case 0xde: { if(!be(l,2))return false; for(uint64_t i=0;i<l*2;i++) if(!skip())return false; return true; }
+            case 0xdf: { if(!be(l,4))return false; for(uint64_t i=0;i<l*2;i++) if(!skip())return false; return true; }
+            case 0xd4: return skipBytes(2);  case 0xd5: return skipBytes(3);
+            case 0xd6: return skipBytes(5);  case 0xd7: return skipBytes(9);  case 0xd8: return skipBytes(17);
+            case 0xc7: if(!be(l,1))return false; return skipBytes(l+1);
+            case 0xc8: if(!be(l,2))return false; return skipBytes(l+1);
+            case 0xc9: if(!be(l,4))return false; return skipBytes(l+1);
+            default: return false;
+        }
+    }
+};
+} // namespace
+
+Result<GDR2Replay> parseGDR(ByteVector& data) {
+    MsgpackReader r(data.data(), data.size());
+    GDR2Replay replay{};
+    replay.version = 1;
+    replay.framerate = 240.0;
+    replay.gameVersion = 22;
+    replay.platformer = false;
+
+    size_t topCount;
+    if (!r.readMap(topCount)) return Err("Not a GDR file (no MessagePack top-level map)");
+
+    for (size_t i = 0; i < topCount; i++) {
+        std::string key;
+        if (!r.readStr(key)) return Err("Failed to read a GDR key");
+
+        if      (key == "author")       { if (!r.readStr(replay.author))      return Err("author"); }
+        else if (key == "description")  { if (!r.readStr(replay.description)) return Err("description"); }
+        else if (key == "duration")     { double v; if (!r.readNum(v)) return Err("duration"); replay.duration = (float)v; }
+        else if (key == "framerate" || key == "fps") { double v; if (!r.readNum(v)) return Err("framerate"); if (v > 0) replay.framerate = v; }
+        else if (key == "gameVersion")  { double v; if (!r.readNum(v)) return Err("gameVersion"); replay.gameVersion = (v < 100) ? (int)std::llround(v * 10) : (int)v; }
+        else if (key == "version")      { double v; if (!r.readNum(v)) return Err("version"); replay.version = (int)std::llround(v); }
+        else if (key == "seed")         { int64_t v; if (!r.readInt(v)) return Err("seed"); replay.seed = (int)v; }
+        else if (key == "coins")        { int64_t v; if (!r.readInt(v)) return Err("coins"); replay.coins = (int)v; }
+        else if (key == "ldm")          { bool v; if (!r.readBool(v)) return Err("ldm"); replay.ldm = v; }
+        else if (key == "platformer" || key == "botInfo") { bool v; if (!r.readBool(v)) return Err("platformer"); replay.platformer = v; }
+        else if (key == "bot") {
+            size_t bc; if (!r.readMap(bc)) return Err("bot");
+            for (size_t j = 0; j < bc; j++) {
+                std::string bk; if (!r.readStr(bk)) return Err("bot key");
+                if (bk == "name") { if (!r.readStr(replay.botName)) return Err("bot.name"); }
+                else if (!r.skip()) return Err("bot skip");   // version is a string in GDR v1 → skip
+            }
+        }
+        else if (key == "level") {
+            size_t lc; if (!r.readMap(lc)) return Err("level");
+            for (size_t j = 0; j < lc; j++) {
+                std::string lk; if (!r.readStr(lk)) return Err("level key");
+                if (lk == "id")        { int64_t v; if (!r.readInt(v)) return Err("level.id"); replay.levelId = (uint32_t)v; }
+                else if (lk == "name") { if (!r.readStr(replay.levelName)) return Err("level.name"); }
+                else if (!r.skip()) return Err("level skip");
+            }
+        }
+        else if (key == "inputs") {
+            size_t ic; if (!r.readArray(ic)) return Err("inputs");
+            replay.inputs.reserve(ic);
+            for (size_t j = 0; j < ic; j++) {
+                size_t mc; if (!r.readMap(mc)) return Err("input map");
+                GDR2Input in{}; in.button = 1;
+                for (size_t k = 0; k < mc; k++) {
+                    std::string ik; if (!r.readStr(ik)) return Err("input key");
+                    if      (ik == "frame")  { int64_t v; if (!r.readInt(v)) return Err("input.frame"); in.frame = (uint64_t)v; }
+                    else if (ik == "btn" || ik == "button") { int64_t v; if (!r.readInt(v)) return Err("input.btn"); in.button = v == 0 ? 1 : (uint8_t)v; }
+                    else if (ik == "down" || ik == "holding") { bool v; if (!r.readBool(v)) return Err("input.down"); in.down = v; }
+                    else if (ik == "2p" || ik == "p2" || ik == "player2") { bool v; if (!r.readBool(v)) return Err("input.2p"); in.player2 = v; }
+                    else if (!r.skip()) return Err("input skip");
+                }
+                replay.inputs.push_back(in);
+            }
+        }
+        else { if (!r.skip()) return Err(fmt::format("Failed to skip GDR key '{}'", key)); }
+    }
+
+    if (replay.inputs.empty()) return Err("GDR file has no inputs");
+    if (replay.botName.empty()) replay.botName = "GDR";
+
+    std::sort(replay.inputs.begin(), replay.inputs.end(),
+        [](const GDR2Input& a, const GDR2Input& b) { return a.frame < b.frame; });
+
+    return Ok(std::move(replay));
+}
+
+// Auto-detect: ".gdr2" starts with the raw magic "GDR"; ".gdr" is MessagePack (a map header
+// byte 0x80-0x8f / 0xde / 0xdf). Dispatch to the right parser so one path handles both.
+Result<GDR2Replay> parseReplayAuto(ByteVector& data) {
+    if (data.size() >= 3 && data[0] == 'G' && data[1] == 'D' && data[2] == 'R')
+        return parseGDR2(data);
+    return parseGDR(data);
+}
+
 // ============================================================
 // GDR2 Parser
 // ============================================================
@@ -349,7 +545,17 @@ static bool parseReplayEventsFromJsonArray(const std::vector<matjson::Value>& ar
 
         auto key = std::make_pair(player, buttonId);
         if (action == "press") {
-            lastPress[key] = frame;
+            // A "press" while the button is ALREADY held is a redundant no-op in GD's
+            // input model (you can't press twice without releasing) — the hold started
+            // at the FIRST press and continues. GDR2 replays contain such duplicate
+            // down=1 events (e.g. Steel/108166595: held 540->634 with a spurious
+            // re-press at 593). Overwriting lastPress here shortened the hold to
+            // 593->634, dropping 53 frames of holding — which desynced frame-perfect
+            // wave sections and killed the run on Watch while the same replay cleared
+            // in Eclipse (which plays the raw down/up events). Only start a new hold
+            // when the button isn't already down.
+            if (lastPress.find(key) == lastPress.end())
+                lastPress[key] = frame;
         } else if (action == "release") {
             auto it = lastPress.find(key);
             if (it != lastPress.end()) {
@@ -436,6 +642,151 @@ static matjson::Value replayToJson(const GDR2Replay& replay) {
 }
 
 // ============================================================
+// GDR2 Writer
+// ============================================================
+
+class GDR2Writer {
+    std::vector<uint8_t> m_data;
+public:
+    void writeRaw(const void* data, size_t size) {
+        const uint8_t* bytes = static_cast<const uint8_t*>(data);
+        m_data.insert(m_data.end(), bytes, bytes + size);
+    }
+
+    void writeVarint(uint64_t value) {
+        do {
+            uint8_t byte = value & 0x7F;
+            value >>= 7;
+            if (value != 0) byte |= 0x80;
+            m_data.push_back(byte);
+        } while (value != 0);
+    }
+
+    void writeString(const std::string& s) {
+        writeVarint(s.size());
+        writeRaw(s.data(), s.size());
+    }
+
+    void writeFloat(float v) {
+        uint8_t bytes[4];
+        memcpy(bytes, &v, 4);
+        std::reverse(bytes, bytes + 4);
+        writeRaw(bytes, 4);
+    }
+
+    void writeDouble(double v) {
+        uint8_t bytes[8];
+        memcpy(bytes, &v, 8);
+        std::reverse(bytes, bytes + 8);
+        writeRaw(bytes, 8);
+    }
+
+    void writeBool(bool v) { writeVarint(v ? 1 : 0); }
+
+    std::vector<uint8_t> take() { return std::move(m_data); }
+};
+
+std::vector<uint8_t> exportReplayToGdr2(const ReplayLoadResult& replay, int levelId, const std::string& levelName) {
+    // Split presses into P1 and P2 events sorted by frame
+    struct Event { uint64_t frame; bool down; bool player2; };
+    std::vector<Event> p1Events, p2Events;
+    for (auto& press : replay.presses) {
+        bool isP2 = press.player == 2;
+        auto& vec = isP2 ? p2Events : p1Events;
+        vec.push_back({press.framePress,   true,  isP2});
+        vec.push_back({press.frameRelease, false, isP2});
+    }
+    auto byFrame = [](const Event& a, const Event& b) { return a.frame < b.frame; };
+    std::sort(p1Events.begin(), p1Events.end(), byFrame);
+    std::sort(p2Events.begin(), p2Events.end(), byFrame);
+
+    GDR2Writer w;
+
+    // Magic header
+    w.writeRaw("GDR", 3);
+
+    // Format version 2
+    w.writeVarint(2);
+
+    // Input tag (empty = non-platformer)
+    w.writeString("");
+
+    // Metadata
+    w.writeString("");                           // author
+    w.writeString("");                           // description
+    w.writeFloat(0.0f);                          // duration
+    w.writeVarint(22);                           // GD game version 2.2
+    w.writeDouble(replay.framerate);
+    w.writeVarint(0);                            // seed
+    w.writeVarint(0);                            // coins
+    w.writeBool(false);                          // ldm
+    w.writeBool(false);                          // platformer
+    w.writeString("kusmic.pathfinder");          // bot name
+    w.writeVarint(1);                            // bot version
+    w.writeVarint(static_cast<uint64_t>(levelId));
+    w.writeString(levelName);
+
+    // Extension block (empty)
+    w.writeVarint(0);
+
+    // Deaths (none)
+    w.writeVarint(0);
+
+    // Input counts
+    w.writeVarint(p1Events.size() + p2Events.size());
+    w.writeVarint(p1Events.size());
+
+    // P1 events: delta-encoded from 0
+    uint64_t prevFrame = 0;
+    for (auto& ev : p1Events) {
+        uint64_t delta = ev.frame - prevFrame;
+        w.writeVarint((delta << 1) | (ev.down ? 1 : 0));
+        prevFrame = ev.frame;
+    }
+
+    // P2 events: delta-encoded from 0 (separate counter)
+    prevFrame = 0;
+    for (auto& ev : p2Events) {
+        uint64_t delta = ev.frame - prevFrame;
+        w.writeVarint((delta << 1) | (ev.down ? 1 : 0));
+        prevFrame = ev.frame;
+    }
+
+    return w.take();
+}
+
+std::string writeSolvedGdr2(int levelId, const std::string& levelName, const ReplayLoadResult& replay) {
+    auto gdr2Data = exportReplayToGdr2(replay, levelId, levelName);
+
+    std::string safeName = levelName;
+    for (auto& c : safeName)
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<' || c == '>' || c == '|') c = '_';
+    if (safeName.empty()) safeName = "replay";
+    auto fileName = fmt::format("{}-{}.gdr2", safeName, levelId);
+
+    auto writeTo = [&](const std::filesystem::path& dir) -> bool {
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        std::ofstream ofs(dir / fileName, std::ios::binary);
+        if (!ofs) return false;
+        ofs.write(reinterpret_cast<const char*>(gdr2Data.data()), gdr2Data.size());
+        return ofs.good();
+    };
+
+    std::string primary;
+    // Eclipse replays folder (directly playable in-game) if it exists.
+    auto eclipseDir = dirs::getGameDir() / "geode" / "config" / "prevter.eclipsemenu" / "replays";
+    if (std::filesystem::exists(eclipseDir) && writeTo(eclipseDir))
+        primary = (eclipseDir / fileName).string();
+    // Always keep a copy in the mod save dir.
+    auto modDir = Mod::get()->getSaveDir() / "gdr2";
+    if (writeTo(modDir) && primary.empty())
+        primary = (modDir / fileName).string();
+    return primary;
+}
+
+// ============================================================
 // Conversion Logic
 // ============================================================
 
@@ -451,11 +802,11 @@ void convertGdr2File(const std::filesystem::path& path) {
     }
 
     auto data = std::move(readRes.unwrap());
-    auto parseRes = parseGDR2(data);
+    auto parseRes = parseReplayAuto(data);   // handles both .gdr2 (binary) and .gdr (MessagePack)
     if (parseRes.isErr()) {
         FLAlertLayer::create(
             "Error",
-            fmt::format("GDR2 parsing error:\n{}", parseRes.unwrapErr()),
+            fmt::format("Replay parsing error:\n{}", parseRes.unwrapErr()),
             "OK"
         )->show();
         return;
@@ -530,6 +881,7 @@ void convertGdr2File(const std::filesystem::path& path) {
         log::warn("[Supabase] Upload FAILED code={} body={}", resp.code(), body);
     }
 }
+
 
 // ============================================================
 // PlayLayer Hook – Show input circles in-game

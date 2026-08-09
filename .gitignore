@@ -43,6 +43,15 @@
 **/build
 # Ignore platform specific build folders
 build-*/
+# Ignore test and testlevel folders
+**/test
+**/testlevel
+
+# Ignore claude folder
+**/claude
+
+# Ignore supabase folder
+**/supabase
 
 # Workspace files are user-specific
 *.sublime-workspace

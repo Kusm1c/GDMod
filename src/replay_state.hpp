@@ -80,12 +80,26 @@ struct ReplayRuntimeHitboxSnapshot {
 extern ReplayPlayerState g_replayPlayer;
 extern ReplayExternalCommands g_replayExternalCommands;
 extern std::optional<std::filesystem::path> g_lastMatchedLocalReplayPath;
+// Set by the level menu's "Auto-repair" action and consumed once in PlayLayer::init.
+// When true, the level launches in auto-repair mode: it replays the current gdsim
+// solution in the REAL engine and locally brute-forces clicks near each death until
+// it clears (or gets stuck), guaranteeing the saved replay actually completes in GD.
+extern std::atomic<bool> g_autoRepairRequested;
+// Set by doSimulate's default (non-repair) path and consumed once in PlayLayer::init.
+// The .gdr2 has ALREADY been written by the time this fires — this just runs ONE
+// real-game playthrough for confirmation + telemetry (divergence/truth capture),
+// never blocking on it and never brute-forcing edits. See confirmOnlyFinish.
+extern std::atomic<bool> g_confirmRequested;
 extern std::mutex g_runtimeHitboxSnapshotsMutex;
 extern std::unordered_map<int, ReplayRuntimeHitboxSnapshot> g_runtimeHitboxSnapshots;
-
 void storeRuntimeHitboxSnapshot(ReplayRuntimeHitboxSnapshot snapshot);
 std::optional<ReplayRuntimeHitboxSnapshot> getRuntimeHitboxSnapshot(int levelId);
 
 std::optional<ReplayLoadResult> loadMatchingReplay(int levelId);
 bool saveReplayToLocalJson(int levelId, const ReplayLoadResult& replay, std::filesystem::path preferredPath = {});
 void convertGdr2File(const std::filesystem::path& path);
+std::vector<uint8_t> exportReplayToGdr2(const ReplayLoadResult& replay, int levelId, const std::string& levelName);
+// Write a solved replay as a .gdr2, no dialog (bot workflow: solve → file on disk).
+// Prefers the Eclipse replays folder so it's directly playable in-game; always also
+// writes a copy in the mod save dir. Returns the primary output path, or "" on failure.
+std::string writeSolvedGdr2(int levelId, const std::string& levelName, const ReplayLoadResult& replay);

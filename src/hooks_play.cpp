@@ -1,13 +1,20 @@
-#include "replay_state.hpp"
+﻿#include "replay_state.hpp"
+#include "sim/Level.hpp"
+#include "sim/Calib.hpp"
+#include "sim/DebugPaths.hpp"
+#include <Geode/cocos/support/zip_support/ZipUtils.h>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/EndLevelLayer.hpp>
 #include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/GameObject.hpp>
 #include <Geode/binding/OBB2D.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/binding/Slider.hpp>
 #include <fstream>
+#include <map>
+#include <cstdio>
+#include <filesystem>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <deque>
@@ -49,28 +56,266 @@ static void traceDebug(fmt::format_string<Args...> format, Args&&... args) {
     (void)format;
     ((void)args, ...);
 }
-// Rhythm Game – Judgment & UR Bar Types
-// ============================================================
 
-enum class Judgment {
-    VeryEarly,
-    Early,
-    Good,
-    Late,
-    VeryLate,
-    Miss
-};
-
-struct URTick {
-    float offsetFrames; // negative = early, positive = late
-    Judgment judgment;
-    float timeCreated;
-};
-
-// Static bridge: captures player inputs from GJBaseGameLayer::handleButton
-static std::vector<std::pair<float, bool>> s_playerInputs; // (time, isPress)
-static bool s_rhythmActive = false;
 static bool s_replayInputInjectionActive = false;
+
+// ============================================================
+// Frame-exact (per-physics-step) replay input injection
+// ============================================================
+// GD steps physics at a fixed 240 sub-steps/sec regardless of monitor FPS, doing
+// N sub-steps per visual frame. The legacy path injected inputs once per *visual*
+// frame (PlayLayer::postUpdate, after the steps already ran), so on any non-240Hz
+// / variable display short ship/UFO taps were collapsed and press/release edges
+// landed up to N-1 sub-steps late — the ship arc drifts a few px and grazes
+// spikes (cube survives; its jumps are discrete). This drives the button per
+// physics step (GJBaseGameLayer::processCommands) instead: frame-exact and
+// Hz-independent. Flip s_perStepReplay to false to fall back to the old behaviour.
+static bool   s_perStepReplay   = true;   // master switch (see report / testing notes)
+static double s_replayStepTime  = 0.0;    // physics clock, re-anchored to m_timePlayed each visual frame
+static bool   s_replayStepHold  = false;  // last injected hold state (edge tracking)
+static bool   s_replayStepActive = false; // true only while a replay plays forward this frame
+// TEMP diagnostic: logs every injected handleButton edge (f, dt, hold) to
+// GDMod_inject_debug.txt. Used to pin down the short-tap (1-frame press)
+// timing bug — cross-reference against a GDMod_truth_*.txt FRAMES section
+// to see exactly which physics frame our injection lands the press/release
+// on vs. which frame the real Y position actually moves. Flip off once done.
+static bool   s_injectDebugLog  = true;
+// Diagnostics: prove the per-step path is actually live and frame-exact.
+static std::atomic<uint64_t> s_perStepProcessCount{0}; // processCommands ticks seen while replay active
+static std::atomic<uint64_t> s_perStepInjectCount{0};  // button edges injected per-step
+
+// During WATCH, show ONLY the input visuals — hide the playback chrome (bottom
+// progress bar + time/speed labels + transport buttons). Replay EDIT mode is
+// unaffected — it needs its controls. Flip to true to bring the chrome back.
+static constexpr bool kWatchShowChrome = false;
+
+// Ground-truth recorder: dumps level + inputs + per-frame real trajectory to
+// GDMod_truth_<levelId>.txt so the offline calibrator (test/calibrate.cpp) can
+// tune gdsim against real-game data without rebuilding.
+static std::ofstream s_calibTruth;
+
+// ============================================================
+// Auto-repair: validate & locally fix a gdsim solution in the REAL engine.
+// ============================================================
+// gdsim solutions can be "almost right" — frame-perfect with no slack — so they
+// just barely die in real GD even though they clear in the simulator. Auto-repair
+// replays the solution in the actual engine, finds where it dies, and brute-forces
+// small input edits (shift a click ±N frames, lengthen/shorten the hold, insert or
+// remove a click) near that death until the run gets further. Every trial is a full
+// restart validated by the real physics, so the result is guaranteed to complete.
+// Simple & robust by design: pure local hill-climb on the death frontier.
+// Fast-forward timescale during repair. GD steps physics at a fixed 240 sub-steps/s,
+// so a higher value replays each trial in less wall-clock time — important since each
+// trial replays from the start to the death (slow on deep deaths in long levels, and
+// EVERY trial replays the full prefix from frame 0 — no checkpoints, see
+// solver_startpos_bug_and_pipeline_fix memory: GD's loadFromCheckpoint can't
+// reproduce a frame-perfect state reliably, so full-runs are the only correct option).
+// Raised from a conservative 8x: the (now-removed) window scanner ran the SAME
+// speedhacked-trial pattern reliably at 100x for months, PROVEN safe — the 8x here was
+// an untested guess, not an empirical limit. Paired with hiding the object render
+// layers below (the window scanner's other half — CPU spent drawing thousands of
+// sprites was likely the real ceiling, not a substep cap), so the higher number should
+// actually reach the CPU/GD, not just request it. On a hard, many-pinch-point level
+// this can be the difference between finishing in minutes vs. not finishing in the
+// time a user is willing to wait with the game open.
+static float s_autoRepairSpeed = 60.0f;
+
+struct AROp {
+    enum Type { ShiftPress, Hold, Insert, Remove } type;
+    int      idx    = -1;  // target press index (Shift/Hold/Remove)
+    int      delta  = 0;   // frames (Shift: move press+release; Hold: release += delta)
+    uint64_t insAt  = 0;   // Insert: press frame
+    uint64_t insLen = 6;   // Insert: hold length
+};
+
+struct AutoRepairState {
+    bool                     active = false;   // a repair session is running this PlayLayer
+    bool                     done   = false;   // finished (solved or stuck)
+    int                      levelId = 0;
+    std::string              levelName;         // for the final .gdr2 filename
+    double                   framerate = 240.0;
+    std::vector<ReplayPress> base;             // best validated input so far
+    std::vector<ReplayPress> trial;            // input under test this run
+    float                    bestX = 0.f;      // furthest validated X (death frontier)
+    float                    trialMaxX = 0.f;  // furthest X this trial
+    bool                     trialDied = false;
+    uint64_t                 lastDeathFrame = 0;
+    std::vector<AROp>        cands;            // candidate edits for current frontier
+    size_t                   candIdx = 0;
+    int                      attempts = 0;
+    int                      maxAttempts = 4000;
+    bool                     firstTrial = true;
+    // Repair logging — quantify how far off gdsim's solution was.
+    std::vector<ReplayPress> original;         // the gdsim solution as-solved (for the final diff)
+    AROp                     lastOp{};          // the edit that produced the current trial
+    bool                     lastOpValid = false;
+    int                      numCorrections = 0;// accepted edits (each = one sim error)
+    int                      totalAdjustFrames = 0;
+    // Momentum: a level can need the SAME kind of nudge (e.g. "hold click #2 longer")
+    // several times in a row as a gradual real-vs-sim timing drift is walked through
+    // one small step at a time — proven on 68839068's repair log: 5 consecutive
+    // "HOLD click #2 +2 frames" fixes back to back. Track the last accepted op's
+    // (type, idx, sign) and a running streak count; arBuildCandidates uses this to
+    // ALSO try a bigger jump in the same direction FIRST, so a long drift can be
+    // covered in fewer real-engine trials instead of re-discovering the same small
+    // step every time.
+    AROp::Type               momentumType = AROp::ShiftPress;
+    int                      momentumIdx = -1;
+    int                      momentumSign = 0;
+    int                      momentumStreak = 0;
+    int                      momentumLastDelta = 0;
+};
+static AutoRepairState g_ar;
+
+// Sort by press frame, drop degenerate/overlapping holds so injection stays valid.
+static void arNormalize(std::vector<ReplayPress>& v) {
+    for (auto& p : v) {
+        if (p.player <= 0) p.player = 1;
+        if (p.framePress < 1) p.framePress = 1;
+        if (p.frameRelease <= p.framePress) p.frameRelease = p.framePress + 1;
+    }
+    std::sort(v.begin(), v.end(),
+        [](const ReplayPress& a, const ReplayPress& b) { return a.framePress < b.framePress; });
+    for (size_t i = 0; i + 1 < v.size(); ++i)
+        if (v[i].frameRelease >= v[i + 1].framePress)
+            v[i].frameRelease = v[i + 1].framePress > v[i].framePress + 1
+                ? v[i + 1].framePress - 1 : v[i].framePress + 1;
+    v.erase(std::remove_if(v.begin(), v.end(),
+        [](const ReplayPress& p) { return p.frameRelease <= p.framePress; }), v.end());
+}
+
+static std::vector<ReplayPress> arApply(const std::vector<ReplayPress>& base, const AROp& op) {
+    std::vector<ReplayPress> v = base;
+    switch (op.type) {
+        case AROp::ShiftPress:
+            if (op.idx >= 0 && op.idx < (int)v.size()) {
+                int64_t np = (int64_t)v[op.idx].framePress + op.delta;
+                int64_t nr = (int64_t)v[op.idx].frameRelease + op.delta;
+                if (np < 1) { nr += (1 - np); np = 1; }
+                v[op.idx].framePress = (uint64_t)np;
+                v[op.idx].frameRelease = (uint64_t)nr;
+            }
+            break;
+        case AROp::Hold:
+            if (op.idx >= 0 && op.idx < (int)v.size()) {
+                int64_t nr = (int64_t)v[op.idx].frameRelease + op.delta;
+                if (nr <= (int64_t)v[op.idx].framePress) nr = (int64_t)v[op.idx].framePress + 1;
+                v[op.idx].frameRelease = (uint64_t)nr;
+            }
+            break;
+        case AROp::Insert:
+            v.push_back({op.insAt, op.insAt + op.insLen, 1});
+            break;
+        case AROp::Remove:
+            if (op.idx >= 0 && op.idx < (int)v.size()) v.erase(v.begin() + op.idx);
+            break;
+    }
+    arNormalize(v);
+    return v;
+}
+
+// Repair log — records every edit the real engine needed on top of gdsim's solution,
+// i.e. exactly where and by how much the simulator was wrong.
+static std::string arLogPath() { return gdsim::debugPath("GDMod_repair_log.txt"); }
+static void arLog(const std::string& s) {
+    log::info("[AR] {}", s);
+    std::ofstream f(arLogPath(), std::ios::app);
+    if (f.is_open()) f << s << "\n";
+}
+static std::string arOpStr(const AROp& op) {
+    // op.idx is 0-based; display 1-based so "click #N" matches the Nth entry in the
+    // gdsim/real solution lists (they were off by one, which read as a bug).
+    switch (op.type) {
+        case AROp::ShiftPress: return fmt::format("SHIFT click #{} by {:+d} frame(s)", op.idx + 1, op.delta);
+        case AROp::Hold:       return fmt::format("HOLD click #{} {:+d} frame(s)", op.idx + 1, op.delta);
+        case AROp::Insert:     return fmt::format("INSERT a click at frame {}", op.insAt);
+        case AROp::Remove:     return fmt::format("REMOVE click #{}", op.idx + 1);
+    }
+    return "?";
+}
+static int arOpAdjustFrames(const AROp& op) {
+    switch (op.type) {
+        case AROp::ShiftPress: case AROp::Hold: return std::abs(op.delta);
+        case AROp::Insert: case AROp::Remove:   return 6;   // a whole click added/removed
+    }
+    return 0;
+}
+static std::string arClickList(const std::vector<ReplayPress>& v) {
+    std::string s;
+    for (size_t i = 0; i < v.size(); ++i)
+        s += fmt::format("{}[{}+{}]", i ? " " : "", v[i].framePress, v[i].frameRelease - v[i].framePress);
+    return s;
+}
+
+// Build the ordered candidate-edit list for the current death frontier. Small,
+// localized edits first (most likely the frame-perfect fix); insert/remove last.
+static void arBuildCandidates() {
+    g_ar.cands.clear();
+    g_ar.candIdx = 0;
+    const auto& b = g_ar.base;
+    uint64_t df = g_ar.lastDeathFrame;
+    int focus = -1;
+    for (int i = 0; i < (int)b.size(); ++i) {
+        if (b[i].framePress <= df) focus = i; else break;
+    }
+    // Momentum: 2+ consecutive accepted fixes of the same (type, idx, sign) mean we're
+    // walking through a gradual drift one small step at a time. Try jumping straight to
+    // 3x and 6x the last delta FIRST — if the drift continues at a similar rate, this
+    // can skip several round-trip trials. Falls through to the normal small deltas if
+    // the big jump overshoots (candidates are tried in order; the first that actually
+    // improves wins, so a failed big jump costs nothing but one trial).
+    if (g_ar.momentumStreak >= 2 && g_ar.momentumIdx >= 0 && g_ar.momentumIdx < (int)b.size()) {
+        int base = g_ar.momentumSign * std::abs(g_ar.momentumLastDelta);
+        for (int mult : {3, 6, 10}) {
+            int d = base * mult;
+            if (g_ar.momentumType == AROp::Hold)
+                g_ar.cands.push_back({AROp::Hold, g_ar.momentumIdx, d, 0, 6});
+            else if (g_ar.momentumType == AROp::ShiftPress)
+                g_ar.cands.push_back({AROp::ShiftPress, g_ar.momentumIdx, d, 0, 6});
+        }
+    }
+    const int shifts[] = {-1, 1, -2, 2, -3, 3, -4, 4, -6, 6, -8, 8};
+    const int holds[]  = {1, -1, 2, -2, 3, -3, 4};
+    if (focus >= 0) {
+        // Edit the click AT the wall and the few before it — a deep death is often
+        // caused by an earlier click that set up a bad approach, not the last one.
+        // Nearest-first so the cheapest likely fix is tried before the rest.
+        for (int j = 0; j <= 3; ++j) {
+            int fi = focus - j;
+            if (fi < 0) break;
+            for (int d : shifts) g_ar.cands.push_back({AROp::ShiftPress, fi, d, 0, 6});
+            for (int d : holds)  g_ar.cands.push_back({AROp::Hold,       fi, d, 0, 6});
+        }
+        if (focus + 1 < (int)b.size())
+            for (int d : shifts) g_ar.cands.push_back({AROp::ShiftPress, focus + 1, d, 0, 6});
+    }
+    // A click may simply be missing right at the wall — try inserting one nearby.
+    const int insOff[] = {0, -6, 6, -12, 12, -3, 3, -18, 18};
+    for (int o : insOff) {
+        int64_t at = (int64_t)df + o;
+        if (at < 1) at = 1;
+        g_ar.cands.push_back({AROp::Insert, -1, 0, (uint64_t)at, 6});
+    }
+    if (focus >= 0) g_ar.cands.push_back({AROp::Remove, focus, 0, 0, 6});
+}
+
+// Is the jump held at physics frame `f`? presses are sorted by framePress and
+// non-overlapping, so the only candidate covering f is the last press starting
+// at or before f.
+static bool replayHeldAtFrame(uint64_t f) {
+    if (!g_replayPlayer.replay.has_value()) return false;
+    const auto& presses = g_replayPlayer.replay->presses;
+    if (presses.empty()) return false;
+    int lo = 0, hi = (int)presses.size();          // first index with framePress > f
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (presses[mid].framePress <= f) lo = mid + 1; else hi = mid;
+    }
+    if (lo - 1 < 0) return false;
+    const auto& p = presses[lo - 1];
+    return p.framePress <= f && f < p.frameRelease;
+}
+
 
 class $modify(MyGJBGL, GJBaseGameLayer) {
     void handleButton(bool push, int button, bool isPlayer1) {
@@ -82,45 +327,77 @@ class $modify(MyGJBGL, GJBaseGameLayer) {
         }
 
         if (replayMode) {
-            if (s_rhythmActive && isPlayer1 && button == 1) {
-                float time = static_cast<float>(m_gameState.m_currentProgress);
-                auto pl = PlayLayer::get();
-                if (pl) time = static_cast<float>(pl->m_timePlayed);
-                s_playerInputs.push_back({time, push});
-            }
             return;
         }
 
         GJBaseGameLayer::handleButton(push, button, isPlayer1);
-        if (s_rhythmActive && isPlayer1 && button == 1) {
-            float time = static_cast<float>(m_gameState.m_currentProgress);
-            auto plTime = PlayLayer::get();
-            if (plTime) time = static_cast<float>(plTime->m_timePlayed);
-            s_playerInputs.push_back({time, push});
+    }
+
+    // Anchor the per-step replay clock to the simulated time BEFORE this visual
+    // frame's physics sub-steps run, so processCommands below can map each step to
+    // an exact physics frame (drift-free: re-anchored every frame).
+    void update(float dt) {
+        if (s_perStepReplay) {
+            auto* pl = PlayLayer::get();
+            bool active = pl && g_replayPlayer.isActive && g_replayPlayer.replay.has_value()
+                          && g_replayExternalCommands.liveReplayActive.load()
+                          && !g_replayExternalCommands.livePaused.load();
+            s_replayStepActive = active;
+            if (active) s_replayStepTime = static_cast<double>(pl->m_timePlayed);
         }
+        GJBaseGameLayer::update(dt);
+    }
+
+    // Per-physics-step input injection. GD::update loops this once per sub-step;
+    // we set the held state for the exact physics frame this step represents, then
+    // advance the clock by the step delta. Half-ticks map to the same frame index
+    // (round) so the hold stays consistent across them.
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (s_perStepReplay && s_replayStepActive && g_replayPlayer.replay.has_value()) {
+            double fr = g_replayPlayer.replay->framerate;
+            if (fr > 0.0) {
+                s_perStepProcessCount.fetch_add(1, std::memory_order_relaxed);
+                // Advance the clock to the frame THIS step produces BEFORE reading the
+                // index. The anchor (s_replayStepTime = m_timePlayed) is the previous
+                // frame's end time, so reading f first labelled each frame's first
+                // sub-step with the PREVIOUS frame's index — every input landed one
+                // physics frame late (harmless for cube's discrete jumps, fatal for
+                // hold-duration vehicles: ship arcs drift, robot jumps mis-charge).
+                // Adding dt first also collapses both half-ticks of a frame onto the
+                // same rounded index instead of splitting them across N and N+1.
+                s_replayStepTime += static_cast<double>(dt);
+                uint64_t f = static_cast<uint64_t>(std::llround(s_replayStepTime * fr));
+                bool hold = replayHeldAtFrame(f);
+                if (hold != s_replayStepHold) {
+                    if (s_injectDebugLog) {
+                        std::ofstream lg(gdsim::debugPath("GDMod_inject_debug.txt"), std::ios::app);
+                        if (lg.is_open()) {
+                            lg << fmt::format(
+                                "f={} hold={} dt={:.6f} halfTick={} lastTick={} stepTime={:.6f} fr={:.1f}\n",
+                                f, hold, dt, isHalfTick, isLastTick, s_replayStepTime, fr);
+                        }
+                    }
+                    s_replayInputInjectionActive = true;
+                    this->handleButton(hold, 1, true);
+                    s_replayInputInjectionActive = false;
+                    s_replayStepHold = hold;
+                    s_perStepInjectCount.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
 class $modify(MyPlayLayer, PlayLayer) {
     struct Fields {
-        struct ReplayStepSnapshot {
-            uint64_t frame = 0;
-            float time = 0.0f;
-            size_t nextInputIdx = 0;
-            bool replayHoldingJump = false;
-            std::shared_ptr<CheckpointObject> checkpoint;
-        };
-
+        // ========== Input bars (normal play, "Show Inputs In-Game" setting) ==========
         std::vector<ReplayPress> m_presses;
         CCNode* m_circleLayer = nullptr;
-        CCDrawNode* m_runtimeHitboxOverlay = nullptr;
-        bool m_runtimeHitboxCaptured = false;
         CCNode* m_indicator = nullptr; // hollow square following the player
-        CCLabelBMFont* m_indicatorStyleLabel = nullptr;
         double m_framerate = 240.0;
         bool m_active = false;
         bool m_dotsCreated = false;
-        // Settings
         int m_barHeight = 10;
         int m_barY = 15;
         ccColor4B m_p1Color = ccc4(50, 255, 80, 200);
@@ -135,342 +412,47 @@ class $modify(MyPlayLayer, PlayLayer) {
         // Dot nodes (one per press): (pressIndex, dotNode)
         std::vector<std::pair<size_t, CCNode*>> m_dots;
 
-        // ========== UR Bar / Rhythm Game ==========
-        CCNode* m_urBar = nullptr;
-        CCLabelBMFont* m_accuracyLabel = nullptr;
-        std::vector<CCNode*> m_urTickNodes;
-        std::vector<URTick> m_urTicks;
-        size_t m_processedInputIdx = 0;
-        std::vector<bool> m_replayPressUsed;
-        std::vector<bool> m_replayReleaseUsed;
-        int m_judgmentCounts[6] = {0, 0, 0, 0, 0, 0};
-        float m_totalAccuracy = 0.0f;
-        int m_totalJudgments = 0;
-        // UR bar settings
-        float m_urBarWidth = 300.0f;
-        float m_urBarHeight = 12.0f;
-        float m_goodFrames = 2.0f;
-        float m_earlyLateFrames = 5.0f;
-        float m_veryFrames = 8.0f;
-        // Replay press times (in seconds) for quick matching
-        std::vector<float> m_replayPressTimes;
-        std::vector<float> m_replayReleaseTimes;
+        // ========== Runtime hitbox capture (offline RE workflow) ==========
+        CCDrawNode* m_runtimeHitboxOverlay = nullptr;
+        bool m_runtimeHitboxCaptured = false;
 
-        // ========== Replay Player Mode ==========
-        bool m_isReplayMode = false;
-        float m_replayCurrentTime = 0.0f;
-        size_t m_nextInputIdx = 0;
-        bool m_isPaused = false;
-        float m_pauseTime = 0.0f;
-        bool m_isSeeking = false;
-        float m_seekTargetTime = 0.0f;
-        float m_seekResumeSpeed = 1.0f;
-        bool m_snapshotRestoreDirty = false;
-        float m_snapshotRestoreTime = 0.0f;
-        bool m_frameStepActive = false;
-        int m_frameStepRemaining = 0;
-        uint64_t m_frameStepLastFrame = 0;
-        std::deque<ReplayStepSnapshot> m_replayStepHistory;
-        bool m_replayHoldingJump = false;
-        uint64_t m_replayFrameCursor = 0;
-        bool m_replayFrameCursorValid = false;
-        CCNode* m_videoControlsLayer = nullptr;
-        CCLabelBMFont* m_timeLabel = nullptr;
-        CCLabelBMFont* m_speedLabel = nullptr;
-        CCLabelBMFont* m_playPauseLabel = nullptr;
-        float m_lastAudioSyncMs = -1.0f;
-        float m_lastAudioRate = 1.0f;
-        bool m_audioPausedByReplay = false;
-        int m_audioMusicID = -1;
-        bool m_musicBootstrapTried = false;
-        float m_nextMusicRetryAt = 0.0f;
-        float m_nextAudioDebugAt = 0.0f;
-        float m_lastAutoSeekAt = -1000.0f;
-        bool m_forcedPracticeMusic = false;
-        bool m_prevPracticeMusicSync = false;
-        int m_replayMusicInitialOffset = -1;  // Captured offset of music at first sync
+        // ========== Auto-repair: validate & locally fix a gdsim solution in REAL GD ==========
+        bool m_autoRepairActive = false;
 
-        // ========== Replay Edit Mode ==========
-        bool m_isReplayEditMode = false;
-        size_t m_editSelectedIdx = 0;
-        CCNode* m_editPanel = nullptr;
-        CCNode* m_editInputsPanel = nullptr;
-        CCMenu* m_editInputsMenu = nullptr;
-        CCLabelBMFont* m_editTitleLabel = nullptr;
-        CCLabelBMFont* m_editPressLabel = nullptr;
-        CCLabelBMFont* m_editReleaseLabel = nullptr;
-        CCLabelBMFont* m_editHintLabel = nullptr;
-        Slider* m_editPressSlider = nullptr;
-        Slider* m_editReleaseSlider = nullptr;
-        bool m_editUpdatingSliders = false;
-        bool m_editPreviewPending = false;
-        float m_lastEditPreviewAt = -1000.0f;
-        CCNode* m_editTimeline = nullptr;
-        CCMenu* m_editTimelineMenu = nullptr;
-        CCLayerColor* m_editTimelineCursor = nullptr;
-        CCLabelBMFont* m_editTimelineLabel = nullptr;
-        CCLabelBMFont* m_editZoomLabel = nullptr;
-        Slider* m_editTimelinePressDrag = nullptr;
-        Slider* m_editTimelineReleaseDrag = nullptr;
-        bool m_editTimelineDragUpdating = false;
-        float m_editTimelineWindowStart = 0.0f;
-        float m_editTimelineWindowEnd = 0.0f;
-        float m_editTimelineZoom = 1.0f;
-        float m_editTimelineDragMinZoom = 2.0f;
-        float m_lastTimelineCenterTime = -1000.0f;
-        size_t m_lastTimelineSelectedIdx = std::numeric_limits<size_t>::max();
-        bool m_editSimplifiedMode = false;
-        CCLabelBMFont* m_editModeLabel = nullptr;
-        CCLabelBMFont* m_editSnapLabel = nullptr;
-        CCNode* m_editSimplifiedBar = nullptr;
-        CCMenu* m_editSimplifiedBarMenu = nullptr;
-        CCMenu* m_editBottomQuickMenu = nullptr;
-        Slider* m_editSimplePressDrag = nullptr;
-        Slider* m_editSimpleReleaseDrag = nullptr;
-        CCLayerColor* m_editSimplePressMarker = nullptr;
-        CCLayerColor* m_editSimpleReleaseMarker = nullptr;
-        float m_editSimpleWindowStart = 0.0f;
-        float m_editSimpleWindowEnd = 0.0f;
-        bool m_editSimpleDragUpdating = false;
-        int m_editSnapDivIndex = 3;
-        bool m_timelineDragging = false;
-        int m_timelineDragMode = 0; // 0 none, 1 press edge, 2 release edge, 3 whole segment
-        size_t m_timelineDragIdx = 0;
-        uint64_t m_timelineDragStartFrame = 0;
-        uint64_t m_timelineOrigPress = 0;
-        uint64_t m_timelineOrigRelease = 0;
+        // ========== Confirm-only: ONE non-blocking real-game pass, no repair loop =====
+        // Default post-Solve path (see doSimulate) — the .gdr2 is already written by
+        // the time this runs; this just confirms + captures telemetry, never retries.
+        bool m_confirmOnlyActive = false;
+        bool m_confirmDone       = false;
+
+        // ========== Sim-vs-game divergence detector (runs during auto-repair trials) ==========
+        // Runs gdsim in lockstep with the live replay and logs the first frame
+        // where the predicted player position diverges from the real one.
+        std::shared_ptr<gdsim::Level> m_divSim;
+        std::vector<bool> m_divInput;
+        uint64_t m_divFrame = 0;
+        bool  m_divInit = false;
+        bool  m_divReported = false;
+        bool  m_divDeathReported = false;   // separate from drift so a death MISMATCH always logs
+        bool  m_deathLogged = false;        // death-debug report written this attempt
+        // Real player state from the last ALIVE frame — the clean "approach" state, so
+        // the death report isn't corrupted by a same-frame pad/portal flip on the kill frame.
+        bool  m_prevRealValid = false, m_prevRealUp = false;
+        float m_prevRealVel = 0.f, m_prevRealX = 0.f, m_prevRealY = 0.f;
+        int   m_prevRealVeh = 0;
+        int   m_divDriftCount = 0;          // log the first few drifts, not just one
+        bool  m_divBaselined = false;
+        float m_divOffX = 0.f, m_divOffY = 0.f;
+        // Continuous drift tracking for the death report: WHERE real GD first parted
+        // from gdsim (onset), and the worst gap reached. Distinguishes a clean
+        // sim-predicted death (no drift) from a desync (real diverged then died).
+        uint64_t m_divFirstDriftFrame = 0;  // first frame |drift| exceeded 2u (0 = never)
+        float m_divFirstDx = 0.f, m_divFirstDy = 0.f;
+        float m_divMaxDx = 0.f, m_divMaxDy = 0.f;  // peak drift (signed, by magnitude)
+        uint64_t m_divMaxDriftFrame = 0;
+        float m_divRealMaxX = 0.f;          // furthest X the real player reached
+        bool  m_truthDeadLogged = false;    // stop appending the (frozen) death frame 60x
     };
-
-    static int snapDivisionAt(int idx) {
-        static constexpr int kSnapDivisions[] = {1, 2, 3, 4, 6, 8, 12, 16};
-        int clamped = std::clamp(idx, 0, static_cast<int>(std::size(kSnapDivisions)) - 1);
-        return kSnapDivisions[clamped];
-    }
-
-    int currentSnapFrames() {
-        auto fields = m_fields.self();
-        return std::max(1, snapDivisionAt(fields->m_editSnapDivIndex));
-    }
-
-    static constexpr float pausedUiTimeScale() {
-        // Keep scheduler running for UI updates while effectively freezing gameplay.
-        return 0.0001f;
-    }
-
-    void captureReplayStepSnapshot(uint64_t liveFrame, float currentTime) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-
-        Fields::ReplayStepSnapshot snap;
-        snap.frame = liveFrame;
-        snap.time = currentTime;
-        snap.nextInputIdx = fields->m_nextInputIdx;
-        snap.replayHoldingJump = fields->m_replayHoldingJump;
-
-        if (auto* checkpoint = this->createCheckpoint()) {
-            checkpoint->retain();
-            snap.checkpoint = std::shared_ptr<CheckpointObject>(checkpoint, [](CheckpointObject* value) {
-                value->release();
-            });
-        }
-
-        if (!fields->m_replayStepHistory.empty() && fields->m_replayStepHistory.back().frame == liveFrame) {
-            fields->m_replayStepHistory.back() = snap;
-        } else {
-            fields->m_replayStepHistory.push_back(snap);
-            constexpr size_t kMaxHistory = 2400;
-            if (fields->m_replayStepHistory.size() > kMaxHistory) {
-                fields->m_replayStepHistory.pop_front();
-            }
-        }
-    }
-
-    bool restoreReplayStepSnapshot(uint64_t targetFrame) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return false;
-        if (fields->m_replayStepHistory.empty()) return false;
-
-        const Fields::ReplayStepSnapshot* best = nullptr;
-        for (auto it = fields->m_replayStepHistory.rbegin(); it != fields->m_replayStepHistory.rend(); ++it) {
-            if (it->frame <= targetFrame) {
-                best = &(*it);
-                break;
-            }
-        }
-        if (!best) return false;
-
-        fields->m_isPaused = true;
-        fields->m_isSeeking = false;
-        fields->m_seekTargetTime = 0.0f;
-        fields->m_frameStepActive = false;
-        fields->m_frameStepRemaining = 0;
-        fields->m_replayCurrentTime = best->time;
-        fields->m_pauseTime = best->time;
-        fields->m_snapshotRestoreDirty = false;
-        fields->m_snapshotRestoreTime = 0.0f;
-        fields->m_nextInputIdx = best->nextInputIdx;
-        fields->m_replayHoldingJump = best->replayHoldingJump;
-        fields->m_replayFrameCursor = best->frame;
-        fields->m_replayFrameCursorValid = true;
-
-        if (best->checkpoint) {
-            this->loadFromCheckpoint(best->checkpoint.get());
-            this->removeAllCheckpoints();
-            this->storeCheckpoint(best->checkpoint.get());
-            this->m_currentCheckpoint = best->checkpoint.get();
-            this->m_activatedCheckpoint = nullptr;
-            this->m_tryPlaceCheckpoint = false;
-        }
-
-        m_timePlayed = best->time;
-        m_gameState.m_currentProgress = best->time;
-
-        // Recompute camera immediately so paused frame-step view matches restored player position.
-        this->resetCamera();
-        this->updateCamera(0.0f);
-
-        CCDirector::sharedDirector()->getScheduler()->setTimeScale(pausedUiTimeScale());
-        applyReplayAudioSync(best->time, true);
-
-        g_replayExternalCommands.liveFrame.store(best->frame);
-        g_replayExternalCommands.livePaused.store(true);
-        g_replayExternalCommands.liveReplayActive.store(true);
-        return true;
-    }
-
-    void stepReplayByFramesNoReset(int stepFrames) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-        if (!g_replayPlayer.replay.has_value()) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.framerate <= 0.0 || replay.presses.empty()) return;
-
-        float frameSeconds = 1.0f / static_cast<float>(replay.framerate);
-        float totalTime = static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate);
-        float currentTime = static_cast<float>(m_timePlayed);
-        float target = std::clamp(currentTime + static_cast<float>(stepFrames) * frameSeconds, 0.0f, totalTime);
-
-        if (stepFrames > 0) {
-            fields->m_isPaused = false;
-            fields->m_isSeeking = false;
-            fields->m_seekTargetTime = 0.0f;
-            fields->m_snapshotRestoreDirty = false;
-            fields->m_frameStepActive = true;
-            fields->m_frameStepRemaining = std::max(1, fields->m_frameStepRemaining + stepFrames);
-            fields->m_frameStepLastFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
-            fields->m_replayFrameCursor = fields->m_frameStepLastFrame;
-            fields->m_replayFrameCursorValid = true;
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
-            return;
-        }
-
-        // Backward stepping restores from recorded snapshots for instant precision.
-        uint64_t currentFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
-        uint64_t targetFrame = (currentFrame > static_cast<uint64_t>(-stepFrames))
-            ? (currentFrame - static_cast<uint64_t>(-stepFrames))
-            : 0;
-        if (restoreReplayStepSnapshot(targetFrame)) {
-            return;
-        }
-
-        // Fallback when history is empty (e.g. first backward step right after load).
-        fields->m_isPaused = true;
-        fields->m_frameStepActive = false;
-        fields->m_frameStepRemaining = 0;
-        fields->m_snapshotRestoreDirty = false;
-        fields->m_isSeeking = (target > 0.05f);
-        fields->m_seekTargetTime = target;
-        fields->m_seekResumeSpeed = 1.0f;
-        fields->m_nextInputIdx = 0;
-        bool shouldHold = false;
-        for (size_t i = 0; i < replay.presses.size(); ++i) {
-            float pressTime = static_cast<float>(replay.presses[i].framePress) / static_cast<float>(replay.framerate);
-            float releaseTime = static_cast<float>(replay.presses[i].frameRelease) / static_cast<float>(replay.framerate);
-            if (target >= releaseTime) {
-                fields->m_nextInputIdx = i + 1;
-                continue;
-            }
-            if (target >= pressTime && target < releaseTime) {
-                shouldHold = true;
-                fields->m_nextInputIdx = i;
-            }
-            break;
-        }
-
-        if (shouldHold != fields->m_replayHoldingJump) {
-            s_replayInputInjectionActive = true;
-            this->handleButton(shouldHold, 1, true);
-            s_replayInputInjectionActive = false;
-        }
-        fields->m_replayHoldingJump = shouldHold;
-        fields->m_replayFrameCursor = static_cast<uint64_t>(std::llround(static_cast<double>(target) * replay.framerate));
-        fields->m_replayFrameCursorValid = true;
-        this->resetLevel();
-        applyReplayAudioSync(0.0f, true);
-
-        g_replayExternalCommands.liveFrame.store(static_cast<uint64_t>(std::llround(static_cast<double>(target) * replay.framerate)));
-        g_replayExternalCommands.livePaused.store(true);
-        g_replayExternalCommands.liveReplayActive.store(true);
-    }
-
-    void processExternalCommandsAlwaysRunning(float dt) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-        if (!g_replayPlayer.replay.has_value()) return;
-        if (!ensureReplayRuntimeReady("processExternalCommandsAlwaysRunning")) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        float currentTime = static_cast<float>(m_timePlayed);
-        uint64_t liveFrame = 0;
-        if (replay.framerate > 0.0) {
-            liveFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
-        }
-
-        g_replayExternalCommands.liveFrame.store(liveFrame);
-        g_replayExternalCommands.livePaused.store(fields->m_isPaused);
-        g_replayExternalCommands.liveReplayActive.store(true);
-
-        traceDebug("[POSTDBG] CHECK setPausedState");
-        int desiredPaused = g_replayExternalCommands.setPausedState.exchange(-1);
-        if (desiredPaused == 0 || desiredPaused == 1) {
-            bool targetPaused = (desiredPaused == 1);
-            traceDebug("[CMDDBG] setPausedState={} targetPaused={} currentPaused={} liveFrame={}", 
-                desiredPaused, targetPaused, fields->m_isPaused, liveFrame);
-            fields->m_frameStepActive = false;
-            fields->m_frameStepRemaining = 0;
-            if (fields->m_isPaused != targetPaused) {
-                traceDebug("[POSTDBG] BEFORE onReplayPlayPause isPaused={}", fields->m_isPaused);
-                onReplayPlayPause(nullptr);
-                traceDebug("[POSTDBG] AFTER onReplayPlayPause isPaused={}", fields->m_isPaused);
-                currentTime = static_cast<float>(m_timePlayed);
-                fields->m_replayCurrentTime = currentTime;
-            }
-        }
-        traceDebug("[POSTDBG] DONE setPausedState");
-
-        traceDebug("[POSTDBG] CHECK stepFrameRequests");
-        int stepFrames = g_replayExternalCommands.stepFrameRequests.exchange(0);
-        if (stepFrames != 0 && replay.framerate > 0.0) {
-            uint64_t calcFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate)) + stepFrames;
-            traceDebug("[CMDDBG] STEP without reset: stepFrames={} currentTime={:.3f}s targetFrame={}", 
-                stepFrames, currentTime, calcFrame);
-            stepReplayByFramesNoReset(stepFrames);
-            currentTime = fields->m_replayCurrentTime;
-        }
-        traceDebug("[POSTDBG] DONE stepFrameRequests");
-    }
-
-    const char* indicatorStyleName() {
-        auto fields = m_fields.self();
-        return fields->m_indicatorStyle == 0 ? "Line" : "Square";
-    }
-
-    void updateIndicatorStyleLabel() {
-        auto fields = m_fields.self();
-        if (!fields->m_indicatorStyleLabel) return;
-        fields->m_indicatorStyleLabel->setString(fmt::format("Ind:{}", indicatorStyleName()).c_str());
-    }
 
     void rebuildIndicatorVisual() {
         auto fields = m_fields.self();
@@ -485,13 +467,19 @@ class $modify(MyPlayLayer, PlayLayer) {
         fields->m_indicator->setContentSize({indSize, indSize});
 
         if (fields->m_indicatorStyle == 0) {
-            // Line style: a single vertical line centered on player X.
-            float lineHeight = std::max(6.0f, barH + 2.0f);
+            // Line style: a crisp vertical playhead with a small bright cap dot on top.
+            float lineHeight = std::max(6.0f, barH + 4.0f);
             auto line = CCLayerColor::create(ic, border, lineHeight);
             line->setPosition({-border * 0.5f, -lineHeight * 0.5f});
             fields->m_indicator->addChild(line);
+            float cap = border + 2.0f;
+            auto capNode = CCLayerColor::create(ccc4(255, 255, 255, ic.a),
+                                                cap, cap);
+            capNode->setPosition({-cap * 0.5f, lineHeight * 0.5f - 1.0f});
+            fields->m_indicator->addChild(capNode);
         } else {
-            // Square style: hollow square border around player indicator.
+            // Square style: hollow square border + a small filled core, so the
+            // playhead reads clearly against busy segments underneath.
             float half = indSize * 0.5f;
 
             auto top = CCLayerColor::create(ic, indSize, border);
@@ -509,1050 +497,13 @@ class $modify(MyPlayLayer, PlayLayer) {
             auto right = CCLayerColor::create(ic, border, indSize);
             right->setPosition({half - border, -half});
             fields->m_indicator->addChild(right);
+
+            float core = indSize * 0.34f;
+            auto center = CCLayerColor::create(ccc4(ic.r, ic.g, ic.b, 150),
+                                               core, core);
+            center->setPosition({-core * 0.5f, -core * 0.5f});
+            fields->m_indicator->addChild(center);
         }
-
-        updateIndicatorStyleLabel();
-    }
-
-    void onReplayIndicatorStyleToggle(CCObject*) {
-        auto fields = m_fields.self();
-        fields->m_indicatorStyle = (fields->m_indicatorStyle + 1) % 2;
-        rebuildIndicatorVisual();
-    }
-
-    uint64_t snapFrameToGrid(uint64_t rawFrame) {
-        int snapFrames = currentSnapFrames();
-        if (snapFrames <= 1) return rawFrame;
-        uint64_t step = static_cast<uint64_t>(snapFrames);
-        return ((rawFrame + step / 2ull) / step) * step;
-    }
-
-    void updateSnapLabel() {
-        auto fields = m_fields.self();
-        if (!fields->m_editSnapLabel) return;
-        fields->m_editSnapLabel->setString(fmt::format("Snap 1/{}", currentSnapFrames()).c_str());
-    }
-
-    void onReplayEditSnapDown(CCObject*) {
-        auto fields = m_fields.self();
-        fields->m_editSnapDivIndex = std::max(0, fields->m_editSnapDivIndex - 1);
-        updateSnapLabel();
-    }
-
-    void onReplayEditSnapUp(CCObject*) {
-        auto fields = m_fields.self();
-        fields->m_editSnapDivIndex = std::min(7, fields->m_editSnapDivIndex + 1);
-        updateSnapLabel();
-    }
-
-    void applyReplayAudioSync(float levelTime, bool forceSeek) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-
-        debugLogToFile(fmt::format("=== applyReplayAudioSync START levelTime={:.3f} forceSeek={} ===", levelTime, forceSeek));
-
-        auto* audio = FMODAudioEngine::sharedEngine();
-        if (!audio) {
-            debugLogToFile("ERROR: audio engine null");
-            return;
-        }
-        debugLogToFile(fmt::format("audio engine OK"));
-
-        auto isMusicSlotValid = [&](int musicID, int channelID) -> bool {
-            bool valid = (channelID != 0) || audio->isMusicPlaying(musicID);
-            debugLogToFile(fmt::format("  isMusicSlotValid musicID={} channelID={} playing={} -> {}", musicID, channelID, audio->isMusicPlaying(musicID), valid));
-            return valid;
-        };
-
-        auto resolveReplayMusic = [&]() -> int {
-            debugLogToFile(fmt::format("  resolveReplayMusic START m_audioMusicID={}", fields->m_audioMusicID));
-            if (fields->m_audioMusicID >= 0) {
-                int ch = audio->getMusicChannelID(fields->m_audioMusicID);
-                debugLogToFile(fmt::format("    checking cached musicID={} ch={}", fields->m_audioMusicID, ch));
-                if (isMusicSlotValid(fields->m_audioMusicID, ch) || fields->m_audioPausedByReplay) {
-                    debugLogToFile(fmt::format("    cached valid, returning ch={}", ch));
-                    return ch;
-                }
-            }
-
-            debugLogToFile("  scanning all music slots...");
-            for (int musicID = 0; musicID < 32; ++musicID) {
-                int ch = audio->getMusicChannelID(musicID);
-                debugLogToFile(fmt::format("    slot musicID={} ch={} valid={}", musicID, ch, isMusicSlotValid(musicID, ch)));
-                if (isMusicSlotValid(musicID, ch)) {
-                    fields->m_audioMusicID = musicID;
-                    debugLogToFile(fmt::format("    FOUND musicID={} ch={}", musicID, ch));
-                    return ch;
-                }
-            }
-
-            fields->m_audioMusicID = -1;
-            debugLogToFile("  NO MUSIC SLOT FOUND");
-            return -1;
-        };
-
-        int channelID = resolveReplayMusic();
-        debugLogToFile(fmt::format("resolved channelID={}", channelID));
-
-        // FIRST time we find the channel, capture the music's initial offset and resume once.
-        // Do not key this off m_lastAudioSyncMs because paused edit mode can keep it < 0 for many ticks.
-        if (fields->m_audioMusicID >= 0 && channelID >= 0 && fields->m_replayMusicInitialOffset == -1) {
-            unsigned int musicMs = audio->getMusicTimeMS(channelID);
-            fields->m_replayMusicInitialOffset = static_cast<int>(musicMs);
-            debugLogToFile(fmt::format("CAPTURED initial music offset: {} ms", fields->m_replayMusicInitialOffset));
-            debugLogToFile("First audio sync: calling resumeAllMusic to start playback");
-            audio->resumeAllMusic();
-            traceDebug("[AUDIODBG] resumeAllMusic on first sync");
-        }
-
-        auto logAudioState = [&](const char* tag, float targetMs, unsigned int musicMs, float driftMs) {
-            if (levelTime < fields->m_nextAudioDebugAt) return;
-            fields->m_nextAudioDebugAt = levelTime + 0.5f;
-            bool playing = (fields->m_audioMusicID >= 0) ? audio->isMusicPlaying(fields->m_audioMusicID) : false;
-            debugLogToFile(fmt::format(
-                "[AUDIODBG] {} t={:.3f}s target={:.0f}ms music={} ch={} play={} paused={} seeking={} forceSeek={} speed={:.2f}x musicMs={} drift={:.1f}",
-                tag,
-                levelTime,
-                targetMs,
-                fields->m_audioMusicID,
-                channelID,
-                playing,
-                fields->m_isPaused,
-                fields->m_isSeeking,
-                forceSeek,
-                g_replayPlayer.playbackSpeed,
-                musicMs,
-                driftMs
-            ));
-        };
-
-        // Pause / resume music alongside replay state.
-        debugLogToFile(fmt::format("checking pause state: m_isPaused={} m_audioPausedByReplay={}", fields->m_isPaused, fields->m_audioPausedByReplay));
-        if (fields->m_isPaused) {
-            if (!fields->m_audioPausedByReplay && fields->m_audioMusicID >= 0) {
-                debugLogToFile(fmt::format("PAUSE: calling pauseMusic musicID={}", fields->m_audioMusicID));
-                audio->pauseMusic(fields->m_audioMusicID);
-                fields->m_audioPausedByReplay = true;
-                traceDebug("[AUDIODBG] pauseMusic music={} ch={}", fields->m_audioMusicID, channelID);
-            }
-            logAudioState("paused", std::max(0.0f, levelTime * 1000.0f), 0, 0.0f);
-            return;
-        }
-
-        if (fields->m_audioPausedByReplay) {
-            if (fields->m_audioMusicID >= 0) {
-                audio->resumeMusic(fields->m_audioMusicID);
-                traceDebug("[AUDIODBG] resumeMusic music={} ch={}", fields->m_audioMusicID, channelID);
-            }
-            fields->m_audioPausedByReplay = false;
-            channelID = resolveReplayMusic();
-        }
-
-        if (fields->m_audioMusicID < 0 || channelID < 0) {
-            logAudioState("no-music", std::max(0.0f, levelTime * 1000.0f), 0, 0.0f);
-            return;
-        }
-
-        float speed = std::clamp(g_replayPlayer.playbackSpeed, 0.25f, 4.0f);
-        if (std::abs(speed - fields->m_lastAudioRate) > 0.001f) {
-            // For MusicChannel target, FMOD API expects musicID, not raw channel ID.
-            audio->setChannelPitch(fields->m_audioMusicID, AudioTargetType::MusicChannel, speed);
-            fields->m_lastAudioRate = speed;
-        }
-
-        float targetMs = std::max(0.0f, levelTime * 1000.0f);
-        if (fields->m_replayMusicInitialOffset > 0) {
-            targetMs += fields->m_replayMusicInitialOffset;
-        }
-        unsigned int musicMs = audio->getMusicTimeMS(channelID);
-        float driftMs = std::abs(targetMs - static_cast<float>(musicMs));
-
-        // Auto-seek only on large sustained drift; aggressive correction near t=0 can mute by rewinding repeatedly.
-        bool allowAutoSeek = (
-            !forceSeek &&
-            !fields->m_isSeeking &&
-            !fields->m_isPaused &&
-            targetMs >= 250.0f &&
-            (levelTime - fields->m_lastAutoSeekAt) >= 1.0f &&
-            driftMs > 700.0f
-        );
-
-        if (forceSeek || fields->m_lastAudioSyncMs < 0.0f || allowAutoSeek) {
-            traceDebug(
-                "[AUDIODBG] setMusicTimeMS music={} ch={} target={:.0f}ms musicMs={} drift={:.1f} forceSeek={}",
-                fields->m_audioMusicID,
-                channelID,
-                targetMs,
-                musicMs,
-                driftMs,
-                forceSeek
-            );
-            traceDebug("CALL: audio->setMusicTimeMS({}, true, {})", static_cast<unsigned int>(targetMs), fields->m_audioMusicID);
-            audio->setMusicTimeMS(static_cast<unsigned int>(targetMs), true, fields->m_audioMusicID);
-            traceDebug("CALL returned");
-            if (!forceSeek) {
-                fields->m_lastAutoSeekAt = levelTime;
-            }
-        }
-        fields->m_lastAudioSyncMs = targetMs;
-        logAudioState("tick", targetMs, musicMs, driftMs);
-        debugLogToFile(fmt::format("=== applyReplayAudioSync END ==="));
-    }
-
-    void ensureReplayMusicStarted(bool forceSeekToCurrent) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-
-        debugLogToFile(fmt::format("=== ensureReplayMusicStarted START forceSeekToCurrent={} ===", forceSeekToCurrent));
-        traceDebug("[AUDIODBG] ensureReplayMusicStarted state-only t={:.3f}s practiceMusicSync={}", static_cast<float>(m_timePlayed), this->m_practiceMusicSync);
-
-        fields->m_audioMusicID = -1;
-        fields->m_musicBootstrapTried = false;
-        fields->m_audioPausedByReplay = false;
-        fields->m_lastAudioSyncMs = -1.0f;
-        fields->m_nextAudioDebugAt = 0.0f;
-        fields->m_lastAutoSeekAt = -1000.0f;
-        fields->m_replayMusicInitialOffset = -1;  // Reset offset capture
-        debugLogToFile("audio state reset");
-
-        if (forceSeekToCurrent) {
-            debugLogToFile("calling applyReplayAudioSync with forceSeekToCurrent");
-            applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
-        }
-        debugLogToFile(fmt::format("=== ensureReplayMusicStarted END ==="));
-    }
-
-    bool ensureReplayRuntimeReady(char const* context) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode || !g_replayPlayer.replay.has_value()) return false;
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.framerate <= 0.0 || replay.presses.empty()) {
-            log::warn("[ReplaySafety] Disabled replay runtime in {} (invalid replay payload)", context);
-            fields->m_isReplayMode = false;
-            fields->m_isPaused = true;
-            fields->m_isSeeking = false;
-            fields->m_frameStepActive = false;
-            fields->m_frameStepRemaining = 0;
-            fields->m_replayHoldingJump = false;
-            fields->m_replayFrameCursorValid = false;
-            g_replayPlayer.isActive = false;
-            return false;
-        }
-
-        if (fields->m_nextInputIdx > replay.presses.size()) {
-            fields->m_nextInputIdx = replay.presses.size();
-        }
-        return true;
-    }
-
-    float replayTotalTimeSeconds() const {
-        if (!g_replayPlayer.replay.has_value()) return 0.0f;
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty() || replay.framerate <= 0.0) return 0.0f;
-        return static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate);
-    }
-
-    uint64_t replayFrameAtTime(float timeSeconds) const {
-        if (!g_replayPlayer.replay.has_value()) return 0;
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.framerate <= 0.0) return 0;
-        return static_cast<uint64_t>(std::llround(static_cast<double>(timeSeconds) * replay.framerate));
-    }
-
-    void primeReplayFrameCursor(float timeSeconds) {
-        auto fields = m_fields.self();
-        fields->m_replayFrameCursor = replayFrameAtTime(timeSeconds);
-        fields->m_replayFrameCursorValid = true;
-    }
-
-    void pumpReplayInputsThroughFrame(uint64_t currentFrame) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode || !g_replayPlayer.replay.has_value()) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.framerate <= 0.0 || replay.presses.empty()) {
-            fields->m_replayFrameCursor = currentFrame;
-            fields->m_replayFrameCursorValid = true;
-            return;
-        }
-
-        uint64_t startFrame = fields->m_replayFrameCursorValid
-            ? fields->m_replayFrameCursor
-            : (currentFrame == 0 ? std::numeric_limits<uint64_t>::max() : currentFrame - 1);
-
-        if (currentFrame < startFrame) {
-            fields->m_replayFrameCursor = currentFrame;
-            fields->m_replayFrameCursorValid = true;
-            return;
-        }
-
-        for (uint64_t frame = startFrame + 1; frame <= currentFrame; ++frame) {
-            while (fields->m_nextInputIdx < replay.presses.size()) {
-                auto& press = replay.presses[fields->m_nextInputIdx];
-
-                if (press.frameRelease < frame) {
-                    fields->m_nextInputIdx++;
-                    continue;
-                }
-
-                if (press.framePress > frame) {
-                    break;
-                }
-
-                if (press.framePress <= frame && !fields->m_replayHoldingJump) {
-                    s_replayInputInjectionActive = true;
-                    this->handleButton(true, 1, true);
-                    s_replayInputInjectionActive = false;
-                    fields->m_replayHoldingJump = true;
-                }
-
-                if (press.frameRelease <= frame && fields->m_replayHoldingJump) {
-                    s_replayInputInjectionActive = true;
-                    this->handleButton(false, 1, true);
-                    s_replayInputInjectionActive = false;
-                    fields->m_replayHoldingJump = false;
-                    fields->m_nextInputIdx++;
-                    continue;
-                }
-
-                break;
-            }
-        }
-
-        fields->m_replayFrameCursor = currentFrame;
-        fields->m_replayFrameCursorValid = true;
-    }
-
-    uint64_t replayMaxFrame() const {
-        if (!g_replayPlayer.replay.has_value()) return 1;
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty()) return 1;
-        uint64_t maxFrame = replay.presses.back().frameRelease;
-        return std::max<uint64_t>(maxFrame, 1ull);
-    }
-
-    void clampSelectedReplayInput() {
-        auto fields = m_fields.self();
-        if (!g_replayPlayer.replay.has_value()) return;
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty()) return;
-
-        if (fields->m_editSelectedIdx >= replay.presses.size()) {
-            fields->m_editSelectedIdx = replay.presses.size() - 1;
-        }
-
-        auto& p = replay.presses[fields->m_editSelectedIdx];
-        if (p.frameRelease <= p.framePress) {
-            p.frameRelease = p.framePress + 1;
-        }
-    }
-
-    void rebuildReplayRuntimeFromCurrentState() {
-        auto fields = m_fields.self();
-        if (!g_replayPlayer.replay.has_value()) return;
-
-        std::sort(g_replayPlayer.replay->presses.begin(), g_replayPlayer.replay->presses.end(),
-            [](ReplayPress const& a, ReplayPress const& b) {
-                return a.framePress < b.framePress;
-            }
-        );
-
-        clampSelectedReplayInput();
-        fields->m_nextInputIdx = 0;
-        fields->m_replayHoldingJump = false;
-
-        float currentTime = static_cast<float>(m_timePlayed);
-        auto const& replay = g_replayPlayer.replay.value();
-        for (size_t i = 0; i < replay.presses.size(); ++i) {
-            float releaseTime = static_cast<float>(replay.presses[i].frameRelease) / static_cast<float>(replay.framerate);
-            if (releaseTime < currentTime) {
-                fields->m_nextInputIdx = i + 1;
-                continue;
-            }
-            break;
-        }
-
-        fields->m_replayFrameCursor = replayFrameAtTime(currentTime);
-        fields->m_replayFrameCursorValid = true;
-    }
-
-    void updateReplayEditLabels() {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty()) return;
-
-        auto const& p = replay.presses[fields->m_editSelectedIdx];
-        float pressTime = static_cast<float>(p.framePress) / static_cast<float>(replay.framerate);
-        float releaseTime = static_cast<float>(p.frameRelease) / static_cast<float>(replay.framerate);
-
-        if (fields->m_editTitleLabel) {
-            fields->m_editTitleLabel->setString(
-                fmt::format("Edit Replay {} / {}", fields->m_editSelectedIdx + 1, replay.presses.size()).c_str()
-            );
-        }
-        if (fields->m_editPressLabel) {
-            fields->m_editPressLabel->setString(
-                fmt::format("Press: {} ({:.3f}s)", p.framePress, pressTime).c_str()
-            );
-        }
-        if (fields->m_editReleaseLabel) {
-            fields->m_editReleaseLabel->setString(
-                fmt::format("Release: {} ({:.3f}s)", p.frameRelease, releaseTime).c_str()
-            );
-        }
-        if (fields->m_editHintLabel) {
-            fields->m_editHintLabel->setString("Replay runs live. Edits apply to upcoming inputs.");
-        }
-        updateSnapLabel();
-
-        uint64_t maxFrame = replayMaxFrame();
-        fields->m_editUpdatingSliders = true;
-        if (fields->m_editPressSlider) {
-            fields->m_editPressSlider->setValue(static_cast<float>(p.framePress) / static_cast<float>(maxFrame));
-        }
-        if (fields->m_editReleaseSlider) {
-            fields->m_editReleaseSlider->setValue(static_cast<float>(p.frameRelease) / static_cast<float>(maxFrame));
-        }
-        fields->m_editUpdatingSliders = false;
-
-        if (fields->m_editInputsMenu) {
-            fields->m_editInputsMenu->removeAllChildrenWithCleanup(true);
-
-            constexpr size_t kVisibleRows = 7;
-            size_t start = 0;
-            if (fields->m_editSelectedIdx > kVisibleRows / 2) {
-                start = fields->m_editSelectedIdx - (kVisibleRows / 2);
-            }
-            if (start + kVisibleRows > replay.presses.size()) {
-                if (replay.presses.size() > kVisibleRows) {
-                    start = replay.presses.size() - kVisibleRows;
-                } else {
-                    start = 0;
-                }
-            }
-
-            float rowY = 64.0f;
-            for (size_t i = start; i < replay.presses.size() && i < start + kVisibleRows; ++i) {
-                auto const& row = replay.presses[i];
-                bool isSel = (i == fields->m_editSelectedIdx);
-                auto rowText = fmt::format(
-                    "{}{}: P{} R{}{}",
-                    isSel ? "> " : "",
-                    i + 1,
-                    row.framePress,
-                    row.frameRelease,
-                    isSel ? " <" : ""
-                );
-
-                auto rowLabel = CCLabelBMFont::create(rowText.c_str(), "chatFont.fnt");
-                rowLabel->setScale(0.45f);
-                rowLabel->setAnchorPoint({0.0f, 0.5f});
-                rowLabel->setColor(isSel ? ccc3(255, 235, 120) : ccc3(220, 220, 220));
-
-                auto rowBtn = CCMenuItemSpriteExtra::create(
-                    rowLabel,
-                    this,
-                    menu_selector(MyPlayLayer::onReplayEditSelectInput)
-                );
-                rowBtn->setTag(static_cast<int>(i));
-                rowBtn->setAnchorPoint({0.0f, 0.5f});
-                rowBtn->setPosition({10.0f, rowY});
-                fields->m_editInputsMenu->addChild(rowBtn);
-
-                rowY -= 10.0f;
-            }
-        }
-
-        rebuildEditTimeline(false);
-        rebuildSimplifiedBar(false);
-    }
-
-    void rebuildEditTimeline(bool force) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        if (!fields->m_editTimelineMenu || !fields->m_editTimeline) return;
-
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty() || replay.framerate <= 0.0) return;
-
-        float totalTime = replayTotalTimeSeconds();
-        float currentTime = static_cast<float>(m_timePlayed);
-        float center = std::clamp(currentTime, 0.0f, totalTime);
-        float zoom = std::clamp(fields->m_editTimelineZoom, 0.5f, 8.0f);
-        float windowDuration = 6.0f / zoom;
-
-        float start = std::max(0.0f, center - windowDuration * 0.5f);
-        float end = std::min(totalTime, start + windowDuration);
-        if (end - start < windowDuration) {
-            start = std::max(0.0f, end - windowDuration);
-        }
-
-        if (!force) {
-            bool selectedUnchanged = (fields->m_lastTimelineSelectedIdx == fields->m_editSelectedIdx);
-            bool centerUnchanged = std::abs(fields->m_lastTimelineCenterTime - center) < 0.12f;
-            if (selectedUnchanged && centerUnchanged) {
-                fields->m_editTimelineWindowStart = start;
-                fields->m_editTimelineWindowEnd = end;
-                if (fields->m_editZoomLabel) {
-                    fields->m_editZoomLabel->setString(fmt::format("Zoom {:.2f}x", zoom).c_str());
-                }
-                updateTimelineDragHandles();
-                return;
-            }
-        }
-
-        fields->m_lastTimelineCenterTime = center;
-        fields->m_lastTimelineSelectedIdx = fields->m_editSelectedIdx;
-        fields->m_editTimelineWindowStart = start;
-        fields->m_editTimelineWindowEnd = end;
-
-        fields->m_editTimelineMenu->removeAllChildrenWithCleanup(true);
-
-        float timelineWidth = fields->m_editTimeline->getContentSize().width;
-        float timelineHeight = fields->m_editTimeline->getContentSize().height;
-        float duration = std::max(0.001f, end - start);
-
-        auto toX = [&](float t) {
-            float n = (t - start) / duration;
-            return std::clamp(n, 0.0f, 1.0f) * timelineWidth;
-        };
-
-        for (size_t i = 0; i < replay.presses.size(); ++i) {
-            auto const& press = replay.presses[i];
-            float t0 = static_cast<float>(press.framePress) / static_cast<float>(replay.framerate);
-            float t1 = static_cast<float>(press.frameRelease) / static_cast<float>(replay.framerate);
-            if (t1 < start || t0 > end) continue;
-
-            float x0 = toX(t0);
-            float x1 = toX(t1);
-            float w = std::max(2.0f, std::abs(x1 - x0));
-            float xLeft = std::min(x0, x1);
-            bool selected = (i == fields->m_editSelectedIdx);
-
-            auto color = selected ? ccc4(255, 235, 120, 220) : ccc4(120, 190, 255, 170);
-            auto seg = CCLayerColor::create(color, w, timelineHeight - 6.0f);
-            seg->setAnchorPoint({0.0f, 0.0f});
-            seg->setPosition({xLeft, 3.0f});
-
-            auto btn = CCMenuItemSpriteExtra::create(
-                seg,
-                this,
-                menu_selector(MyPlayLayer::onReplayEditSelectInput)
-            );
-            btn->setTag(static_cast<int>(i));
-            btn->setAnchorPoint({0.0f, 0.0f});
-            btn->setPosition({xLeft, 3.0f});
-            fields->m_editTimelineMenu->addChild(btn);
-        }
-
-        if (fields->m_editTimelineLabel) {
-            fields->m_editTimelineLabel->setString(
-                fmt::format("Timeline {:.2f}s/{:.2f}s", currentTime, totalTime).c_str()
-            );
-        }
-
-        if (fields->m_editZoomLabel) {
-            fields->m_editZoomLabel->setString(fmt::format("Zoom {:.2f}x", zoom).c_str());
-        }
-
-        updateTimelineDragHandles();
-    }
-
-    void updateEditTimelineCursor() {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !fields->m_editTimelineCursor || !fields->m_editTimeline) return;
-        float start = fields->m_editTimelineWindowStart;
-        float end = std::max(start + 0.001f, fields->m_editTimelineWindowEnd);
-        float duration = end - start;
-        float t = static_cast<float>(m_timePlayed);
-        float n = std::clamp((t - start) / duration, 0.0f, 1.0f);
-        float x = n * fields->m_editTimeline->getContentSize().width;
-        fields->m_editTimelineCursor->setPosition({x, 0.0f});
-    }
-
-    uint64_t frameFromTimelineX(float localX) {
-        auto fields = m_fields.self();
-        if (!g_replayPlayer.replay.has_value()) return 0;
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.framerate <= 0.0) return 0;
-
-        float width = std::max(1.0f, fields->m_editTimeline->getContentSize().width);
-        float start = fields->m_editTimelineWindowStart;
-        float end = std::max(start + 0.001f, fields->m_editTimelineWindowEnd);
-        float n = std::clamp(localX / width, 0.0f, 1.0f);
-        float t = start + n * (end - start);
-        uint64_t frame = static_cast<uint64_t>(std::llround(static_cast<double>(t) * replay.framerate));
-        return snapFrameToGrid(frame);
-    }
-
-    float timelineXFromFrame(uint64_t frame) {
-        auto fields = m_fields.self();
-        if (!g_replayPlayer.replay.has_value()) return 0.0f;
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.framerate <= 0.0) return 0.0f;
-
-        float start = fields->m_editTimelineWindowStart;
-        float end = std::max(start + 0.001f, fields->m_editTimelineWindowEnd);
-        float width = std::max(1.0f, fields->m_editTimeline->getContentSize().width);
-        float t = static_cast<float>(frame) / static_cast<float>(replay.framerate);
-        float n = std::clamp((t - start) / (end - start), 0.0f, 1.0f);
-        return n * width;
-    }
-
-    void updateEditModeVisibility() {
-        auto fields = m_fields.self();
-        bool simplified = fields->m_editSimplifiedMode;
-
-        // In simplified mode, hide the advanced edit panels entirely.
-        if (fields->m_editPanel) fields->m_editPanel->setVisible(!simplified);
-        if (fields->m_editInputsPanel) fields->m_editInputsPanel->setVisible(!simplified);
-
-        if (fields->m_editTimeline) fields->m_editTimeline->setVisible(!simplified);
-        if (fields->m_editTimelineLabel) fields->m_editTimelineLabel->setVisible(!simplified);
-        if (fields->m_editZoomLabel) fields->m_editZoomLabel->setVisible(!simplified);
-        if (fields->m_editTimelinePressDrag) fields->m_editTimelinePressDrag->setVisible(false);
-        if (fields->m_editTimelineReleaseDrag) fields->m_editTimelineReleaseDrag->setVisible(false);
-
-        // Simplified mode now reuses the normal in-game input bar visuals,
-        // so the custom simplified timeline widgets stay hidden.
-        if (fields->m_editSimplifiedBar) fields->m_editSimplifiedBar->setVisible(false);
-        if (fields->m_editSimplePressDrag) fields->m_editSimplePressDrag->setVisible(false);
-        if (fields->m_editSimpleReleaseDrag) fields->m_editSimpleReleaseDrag->setVisible(false);
-        if (fields->m_editSimplePressMarker) fields->m_editSimplePressMarker->setVisible(simplified);
-        if (fields->m_editSimpleReleaseMarker) fields->m_editSimpleReleaseMarker->setVisible(simplified);
-        if (fields->m_editBottomQuickMenu) fields->m_editBottomQuickMenu->setVisible(simplified);
-
-        if (fields->m_editModeLabel) {
-            fields->m_editModeLabel->setString(simplified ? "Mode: Simplified" : "Mode: Timeline");
-        }
-    }
-
-    void updateSimplifiedDragHandles() {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !fields->m_editSimplifiedMode || !g_replayPlayer.replay.has_value()) return;
-        if (!fields->m_editSimplePressMarker || !fields->m_editSimpleReleaseMarker) return;
-        if (!fields->m_active) return;
-
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty() || replay.framerate <= 0.0) return;
-
-        // Find the live rendered segment for selected input and place markers on it.
-        CCNode* selectedDot = nullptr;
-        for (auto& [idx, dot] : fields->m_dots) {
-            if (idx == fields->m_editSelectedIdx) {
-                selectedDot = dot;
-                break;
-            }
-        }
-
-        if (!selectedDot || !selectedDot->isVisible()) {
-            fields->m_editSimplePressMarker->setVisible(false);
-            fields->m_editSimpleReleaseMarker->setVisible(false);
-            if (fields->m_editSimplePressDrag) fields->m_editSimplePressDrag->setVisible(false);
-            if (fields->m_editSimpleReleaseDrag) fields->m_editSimpleReleaseDrag->setVisible(false);
-            return;
-        }
-
-        auto dotPos = selectedDot->getPosition();
-        auto dotSize = selectedDot->getContentSize();
-        float y = static_cast<float>(fields->m_barY) + static_cast<float>(fields->m_barHeight) * 0.5f;
-
-        fields->m_editSimplePressMarker->setVisible(true);
-        fields->m_editSimpleReleaseMarker->setVisible(true);
-        fields->m_editSimplePressMarker->setPosition({dotPos.x, y});
-        fields->m_editSimpleReleaseMarker->setPosition({dotPos.x + dotSize.width, y});
-
-        if (fields->m_editSimplePressDrag) {
-            fields->m_editSimplePressDrag->setVisible(true);
-            fields->m_editSimplePressDrag->setPosition({dotPos.x, y});
-        }
-        if (fields->m_editSimpleReleaseDrag) {
-            fields->m_editSimpleReleaseDrag->setVisible(true);
-            fields->m_editSimpleReleaseDrag->setPosition({dotPos.x + dotSize.width, y});
-        }
-    }
-
-    void rebuildSimplifiedBar(bool force) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        if (!fields->m_editSimplifiedBar) return;
-
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty() || replay.framerate <= 0.0) return;
-
-        // Simplified mode now uses gameplay bar/dots visuals.
-        // Keep legacy node hidden and only update on-bar handles.
-        fields->m_editSimplifiedBar->setVisible(false);
-        updateSimplifiedDragHandles();
-    }
-
-    void onReplayEditModeToggle(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode) return;
-        fields->m_editSimplifiedMode = !fields->m_editSimplifiedMode;
-        updateEditModeVisibility();
-        updateReplayEditLabels();
-        rebuildEditTimeline(true);
-        rebuildSimplifiedBar(true);
-    }
-
-    void onReplayEditSimplePressDrag(CCObject* sender) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !fields->m_editSimplifiedMode || fields->m_editSimpleDragUpdating || !g_replayPlayer.replay.has_value()) return;
-        auto* slider = typeinfo_cast<Slider*>(sender);
-        if (!slider) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        auto& p = replay.presses[fields->m_editSelectedIdx];
-        int delta = static_cast<int>(std::llround((slider->getValue() - 0.5f) * 8.0f));
-        if (delta == 0) {
-            fields->m_editSimpleDragUpdating = true;
-            slider->setValue(0.5f);
-            fields->m_editSimpleDragUpdating = false;
-            return;
-        }
-
-        int64_t frame64 = static_cast<int64_t>(p.framePress) + static_cast<int64_t>(delta * currentSnapFrames());
-        if (frame64 < 0) frame64 = 0;
-        uint64_t frame = snapFrameToGrid(static_cast<uint64_t>(frame64));
-
-        p.framePress = frame;
-        if (p.frameRelease <= p.framePress) p.frameRelease = p.framePress + 1;
-
-        rebuildReplayRuntimeFromCurrentState();
-        updateReplayEditLabels();
-        rebuildSimplifiedBar(true);
-        fields->m_editSimpleDragUpdating = true;
-        slider->setValue(0.5f);
-        fields->m_editSimpleDragUpdating = false;
-    }
-
-    void onReplayEditSimpleReleaseDrag(CCObject* sender) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !fields->m_editSimplifiedMode || fields->m_editSimpleDragUpdating || !g_replayPlayer.replay.has_value()) return;
-        auto* slider = typeinfo_cast<Slider*>(sender);
-        if (!slider) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        auto& p = replay.presses[fields->m_editSelectedIdx];
-        int delta = static_cast<int>(std::llround((slider->getValue() - 0.5f) * 8.0f));
-        if (delta == 0) {
-            fields->m_editSimpleDragUpdating = true;
-            slider->setValue(0.5f);
-            fields->m_editSimpleDragUpdating = false;
-            return;
-        }
-
-        int64_t frame64 = static_cast<int64_t>(p.frameRelease) + static_cast<int64_t>(delta * currentSnapFrames());
-        if (frame64 < 0) frame64 = 0;
-        uint64_t frame = snapFrameToGrid(static_cast<uint64_t>(frame64));
-
-        p.frameRelease = frame;
-        if (p.frameRelease <= p.framePress) p.frameRelease = p.framePress + 1;
-
-        rebuildReplayRuntimeFromCurrentState();
-        updateReplayEditLabels();
-        rebuildSimplifiedBar(true);
-        fields->m_editSimpleDragUpdating = true;
-        slider->setValue(0.5f);
-        fields->m_editSimpleDragUpdating = false;
-    }
-
-    void previewReplayAtSelectedInput() {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty()) return;
-
-        auto const& p = replay.presses[fields->m_editSelectedIdx];
-        float target = std::max(0.0f, (static_cast<float>(p.framePress) / static_cast<float>(replay.framerate)) - 0.2f);
-
-        if (target <= 0.05f) {
-            fields->m_isSeeking = false;
-            fields->m_seekTargetTime = 0.0f;
-            fields->m_isPaused = true;
-            if (static_cast<float>(m_timePlayed) > 0.05f) {
-                this->resetLevel();
-            }
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(pausedUiTimeScale());
-            applyReplayAudioSync(0.0f, true);
-            return;
-        }
-
-        fields->m_isPaused = false;
-        fields->m_isSeeking = true;
-        fields->m_seekTargetTime = target;
-        fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
-        fields->m_isPaused = true;
-        this->resetLevel();
-        applyReplayAudioSync(0.0f, true);
-    }
-
-    void queueReplayEditPreview() {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode) return;
-        fields->m_editPreviewPending = true;
-    }
-
-    void editSelectedInputFrame(bool editPress, int deltaFrames) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty()) return;
-
-        auto& p = replay.presses[fields->m_editSelectedIdx];
-        auto applyDelta = [&](uint64_t value) -> uint64_t {
-            int64_t next = static_cast<int64_t>(value) + static_cast<int64_t>(deltaFrames);
-            if (next < 0) next = 0;
-            return static_cast<uint64_t>(next);
-        };
-
-        if (editPress) {
-            p.framePress = applyDelta(p.framePress);
-            p.framePress = snapFrameToGrid(p.framePress);
-            if (p.frameRelease <= p.framePress) {
-                p.frameRelease = p.framePress + 1;
-            }
-        } else {
-            p.frameRelease = applyDelta(p.frameRelease);
-            p.frameRelease = snapFrameToGrid(p.frameRelease);
-            if (p.frameRelease <= p.framePress) {
-                p.frameRelease = p.framePress + 1;
-            }
-        }
-
-        rebuildReplayRuntimeFromCurrentState();
-        updateReplayEditLabels();
-    }
-
-    void onReplayEditPrev(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        if (fields->m_editSelectedIdx > 0) {
-            fields->m_editSelectedIdx--;
-        }
-        updateReplayEditLabels();
-    }
-
-    void onReplayEditNext(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        auto const count = g_replayPlayer.replay->presses.size();
-        if (fields->m_editSelectedIdx + 1 < count) {
-            fields->m_editSelectedIdx++;
-        }
-        updateReplayEditLabels();
-    }
-
-    void onReplayEditSelectInput(CCObject* sender) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-
-        auto* btn = typeinfo_cast<CCNode*>(sender);
-        if (!btn) return;
-
-        int idx = btn->getTag();
-        if (idx < 0) return;
-        size_t uidx = static_cast<size_t>(idx);
-        if (uidx >= g_replayPlayer.replay->presses.size()) return;
-
-        fields->m_editSelectedIdx = uidx;
-        updateReplayEditLabels();
-    }
-
-    void onReplayEditPressMinus(CCObject*) { editSelectedInputFrame(true, -currentSnapFrames()); }
-    void onReplayEditPressPlus(CCObject*) { editSelectedInputFrame(true, +currentSnapFrames()); }
-    void onReplayEditReleaseMinus(CCObject*) { editSelectedInputFrame(false, -currentSnapFrames()); }
-    void onReplayEditReleasePlus(CCObject*) { editSelectedInputFrame(false, +currentSnapFrames()); }
-
-    void onReplayEditZoomOut(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode) return;
-        fields->m_editTimelineZoom = std::max(0.5f, fields->m_editTimelineZoom / 1.5f);
-        rebuildEditTimeline(true);
-        updateEditTimelineCursor();
-    }
-
-    void onReplayEditZoomIn(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode) return;
-        fields->m_editTimelineZoom = std::min(8.0f, fields->m_editTimelineZoom * 1.5f);
-        rebuildEditTimeline(true);
-        updateEditTimelineCursor();
-    }
-
-    void updateTimelineDragHandles() {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        if (!fields->m_editTimelinePressDrag || !fields->m_editTimelineReleaseDrag) return;
-
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty() || replay.framerate <= 0.0) return;
-
-        bool canDrag = fields->m_editTimelineZoom >= fields->m_editTimelineDragMinZoom;
-        fields->m_editTimelinePressDrag->setVisible(canDrag);
-        fields->m_editTimelineReleaseDrag->setVisible(canDrag);
-
-        auto const& p = replay.presses[fields->m_editSelectedIdx];
-        float start = fields->m_editTimelineWindowStart;
-        float end = std::max(start + 0.001f, fields->m_editTimelineWindowEnd);
-        float duration = end - start;
-
-        float pressT = static_cast<float>(p.framePress) / static_cast<float>(replay.framerate);
-        float releaseT = static_cast<float>(p.frameRelease) / static_cast<float>(replay.framerate);
-
-        fields->m_editTimelineDragUpdating = true;
-        fields->m_editTimelinePressDrag->setValue(std::clamp((pressT - start) / duration, 0.0f, 1.0f));
-        fields->m_editTimelineReleaseDrag->setValue(std::clamp((releaseT - start) / duration, 0.0f, 1.0f));
-        fields->m_editTimelineDragUpdating = false;
-    }
-
-    void onReplayEditTimelinePressDrag(CCObject* sender) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || fields->m_editTimelineDragUpdating || !g_replayPlayer.replay.has_value()) return;
-        auto* slider = typeinfo_cast<Slider*>(sender);
-        if (!slider) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty() || replay.framerate <= 0.0) return;
-
-        float start = fields->m_editTimelineWindowStart;
-        float end = std::max(start + 0.001f, fields->m_editTimelineWindowEnd);
-        float t = start + std::clamp(slider->getValue(), 0.0f, 1.0f) * (end - start);
-        uint64_t frame = static_cast<uint64_t>(std::llround(static_cast<double>(t) * replay.framerate));
-        frame = snapFrameToGrid(frame);
-
-        auto& p = replay.presses[fields->m_editSelectedIdx];
-        p.framePress = frame;
-        if (p.frameRelease <= p.framePress) p.frameRelease = p.framePress + 1;
-
-        rebuildReplayRuntimeFromCurrentState();
-        updateReplayEditLabels();
-    }
-
-    void onReplayEditTimelineReleaseDrag(CCObject* sender) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || fields->m_editTimelineDragUpdating || !g_replayPlayer.replay.has_value()) return;
-        auto* slider = typeinfo_cast<Slider*>(sender);
-        if (!slider) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty() || replay.framerate <= 0.0) return;
-
-        float start = fields->m_editTimelineWindowStart;
-        float end = std::max(start + 0.001f, fields->m_editTimelineWindowEnd);
-        float t = start + std::clamp(slider->getValue(), 0.0f, 1.0f) * (end - start);
-        uint64_t frame = static_cast<uint64_t>(std::llround(static_cast<double>(t) * replay.framerate));
-        frame = snapFrameToGrid(frame);
-
-        auto& p = replay.presses[fields->m_editSelectedIdx];
-        p.frameRelease = frame;
-        if (p.frameRelease <= p.framePress) p.frameRelease = p.framePress + 1;
-
-        rebuildReplayRuntimeFromCurrentState();
-        updateReplayEditLabels();
-    }
-
-    void onReplayEditSave(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-        rebuildReplayRuntimeFromCurrentState();
-
-        bool ok = saveReplayToLocalJson(
-            g_replayPlayer.levelId,
-            g_replayPlayer.replay.value(),
-            g_replayPlayer.sourceReplayPath
-        );
-
-        if (ok) {
-            FLAlertLayer::create("Replay Editor", "Saved replay edits.", "OK")->show();
-        } else {
-            FLAlertLayer::create("Replay Editor", "Failed to save replay edits.", "OK")->show();
-        }
-    }
-
-    void onReplayEditJumpToCurrent(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value()) return;
-
-        auto const& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty() || replay.framerate <= 0.0) return;
-
-        uint64_t currentFrame = static_cast<uint64_t>(
-            std::llround(static_cast<double>(m_timePlayed) * replay.framerate)
-        );
-
-        size_t bestIdx = 0;
-        uint64_t bestDist = std::numeric_limits<uint64_t>::max();
-
-        for (size_t i = 0; i < replay.presses.size(); ++i) {
-            auto const& p = replay.presses[i];
-
-            if (currentFrame >= p.framePress && currentFrame <= p.frameRelease) {
-                bestIdx = i;
-                bestDist = 0;
-                break;
-            }
-
-            uint64_t dist = 0;
-            if (currentFrame < p.framePress) {
-                dist = p.framePress - currentFrame;
-            } else {
-                dist = currentFrame - p.frameRelease;
-            }
-
-            if (dist < bestDist) {
-                bestDist = dist;
-                bestIdx = i;
-            }
-        }
-
-        fields->m_editSelectedIdx = bestIdx;
-        updateReplayEditLabels();
-    }
-
-    void onReplayEditPressSlider(CCObject* sender) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || fields->m_editUpdatingSliders || !g_replayPlayer.replay.has_value()) return;
-
-        auto* slider = typeinfo_cast<Slider*>(sender);
-        if (!slider) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty()) return;
-
-        uint64_t maxFrame = replayMaxFrame();
-        auto& p = replay.presses[fields->m_editSelectedIdx];
-        p.framePress = static_cast<uint64_t>(std::round(std::clamp(slider->getValue(), 0.0f, 1.0f) * static_cast<float>(maxFrame)));
-        if (p.frameRelease <= p.framePress) {
-            p.frameRelease = p.framePress + 1;
-        }
-
-        rebuildReplayRuntimeFromCurrentState();
-        updateReplayEditLabels();
-    }
-
-    void onReplayEditReleaseSlider(CCObject* sender) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || fields->m_editUpdatingSliders || !g_replayPlayer.replay.has_value()) return;
-
-        auto* slider = typeinfo_cast<Slider*>(sender);
-        if (!slider) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty()) return;
-
-        uint64_t maxFrame = replayMaxFrame();
-        auto& p = replay.presses[fields->m_editSelectedIdx];
-        p.frameRelease = static_cast<uint64_t>(std::round(std::clamp(slider->getValue(), 0.0f, 1.0f) * static_cast<float>(maxFrame)));
-        if (p.frameRelease <= p.framePress) {
-            p.frameRelease = p.framePress + 1;
-        }
-
-        rebuildReplayRuntimeFromCurrentState();
-        updateReplayEditLabels();
     }
 
     bool captureRuntimeHitboxesForLevel(GJGameLevel* level) {
@@ -1691,6 +642,46 @@ class $modify(MyPlayLayer, PlayLayer) {
         if (snapshot.hitboxes.empty()) return false;
         if (!std::isfinite(snapshot.minX) || !std::isfinite(snapshot.maxX)) return false;
 
+        // Dump id -> real hitbox to a plain-text file for offline reference (e.g. the
+        // hitbox_test.spwn level, which places every GD object id once so a single
+        // playthrough captures the whole table). Decorations never appear here since
+        // collectObject() already skips anything that's neither Solid/Slope/
+        // CollisionObject nor Hazard/AnimatedHazard by real m_objectType — exactly the
+        // triage gdsim's Object::create() factory needs, read from the engine itself
+        // instead of guessed from manual play.
+        {
+            auto sorted = snapshot.hitboxes;
+            std::sort(sorted.begin(), sorted.end(),
+                [](auto const& a, auto const& b) { return a.objectId < b.objectId; });
+            // Write the same table to (a) the legacy global path some offline tools
+            // read, and (b) a per-level file in testlevel/movetest/ named by id, so
+            // the RE tool keeps a permanent per-level hitbox record. Directory is
+            // created first so the write never silently fails.
+            std::error_code ec;
+            std::filesystem::create_directories(
+                "C:/Users/Kusmic/Documents/GitHub/GDMod/testlevel/movetest/", ec);
+            const std::string perLevel = fmt::format(
+                "C:/Users/Kusmic/Documents/GitHub/GDMod/testlevel/movetest/GDMod_hitbox_{}.txt",
+                level->m_levelID);
+            const std::string latest = gdsim::capturePath("GDMod_hitbox_capture.txt");
+            for (const std::string& path : {latest, perLevel}) {
+                std::ofstream f(path, std::ios::trunc);
+                if (!f.is_open()) continue;
+                f << "# GDMod hitbox capture -- level " << level->m_levelID
+                  << "  objects=" << sorted.size() << "\n";
+                f << "# id type shape x y width height radius gdObjectType\n";
+                for (auto const& hb : sorted) {
+                    const char* shapeName = hb.shape == ReplayRuntimeHitboxRect::Shape::Circle ? "circle"
+                        : hb.shape == ReplayRuntimeHitboxRect::Shape::OrientedQuad ? "obb" : "rect";
+                    f << hb.objectId << " "
+                      << (hb.isHazard ? "hazard" : (hb.isSolid ? "solid" : "other")) << " "
+                      << shapeName << " "
+                      << hb.x << " " << hb.y << " " << hb.width << " " << hb.height << " "
+                      << hb.radius << " " << hb.objectType << "\n";
+                }
+            }
+        }
+
         storeRuntimeHitboxSnapshot(std::move(snapshot));
         log::info(
             "[RuntimeHitbox] captured level={} unique={} solidRefs={} hazardRefs={}",
@@ -1758,6 +749,7 @@ class $modify(MyPlayLayer, PlayLayer) {
         auto fields = m_fields.self();
         fields->m_runtimeHitboxCaptured = captureRuntimeHitboxesForLevel(level);
         debugLogToFile("PlayLayer::init succeeded");
+
         auto winSize = CCDirector::sharedDirector()->getWinSize();
 
         // ========== Replay Player Mode Setup ==========
@@ -1766,363 +758,61 @@ class $modify(MyPlayLayer, PlayLayer) {
                 log::warn("[ReplaySafety] Ignoring invalid replay payload during PlayLayer init");
                 g_replayPlayer.isActive = false;
                 g_replayPlayer.replay.reset();
-            } else {
-            debugLogToFile("ENTERING REPLAY MODE");
-            fields->m_isReplayMode = true;
-            fields->m_isReplayEditMode = g_replayPlayer.isEditMode;
-            fields->m_replayCurrentTime = 0.0f;
-            fields->m_nextInputIdx = 0;
-            fields->m_isPaused = g_replayPlayer.isPaused;
-            fields->m_pauseTime = 0.0f;
-            fields->m_isSeeking = false;
-            fields->m_seekTargetTime = 0.0f;
-            fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
-            fields->m_snapshotRestoreDirty = false;
-            fields->m_snapshotRestoreTime = 0.0f;
-            fields->m_replayHoldingJump = false;
-            fields->m_replayFrameCursor = 0;
-            fields->m_replayFrameCursorValid = false;
-            fields->m_replayStepHistory.clear();
-            fields->m_editSelectedIdx = 0;
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(
-                fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed
-            );
-            fields->m_prevPracticeMusicSync = this->m_practiceMusicSync;
-            fields->m_forcedPracticeMusic = false;
-            this->togglePracticeMode(true);
-            ensureReplayMusicStarted(false);
-            
-            // Schedule command processor to run ALWAYS, even when timeScale=0 (paused)
-            auto scheduler = CCDirector::sharedDirector()->getScheduler();
-            scheduler->scheduleSelector(
-                schedule_selector(MyPlayLayer::processExternalCommandsAlwaysRunning),
-                this,
-                0.0f,  // interval
-                kCCRepeatForever,
-                0.0f,  // delay
-                false  // paused
-            );
-
-            // Setup video controls layer (bottom controls)
-            auto ctrlLayer = CCNode::create();
-            ctrlLayer->setContentSize({winSize.width, 60.0f});
-            ctrlLayer->setAnchorPoint({0.0f, 0.0f});
-            ctrlLayer->setPosition({0.0f, 0.0f});
-            ctrlLayer->setID("replay-controls"_spr);
-
-            // Background bar for controls
-            auto ctrlBg = CCLayerColor::create(ccc4(0, 0, 0, 180), winSize.width, 60.0f);
-            ctrlBg->setPosition({0.0f, 0.0f});
-            ctrlLayer->addChild(ctrlBg, 0);
-
-            // Time label (current time / total time)
-            auto timeLabel = CCLabelBMFont::create("00:00 / 00:00", "chatFont.fnt");
-            timeLabel->setScale(0.6f);
-            timeLabel->setAnchorPoint({0.0f, 0.5f});
-            timeLabel->setPosition({10.0f, 30.0f});
-            timeLabel->setColor(ccc3(255, 255, 255));
-            ctrlLayer->addChild(timeLabel, 1);
-            fields->m_timeLabel = timeLabel;
-
-            // Speed label (current playback speed)
-            auto speedLabel = CCLabelBMFont::create("1.00x", "chatFont.fnt");
-            speedLabel->setScale(0.6f);
-            speedLabel->setAnchorPoint({1.0f, 0.5f});
-            speedLabel->setPosition({winSize.width - 10.0f, 30.0f});
-            speedLabel->setColor(ccc3(255, 200, 100));
-            ctrlLayer->addChild(speedLabel, 1);
-            fields->m_speedLabel = speedLabel;
-
-            // Centered row layout for replay control buttons
-            float controlsY = 30.0f;
-            float buttonSpacing = 56.0f;
-            float centerX = winSize.width * 0.5f;
-
-            auto mkControlBtn = [&](const char* text, float textScale, SEL_MenuHandler cb, CCPoint pos, ccColor4B bgColor, CCSize size = {52.0f, 26.0f}, CCLabelBMFont** outLabel = nullptr) {
-                auto wrapper = CCNode::create();
-                wrapper->setContentSize(size);
-                wrapper->setAnchorPoint({0.5f, 0.5f});
-
-                auto bg = CCLayerColor::create(bgColor, size.width, size.height);
-                bg->setAnchorPoint({0.0f, 0.0f});
-                bg->setPosition({0.0f, 0.0f});
-                wrapper->addChild(bg, 0);
-
-                auto txt = CCLabelBMFont::create(text, "bigFont.fnt");
-                txt->setScale(textScale);
-                txt->setAnchorPoint({0.5f, 0.5f});
-                txt->setPosition({size.width * 0.5f, size.height * 0.5f});
-                wrapper->addChild(txt, 1);
-
-                auto btn = CCMenuItemSpriteExtra::create(wrapper, this, cb);
-                btn->setPosition(pos);
-                if (outLabel) {
-                    *outLabel = txt;
-                }
-                return btn;
-            };
-
-            // Play/Pause button
-            auto playBtn = mkControlBtn(
-                fields->m_isPaused ? "Play" : "Pause",
-                0.4f,
-                menu_selector(MyPlayLayer::onReplayPlayPause),
-                {centerX - (2.0f * buttonSpacing), controlsY},
-                ccc4(45, 75, 110, 200),
-                {52.0f, 26.0f},
-                &fields->m_playPauseLabel
-            );
-
-            // Speed down button (-0.25x)
-            auto speedDownBtn = mkControlBtn(
-                "-",
-                0.5f,
-                menu_selector(MyPlayLayer::onReplaySpeedDown),
-                {centerX - buttonSpacing, controlsY},
-                ccc4(70, 70, 70, 190)
-            );
-
-            // Speed up button (+0.25x)
-            auto speedUpBtn = mkControlBtn(
-                "+",
-                0.5f,
-                menu_selector(MyPlayLayer::onReplaySpeedUp),
-                {centerX, controlsY},
-                ccc4(70, 70, 70, 190)
-            );
-
-            // Rewind button
-            auto rewindBtn = mkControlBtn(
-                "<<",
-                0.4f,
-                menu_selector(MyPlayLayer::onReplayRewind),
-                {centerX + buttonSpacing, controlsY},
-                ccc4(70, 70, 70, 190)
-            );
-
-            // Skip forward button (+5s)
-            auto skipForwardBtn = mkControlBtn(
-                ">>",
-                0.4f,
-                menu_selector(MyPlayLayer::onReplaySkipForward),
-                {centerX + (2.0f * buttonSpacing), controlsY},
-                ccc4(70, 70, 70, 190)
-            );
-
-            auto controlMenu = CCMenu::create();
-            controlMenu->addChild(playBtn);
-            controlMenu->addChild(speedDownBtn);
-            controlMenu->addChild(speedUpBtn);
-            controlMenu->addChild(rewindBtn);
-            controlMenu->addChild(skipForwardBtn);
-
-            if (fields->m_isReplayEditMode) {
-                auto quickMenu = CCMenu::create();
-                quickMenu->setPosition({0.0f, 0.0f});
-
-                auto modeBtn = mkControlBtn(
-                    "Mode",
-                    0.34f,
-                    menu_selector(MyPlayLayer::onReplayEditModeToggle),
-                    {70.0f, controlsY},
-                    ccc4(32, 40, 52, 190),
-                    {58.0f, 24.0f}
-                );
-
-                auto saveBtn = mkControlBtn(
-                    "Save",
-                    0.34f,
-                    menu_selector(MyPlayLayer::onReplayEditSave),
-                    {138.0f, controlsY},
-                    ccc4(32, 40, 52, 190),
-                    {58.0f, 24.0f}
-                );
-
-                auto snapDownBtn = mkControlBtn(
-                    "S-",
-                    0.34f,
-                    menu_selector(MyPlayLayer::onReplayEditSnapDown),
-                    {206.0f, controlsY},
-                    ccc4(32, 40, 52, 190),
-                    {44.0f, 24.0f}
-                );
-
-                auto snapUpBtn = mkControlBtn(
-                    "S+",
-                    0.34f,
-                    menu_selector(MyPlayLayer::onReplayEditSnapUp),
-                    {260.0f, controlsY},
-                    ccc4(32, 40, 52, 190),
-                    {44.0f, 24.0f}
-                );
-
-                quickMenu->addChild(modeBtn);
-                quickMenu->addChild(saveBtn);
-                quickMenu->addChild(snapDownBtn);
-                quickMenu->addChild(snapUpBtn);
-                quickMenu->setVisible(false);
-                controlMenu->addChild(quickMenu);
-                fields->m_editBottomQuickMenu = quickMenu;
-            }
-
-            controlMenu->setPosition({0.0f, 0.0f});
-            controlMenu->setID("replay-menu"_spr);
-            ctrlLayer->addChild(controlMenu, 2);
-
-            this->addChild(ctrlLayer, 10100);
-            fields->m_videoControlsLayer = ctrlLayer;
-            fields->m_lastAudioSyncMs = -1.0f;
-            fields->m_lastAudioRate = g_replayPlayer.playbackSpeed;
-            fields->m_audioPausedByReplay = false;
-            fields->m_audioMusicID = -1;
-            fields->m_nextMusicRetryAt = 0.25f;
-            fields->m_nextAudioDebugAt = 0.0f;
-            fields->m_lastAutoSeekAt = -1000.0f;
-            fields->m_replayMusicInitialOffset = -1;
-
-            if (fields->m_isReplayEditMode) {
-                auto editPanel = CCNode::create();
-                editPanel->setContentSize({winSize.width, 74.0f});
-                editPanel->setAnchorPoint({0.0f, 0.0f});
-                editPanel->setPosition({0.0f, 68.0f});
-                editPanel->setID("replay-edit-panel"_spr);
-
-                auto editBg = CCLayerColor::create(ccc4(0, 0, 0, 160), winSize.width, 74.0f);
-                editBg->setPosition({0.0f, 0.0f});
-                editPanel->addChild(editBg, 0);
-
-                auto title = CCLabelBMFont::create("Edit Replay", "chatFont.fnt");
-                title->setScale(0.7f);
-                title->setAnchorPoint({0.0f, 0.5f});
-                title->setPosition({10.0f, 56.0f});
-                editPanel->addChild(title, 1);
-                fields->m_editTitleLabel = title;
-
-                auto pressLabel = CCLabelBMFont::create("Press: -", "chatFont.fnt");
-                pressLabel->setScale(0.6f);
-                pressLabel->setAnchorPoint({0.0f, 0.5f});
-                pressLabel->setPosition({10.0f, 36.0f});
-                editPanel->addChild(pressLabel, 1);
-                fields->m_editPressLabel = pressLabel;
-
-                auto releaseLabel = CCLabelBMFont::create("Release: -", "chatFont.fnt");
-                releaseLabel->setScale(0.6f);
-                releaseLabel->setAnchorPoint({0.0f, 0.5f});
-                releaseLabel->setPosition({10.0f, 18.0f});
-                editPanel->addChild(releaseLabel, 1);
-                fields->m_editReleaseLabel = releaseLabel;
-
-                auto pressSlider = Slider::create(this, menu_selector(MyPlayLayer::onReplayEditPressSlider), 0.45f);
-                pressSlider->setPosition({230.0f, 36.0f});
-                pressSlider->setValue(0.0f);
-                pressSlider->setLiveDragging(false);
-                pressSlider->setVisible(false);
-                editPanel->addChild(pressSlider, 1);
-                fields->m_editPressSlider = pressSlider;
-
-                auto releaseSlider = Slider::create(this, menu_selector(MyPlayLayer::onReplayEditReleaseSlider), 0.45f);
-                releaseSlider->setPosition({230.0f, 18.0f});
-                releaseSlider->setValue(0.0f);
-                releaseSlider->setLiveDragging(false);
-                releaseSlider->setVisible(false);
-                editPanel->addChild(releaseSlider, 1);
-                fields->m_editReleaseSlider = releaseSlider;
-
-                auto hintLabel = CCLabelBMFont::create("", "chatFont.fnt");
-                hintLabel->setScale(0.45f);
-                hintLabel->setAnchorPoint({1.0f, 0.5f});
-                hintLabel->setPosition({winSize.width - 10.0f, 56.0f});
-                hintLabel->setColor(ccc3(180, 220, 255));
-                editPanel->addChild(hintLabel, 1);
-                fields->m_editHintLabel = hintLabel;
-
-                auto mkTxtBtn = [&](const char* text, SEL_MenuHandler cb, CCPoint pos) {
-                    auto wrap = CCNode::create();
-                    wrap->setContentSize({44.0f, 20.0f});
-                    wrap->setAnchorPoint({0.5f, 0.5f});
-
-                    auto bg = CCLayerColor::create(ccc4(32, 40, 52, 190), 44.0f, 20.0f);
-                    bg->setAnchorPoint({0.0f, 0.0f});
-                    bg->setPosition({0.0f, 0.0f});
-                    wrap->addChild(bg, 0);
-
-                    auto txt = CCLabelBMFont::create(text, "bigFont.fnt");
-                    txt->setScale(0.32f);
-                    txt->setAnchorPoint({0.5f, 0.5f});
-                    txt->setPosition({22.0f, 10.0f});
-                    wrap->addChild(txt, 1);
-
-                    auto btn = CCMenuItemSpriteExtra::create(wrap, this, cb);
-                    btn->setPosition(pos);
-                    return btn;
-                };
-
-                auto editMenu = CCMenu::create();
-                editMenu->setPosition({0.0f, 0.0f});
-                editMenu->addChild(mkTxtBtn("Mode", menu_selector(MyPlayLayer::onReplayEditModeToggle), {winSize.width - 330.0f, 56.0f}));
-                editMenu->addChild(mkTxtBtn("Prev", menu_selector(MyPlayLayer::onReplayEditPrev), {winSize.width - 330.0f, 36.0f}));
-                editMenu->addChild(mkTxtBtn("Next", menu_selector(MyPlayLayer::onReplayEditNext), {winSize.width - 270.0f, 36.0f}));
-                editMenu->addChild(mkTxtBtn("Now", menu_selector(MyPlayLayer::onReplayEditJumpToCurrent), {winSize.width - 230.0f, 56.0f}));
-                editMenu->addChild(mkTxtBtn("S-", menu_selector(MyPlayLayer::onReplayEditSnapDown), {winSize.width - 190.0f, 56.0f}));
-                editMenu->addChild(mkTxtBtn("S+", menu_selector(MyPlayLayer::onReplayEditSnapUp), {winSize.width - 150.0f, 56.0f}));
-                editMenu->addChild(mkTxtBtn("Z-", menu_selector(MyPlayLayer::onReplayEditZoomOut), {winSize.width - 230.0f, 18.0f}));
-                editMenu->addChild(mkTxtBtn("Z+", menu_selector(MyPlayLayer::onReplayEditZoomIn), {winSize.width - 190.0f, 18.0f}));
-                editMenu->addChild(mkTxtBtn("P-", menu_selector(MyPlayLayer::onReplayEditPressMinus), {winSize.width - 210.0f, 36.0f}));
-                editMenu->addChild(mkTxtBtn("P+", menu_selector(MyPlayLayer::onReplayEditPressPlus), {winSize.width - 170.0f, 36.0f}));
-                editMenu->addChild(mkTxtBtn("R-", menu_selector(MyPlayLayer::onReplayEditReleaseMinus), {winSize.width - 120.0f, 36.0f}));
-                editMenu->addChild(mkTxtBtn("R+", menu_selector(MyPlayLayer::onReplayEditReleasePlus), {winSize.width - 80.0f, 36.0f}));
-                editMenu->addChild(mkTxtBtn("Save", menu_selector(MyPlayLayer::onReplayEditSave), {winSize.width - 35.0f, 36.0f}));
-                editPanel->addChild(editMenu, 2);
-
-                auto modeLabel = CCLabelBMFont::create("Mode: Advanced", "chatFont.fnt");
-                modeLabel->setScale(0.48f);
-                modeLabel->setAnchorPoint({0.0f, 0.5f});
-                modeLabel->setPosition({winSize.width - 288.0f, 56.0f});
-                modeLabel->setColor(ccc3(170, 230, 255));
-                editPanel->addChild(modeLabel, 2);
-                fields->m_editModeLabel = modeLabel;
-
-                auto snapLabel = CCLabelBMFont::create("Snap 1/4", "chatFont.fnt");
-                snapLabel->setScale(0.45f);
-                snapLabel->setAnchorPoint({0.0f, 0.5f});
-                snapLabel->setPosition({winSize.width - 288.0f, 18.0f});
-                snapLabel->setColor(ccc3(255, 220, 130));
-                editPanel->addChild(snapLabel, 2);
-                fields->m_editSnapLabel = snapLabel;
-
-                fields->m_indicatorStyleLabel = nullptr;
-
-                this->addChild(editPanel, 10101);
-                fields->m_editPanel = editPanel;
-
-                auto inputsPanel = CCNode::create();
-                inputsPanel->setContentSize({260.0f, 80.0f});
-                inputsPanel->setAnchorPoint({0.0f, 0.0f});
-                inputsPanel->setPosition({10.0f, 146.0f});
-                inputsPanel->setID("replay-edit-inputs-panel"_spr);
-
-                auto inputsBg = CCLayerColor::create(ccc4(0, 0, 0, 150), 260.0f, 80.0f);
-                inputsBg->setPosition({0.0f, 0.0f});
-                inputsPanel->addChild(inputsBg, 0);
-
-                auto inputsTitle = CCLabelBMFont::create("Inputs (click to select)", "chatFont.fnt");
-                inputsTitle->setScale(0.5f);
-                inputsTitle->setAnchorPoint({0.0f, 0.5f});
-                inputsTitle->setPosition({8.0f, 72.0f});
-                inputsPanel->addChild(inputsTitle, 1);
-
-                auto inputsMenu = CCMenu::create();
-                inputsMenu->setPosition({0.0f, 0.0f});
-                inputsPanel->addChild(inputsMenu, 2);
-
-                this->addChild(inputsPanel, 10102);
-                fields->m_editInputsPanel = inputsPanel;
-                fields->m_editInputsMenu = inputsMenu;
-
-                updateReplayEditLabels();
-            }
-
-            log::info("[ReplayPlayer] Initialized replay player mode with {} presses", fields->m_isReplayMode);
+            } else if (g_autoRepairRequested.exchange(false)) {
+                // ===== Auto-repair mode: refine the gdsim solution in real GD =====
+                fields->m_autoRepairActive = true;
+                g_ar = AutoRepairState{};
+                g_ar.active     = true;
+                g_ar.levelId    = g_replayPlayer.levelId;
+                g_ar.levelName  = level ? std::string(level->m_levelName) : std::string();
+                g_ar.framerate  = g_replayPlayer.replay->framerate;
+                g_ar.base       = g_replayPlayer.replay->presses;
+                g_ar.trial      = g_ar.base;
+                arNormalize(g_ar.base);
+                arNormalize(g_ar.trial);
+                g_ar.original   = g_ar.base;   // gdsim's solution, for the final diff
+                g_replayPlayer.replay->presses = g_ar.trial;
+                // Fresh repair log — records how far off the sim solution was.
+                std::ofstream(arLogPath(), std::ios::trunc)
+                    << "=== repair log  level=" << g_ar.levelId << "  fps=" << g_ar.framerate << "\n"
+                    << "gdsim solution: " << g_ar.base.size() << " clicks  " << arClickList(g_ar.base) << "\n"
+                    << "(each line below is an edit the REAL engine needed = where gdsim was wrong)\n";
+                s_replayStepHold   = false;
+                s_replayStepActive = false;
+                s_replayStepTime   = 0.0;
+                g_replayExternalCommands.liveReplayActive.store(true);
+                g_replayExternalCommands.livePaused.store(false);
+                this->togglePracticeMode(false);
+                // Headless-ish, same as the (now-removed) window scanner: hide the
+                // object render layers so the CPU spends its frame budget on physics
+                // substeps, not drawing — lets the raised speedhack above actually land.
+                // Collision/hitboxes live in update(), independent of rendering.
+                if (this->m_objectLayer)            this->m_objectLayer->setVisible(false);
+                if (this->m_inShaderObjectLayer)    this->m_inShaderObjectLayer->setVisible(false);
+                if (this->m_aboveShaderObjectLayer) this->m_aboveShaderObjectLayer->setVisible(false);
+                CCDirector::sharedDirector()->getScheduler()->setTimeScale(s_autoRepairSpeed);
+                log::info("[AR] start: {} seed clicks, level {}, speed {}x",
+                          g_ar.base.size(), g_ar.levelId, s_autoRepairSpeed);
+            } else if (g_confirmRequested.exchange(false)) {
+                // ===== Confirm-only mode: ONE real-game pass, no repair loop =====
+                // The .gdr2 was already written before play() was called (doSimulate).
+                // This just runs the solve once for real, at speed, so a divergence
+                // from gdsim gets logged/captured (updateDivergenceDetector already
+                // writes a full truth capture for ANY active replay) instead of going
+                // undetected — but nothing here can withhold or retry the .gdr2.
+                fields->m_confirmOnlyActive = true;
+                fields->m_confirmDone       = false;
+                s_replayStepHold   = false;
+                s_replayStepActive = false;
+                s_replayStepTime   = 0.0;
+                g_replayExternalCommands.liveReplayActive.store(true);
+                g_replayExternalCommands.livePaused.store(false);
+                this->togglePracticeMode(false);
+                if (this->m_objectLayer)            this->m_objectLayer->setVisible(false);
+                if (this->m_inShaderObjectLayer)    this->m_inShaderObjectLayer->setVisible(false);
+                if (this->m_aboveShaderObjectLayer) this->m_aboveShaderObjectLayer->setVisible(false);
+                CCDirector::sharedDirector()->getScheduler()->setTimeScale(s_autoRepairSpeed);
+                log::info("[Confirm] start: level {}, speed {}x", g_replayPlayer.levelId, s_autoRepairSpeed);
             }
         }
 
@@ -2130,13 +820,13 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         bool setting = Mod::get()->getSettingValue<bool>("show-inputs-ingame");
         log::info("[InputCircles] Setting show-inputs-ingame = {}", setting);
-        if (!setting && !fields->m_isReplayMode) return true;
+        if (!setting) return true;
 
         int levelId = level->m_levelID;
         log::info("[InputCircles] Level ID = {}", levelId);
 
         // Load replay for visualization (input circles mode)
-        if (!fields->m_isReplayMode) {
+        {
             auto loadResult = loadMatchingReplay(levelId);
             if (!loadResult.has_value()) {
                 log::info("[InputCircles] No matching replay found for level {}", levelId);
@@ -2148,13 +838,6 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_presses = std::move(loadResult->presses);
             fields->m_framerate = loadResult->framerate;
             fields->m_active = true;
-        } else {
-            // In replay mode, use the replay from g_replayPlayer
-            if (g_replayPlayer.replay.has_value()) {
-                fields->m_presses = g_replayPlayer.replay->presses;
-                fields->m_framerate = g_replayPlayer.replay->framerate;
-                fields->m_active = true;
-            }
         }
 
         // Read settings
@@ -2180,6 +863,18 @@ class $modify(MyPlayLayer, PlayLayer) {
         bgStrip->setID("input-bg-strip"_spr);
         this->addChild(bgStrip, 9999);
         fields->m_bgStrip = bgStrip;
+        // Subtle top/bottom hairlines so the track reads as a clean, defined bar
+        // (instead of a flat translucent rectangle bleeding into the level).
+        {
+            auto topLine = CCLayerColor::create(ccc4(255, 255, 255, 40),
+                                                gameplayWinSize.width, 1.0f);
+            topLine->setPosition({0.0f, initBarH - 1.0f});
+            bgStrip->addChild(topLine, 1);
+            auto botLine = CCLayerColor::create(ccc4(0, 0, 0, 90),
+                                                gameplayWinSize.width, 1.0f);
+            botLine->setPosition({0.0f, 0.0f});
+            bgStrip->addChild(botLine, 1);
+        }
 
         // Create a layer for dots, added to PlayLayer directly (screen space, high Z)
         auto circleLayer = CCNode::create();
@@ -2197,222 +892,560 @@ class $modify(MyPlayLayer, PlayLayer) {
         fields->m_indicator = indicator;
         rebuildIndicatorVisual();
 
-        // ========== UR Bar Setup / Edit Timeline Setup ==========
-        if (fields->m_isReplayEditMode) {
-            float timelineW = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-bar-width"));
-            float timelineH = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-bar-height"));
-            float timelineX = winSize.width / 2.0f;
-            float timelineY = winSize.height - 30.0f;
-
-            auto timeline = CCNode::create();
-            timeline->setContentSize({timelineW, timelineH});
-            timeline->setAnchorPoint({0.5f, 0.5f});
-            timeline->setPosition({timelineX, timelineY});
-            timeline->setID("replay-edit-timeline"_spr);
-
-            auto timelineBg = CCLayerColor::create(ccc4(0, 0, 0, 190), timelineW, timelineH);
-            timelineBg->setPosition({0.0f, 0.0f});
-            timeline->addChild(timelineBg, 0);
-
-            auto timelineMenu = CCMenu::create();
-            timelineMenu->setPosition({0.0f, 0.0f});
-            timeline->addChild(timelineMenu, 1);
-
-            auto cursor = CCLayerColor::create(ccc4(255, 255, 255, 255), 2.0f, timelineH + 4.0f);
-            cursor->setPosition({0.0f, -2.0f});
-            timeline->addChild(cursor, 2);
-
-            this->addChild(timeline, 10002);
-            fields->m_editTimeline = timeline;
-            fields->m_editTimelineMenu = timelineMenu;
-            fields->m_editTimelineCursor = cursor;
-
-            auto tlLabel = CCLabelBMFont::create("Timeline", "chatFont.fnt");
-            tlLabel->setScale(0.45f);
-            tlLabel->setAnchorPoint({0.5f, 0.0f});
-            tlLabel->setPosition({timelineX, timelineY + timelineH * 0.5f + 4.0f});
-            tlLabel->setColor(ccc3(220, 230, 255));
-            this->addChild(tlLabel, 10003);
-            fields->m_editTimelineLabel = tlLabel;
-
-            auto zoomLabel = CCLabelBMFont::create("Zoom 1.00x", "chatFont.fnt");
-            zoomLabel->setScale(0.42f);
-            zoomLabel->setAnchorPoint({1.0f, 0.0f});
-            zoomLabel->setPosition({timelineX + timelineW * 0.5f, timelineY + timelineH * 0.5f + 4.0f});
-            zoomLabel->setColor(ccc3(255, 220, 130));
-            this->addChild(zoomLabel, 10003);
-            fields->m_editZoomLabel = zoomLabel;
-
-            auto pressDrag = Slider::create(this, menu_selector(MyPlayLayer::onReplayEditTimelinePressDrag), 0.52f);
-            pressDrag->setPosition({timelineX - 2.0f, timelineY - timelineH * 0.5f - 10.0f});
-            pressDrag->setValue(0.0f);
-            pressDrag->setLiveDragging(true);
-            this->addChild(pressDrag, 10003);
-            fields->m_editTimelinePressDrag = pressDrag;
-
-            auto releaseDrag = Slider::create(this, menu_selector(MyPlayLayer::onReplayEditTimelineReleaseDrag), 0.52f);
-            releaseDrag->setPosition({timelineX - 2.0f, timelineY - timelineH * 0.5f - 22.0f});
-            releaseDrag->setValue(0.0f);
-            releaseDrag->setLiveDragging(true);
-            this->addChild(releaseDrag, 10003);
-            fields->m_editTimelineReleaseDrag = releaseDrag;
-
-            auto simpleBar = CCNode::create();
-            simpleBar->setContentSize({timelineW, timelineH});
-            simpleBar->setAnchorPoint({0.5f, 0.5f});
-            simpleBar->setPosition({timelineX, timelineY});
-            simpleBar->setID("replay-edit-simple-bar"_spr);
-
-            auto simpleBg = CCLayerColor::create(ccc4(0, 0, 0, 210), timelineW, timelineH);
-            simpleBg->setPosition({0.0f, 0.0f});
-            simpleBar->addChild(simpleBg, 0);
-
-            auto simpleMenu = CCMenu::create();
-            simpleMenu->setPosition({0.0f, 0.0f});
-            simpleBar->addChild(simpleMenu, 1);
-
-            this->addChild(simpleBar, 10002);
-            fields->m_editSimplifiedBar = simpleBar;
-            fields->m_editSimplifiedBarMenu = simpleMenu;
-
-            auto simplePressDrag = Slider::create(this, menu_selector(MyPlayLayer::onReplayEditSimplePressDrag), 0.14f);
-            simplePressDrag->setPosition({timelineX - 2.0f, 18.0f});
-            simplePressDrag->setValue(0.5f);
-            simplePressDrag->setLiveDragging(true);
-            this->addChild(simplePressDrag, 10003);
-            fields->m_editSimplePressDrag = simplePressDrag;
-
-            auto simpleReleaseDrag = Slider::create(this, menu_selector(MyPlayLayer::onReplayEditSimpleReleaseDrag), 0.14f);
-            simpleReleaseDrag->setPosition({timelineX - 2.0f, 8.0f});
-            simpleReleaseDrag->setValue(0.5f);
-            simpleReleaseDrag->setLiveDragging(true);
-            this->addChild(simpleReleaseDrag, 10003);
-            fields->m_editSimpleReleaseDrag = simpleReleaseDrag;
-
-            // Blue/red interactive markers directly on normal gameplay input bar visuals.
-            auto pressMarker = CCLayerColor::create(ccc4(70, 140, 255, 255), 8.0f, static_cast<float>(fields->m_barHeight) + 6.0f);
-            pressMarker->setAnchorPoint({0.5f, 0.5f});
-            this->addChild(pressMarker, 10004);
-            fields->m_editSimplePressMarker = pressMarker;
-
-            auto releaseMarker = CCLayerColor::create(ccc4(255, 80, 80, 255), 8.0f, static_cast<float>(fields->m_barHeight) + 6.0f);
-            releaseMarker->setAnchorPoint({0.5f, 0.5f});
-            this->addChild(releaseMarker, 10004);
-            fields->m_editSimpleReleaseMarker = releaseMarker;
-
-            rebuildEditTimeline(true);
-            rebuildSimplifiedBar(true);
-            updateEditModeVisibility();
-            updateEditTimelineCursor();
-        }
-
-        // ========== UR Bar Setup ==========
-        if (!fields->m_isReplayEditMode) {
-        // Pre-compute replay press/release times in seconds for matching
-        for (auto& press : fields->m_presses) {
-            fields->m_replayPressTimes.push_back(
-                static_cast<float>(press.framePress) / static_cast<float>(fields->m_framerate));
-            fields->m_replayReleaseTimes.push_back(
-                static_cast<float>(press.frameRelease) / static_cast<float>(fields->m_framerate));
-        }
-        fields->m_replayPressUsed.resize(fields->m_presses.size(), false);
-        fields->m_replayReleaseUsed.resize(fields->m_presses.size(), false);
-
-        // Read UR bar settings
-        fields->m_urBarWidth = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-bar-width"));
-        fields->m_urBarHeight = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-bar-height"));
-        fields->m_goodFrames = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-good-frames"));
-        fields->m_earlyLateFrames = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-earlylate-frames"));
-        fields->m_veryFrames = static_cast<float>(Mod::get()->getSettingValue<int64_t>("ur-very-frames"));
-
-        float urW = fields->m_urBarWidth;
-        float urH = fields->m_urBarHeight;
-        float veryF = fields->m_veryFrames;
-        float elF = fields->m_earlyLateFrames;
-        float gF = fields->m_goodFrames;
-        float totalFrameRange = veryF * 2.0f; // -veryF to +veryF
-        float pxPerFrame = urW / totalFrameRange;
-
-        // UR bar container (centered horizontally near top of screen)
-        auto urBar = CCNode::create();
-        urBar->setContentSize({urW, urH});
-        urBar->setAnchorPoint({0.5f, 0.5f});
-        float urX = winSize.width / 2.0f;
-        float urY = winSize.height - 30.0f;
-        urBar->setPosition({urX, urY});
-        urBar->setID("ur-bar"_spr);
-
-        // Zone colors
-        ccColor4B cVeryEarly = ccc4(255, 60, 60, 200);   // red
-        ccColor4B cEarly     = ccc4(255, 200, 50, 200);   // yellow
-        ccColor4B cGood      = ccc4(50, 255, 80, 200);    // green
-        ccColor4B cLate      = ccc4(255, 200, 50, 200);   // yellow
-        ccColor4B cVeryLate  = ccc4(255, 60, 60, 200);    // red
-
-        // Zone widths in pixels
-        float wVeryEarly = (veryF - elF) * pxPerFrame;
-        float wEarly     = (elF - gF) * pxPerFrame;
-        float wGood      = gF * 2.0f * pxPerFrame;
-        float wLate      = (elF - gF) * pxPerFrame;
-        float wVeryLate  = (veryF - elF) * pxPerFrame;
-
-        // Background
-        auto urBg = CCLayerColor::create(ccc4(0, 0, 0, 160), urW, urH);
-        urBg->setPosition({0.0f, 0.0f});
-        urBar->addChild(urBg, 0);
-
-        // Zones from left to right
-        float xOff = 0.0f;
-        auto zVE = CCLayerColor::create(cVeryEarly, wVeryEarly, urH);
-        zVE->setPosition({xOff, 0.0f}); urBar->addChild(zVE, 1); xOff += wVeryEarly;
-        auto zE = CCLayerColor::create(cEarly, wEarly, urH);
-        zE->setPosition({xOff, 0.0f}); urBar->addChild(zE, 1); xOff += wEarly;
-        auto zG = CCLayerColor::create(cGood, wGood, urH);
-        zG->setPosition({xOff, 0.0f}); urBar->addChild(zG, 1); xOff += wGood;
-        auto zL = CCLayerColor::create(cLate, wLate, urH);
-        zL->setPosition({xOff, 0.0f}); urBar->addChild(zL, 1); xOff += wLate;
-        auto zVL = CCLayerColor::create(cVeryLate, wVeryLate, urH);
-        zVL->setPosition({xOff, 0.0f}); urBar->addChild(zVL, 1);
-
-        // Center line (perfect timing marker)
-        auto centerLine = CCLayerColor::create(ccc4(255, 255, 255, 255), 2.0f, urH + 4.0f);
-        centerLine->setPosition({urW / 2.0f - 1.0f, -2.0f});
-        urBar->addChild(centerLine, 3);
-
-        this->addChild(urBar, 10002);
-        fields->m_urBar = urBar;
-
-        // Accuracy label (top-right corner)
-        auto accLabel = CCLabelBMFont::create("100.00%", "bigFont.fnt");
-        accLabel->setScale(0.35f);
-        accLabel->setAnchorPoint({1.0f, 1.0f});
-        accLabel->setPosition({winSize.width - 10.0f, winSize.height - 10.0f});
-        accLabel->setColor(ccc3(255, 255, 255));
-        accLabel->setOpacity(220);
-        accLabel->setID("accuracy-label"_spr);
-        this->addChild(accLabel, 10002);
-        fields->m_accuracyLabel = accLabel;
-
-        // Activate rhythm input capture
-        s_playerInputs.clear();
-        s_rhythmActive = true;
-        s_replayInputInjectionActive = false;
-        fields->m_processedInputIdx = 0;
-
-        log::info("[UR] Rhythm mode active. UR bar: {}x{} goodF={} elF={} veryF={}", 
-            urW, urH, gF, elF, veryF);
-        } else {
-            // In replay edit mode, UR gameplay scoring UI is replaced by timeline UI.
-            s_playerInputs.clear();
-            s_rhythmActive = false;
-        }
-
         return true;
+    }
+
+    // Steps a parallel gdsim Level alongside the live replay and reports the
+    // first frame where the simulated player position diverges from the real
+    // one — pinpoints exactly which physics feature the simulator gets wrong.
+    static std::string divLogPath() { return gdsim::debugPath("GDMod_divergence.txt"); }
+    void divLog(const std::string& s) {
+        log::warn("[DIV] {}", s);
+        std::ofstream f(divLogPath(), std::ios::app);
+        if (f.is_open()) f << s << "\n";
+    }
+
+    static std::string deathLogPath() { return gdsim::debugPath("GDMod_death_debug.txt"); }
+    static void deathLog(const std::string& s) {
+        log::warn("[DEATH] {}", s);
+        std::ofstream f(deathLogPath(), std::ios::app);
+        if (f.is_open()) f << s << "\n";
+    }
+    // Human-readable name for the common object IDs that kill you.
+    static const char* objName(int id) {
+        switch (id) {
+            case 8: case 39: case 88: case 89: case 98: case 216: case 217: case 218: return "spike";
+            case 9: case 61: case 243: case 244: return "spike/saw";
+            case 135: case 1734: case 1705: case 1706: case 1707: return "sawblade";
+            case 1: case 2: case 3: case 4: case 5: case 6: case 7: return "block";
+            case 35: return "yellow pad"; case 67: return "blue pad";
+            case 140: return "pink pad"; case 1332: return "red pad";
+            case 36: return "yellow orb"; case 84: return "blue orb"; case 141: return "pink orb";
+            case 1333: return "red orb"; case 1022: return "green orb"; case 1330: return "black orb";
+            case 10: case 11: return "gravity portal";
+            case 12: case 13: case 47: case 111: case 660: case 745: case 1331: case 1933: return "vehicle portal";
+            case 200: case 201: case 202: case 203: case 1334: return "speed portal";
+            default: return "?";
+        }
+    }
+
+    void updateDivergenceDetector(uint64_t liveFrame) {
+        auto fields = m_fields.self();
+        if (!m_player1 || !g_replayPlayer.replay.has_value()) return;
+        auto& replay = g_replayPlayer.replay.value();
+
+        if (!fields->m_divInit) {
+            fields->m_divInit = true; // attempt once per level load
+            if (!m_level) return;
+            // Apply calibrated physics so the detector's sim reflects the tuned
+            // model (lets us verify a calibration pass in-game).
+            gdsim::loadCalibFromFile(gdsim::configPath("GDMod_calib.txt").c_str());
+
+            std::string raw = m_level->m_levelString;
+            std::string lvl = raw.find(';') != std::string::npos
+                ? raw
+                : std::string(cocos2d::ZipUtils::decompressString(gd::string(raw), false, 0));
+
+            std::ofstream(divLogPath(), std::ios::trunc)
+                << "=== divergence log  level=" << (m_level ? m_level->m_levelID : 0)
+                << "  presses=" << replay.presses.size()
+                << "  fps=" << replay.framerate
+                << "  rawLen=" << raw.size() << "  lvlLen=" << lvl.size() << "\n";
+
+            // Fresh death-debug log for this watch attempt ("Test" feature).
+            fields->m_deathLogged = false;
+            std::ofstream(deathLogPath(), std::ios::trunc)
+                << "=== death-debug log  level=" << (m_level ? m_level->m_levelID : 0)
+                << "  presses=" << replay.presses.size() << "  fps=" << replay.framerate << "\n"
+                << "(one report is written the first time the player dies during this watch)\n";
+
+            if (lvl.empty() || lvl.find(';') == std::string::npos) {
+                divLog("ABORT: could not decompress level string");
+                return;
+            }
+            try {
+                fields->m_divSim = std::make_shared<gdsim::Level>(lvl);
+            } catch (...) { divLog("ABORT: Level ctor threw"); fields->m_divSim = nullptr; return; }
+
+            uint64_t maxF = 16;
+            for (auto& p : replay.presses) maxF = std::max(maxF, p.frameRelease);
+            fields->m_divInput.assign(maxF + 4, false);
+            for (auto& p : replay.presses)
+                if (p.player == 1)
+                    for (uint64_t f = p.framePress; f < p.frameRelease && f < fields->m_divInput.size(); ++f)
+                        fields->m_divInput[f] = true;
+
+            fields->m_divFrame = 0;
+            fields->m_divReported = false;
+            fields->m_divDeathReported = false;
+            fields->m_divDriftCount = 0;
+            fields->m_divBaselined = false;
+            fields->m_divFirstDriftFrame = 0;
+            fields->m_divFirstDx = fields->m_divFirstDy = 0.f;
+            fields->m_divMaxDx = fields->m_divMaxDy = 0.f;
+            fields->m_divMaxDriftFrame = 0;
+            fields->m_divRealMaxX = 0.f;
+            fields->m_truthDeadLogged = false;
+            divLog(fmt::format("armed: sections={} maxInputFrame={}",
+                               fields->m_divSim->sections.size(), maxF));
+
+            // Open the calibration ground-truth file and write its header (level
+            // + inputs). Per-frame real states are appended below each tick.
+            int lid = m_level ? m_level->m_levelID : 0;
+            s_calibTruth = std::ofstream(
+                gdsim::capturePath(fmt::format("GDMod_truth_{}.txt", lid)), std::ios::trunc);
+            if (s_calibTruth.is_open()) {
+                s_calibTruth << "LEVELID " << lid << "\n";
+                s_calibTruth << "FPS " << (int)replay.framerate << "\n";
+                s_calibTruth << "NPRESS " << replay.presses.size() << "\n";
+                for (auto& p : replay.presses)
+                    s_calibTruth << p.framePress << ' ' << p.frameRelease << ' ' << p.player << "\n";
+                s_calibTruth << "LVL " << lvl << "\n";
+                // Per-frame REAL state. Columns: frame x y dead vehId mini yVel speed
+                // (yVel = PlayerObject::m_yVelocity, the engine's true Y velocity BEFORE
+                // position rounding/clamping; speed = m_playerSpeed). Capturing velocity
+                // — not just position — lets analysis pin a divergence to its source one
+                // frame before it shows up as a position gap. Trailing columns are
+                // ignored by the older 6-field parsers, so this stays backward-compatible.
+                s_calibTruth << "FRAMES\n";
+                s_calibTruth.flush();
+            }
+        }
+        if (!fields->m_divSim) return;
+
+        // Seek/restart: replay time jumped backward — resync the sim.
+        if (liveFrame < fields->m_divFrame) {
+            fields->m_divSim->rollback(0);
+            fields->m_divFrame = 0;
+            fields->m_divReported = false;
+            fields->m_divDeathReported = false;
+            fields->m_divDriftCount = 0;
+            fields->m_divBaselined = false;
+            fields->m_divFirstDriftFrame = 0;
+            fields->m_divFirstDx = fields->m_divFirstDy = 0.f;
+            fields->m_divMaxDx = fields->m_divMaxDy = 0.f;
+            fields->m_divMaxDriftFrame = 0;
+            fields->m_divRealMaxX = 0.f;
+            fields->m_truthDeadLogged = false;
+        }
+
+        const float dt = 1.f / (float)(replay.framerate > 0.0 ? replay.framerate : 240.0);
+        uint64_t target = std::min(liveFrame, fields->m_divFrame + 4000); // cap catch-up
+        while (fields->m_divFrame < target) {
+            uint64_t f = fields->m_divFrame + 1;
+            bool pressed = f < fields->m_divInput.size() && fields->m_divInput[f];
+            fields->m_divSim->runFrame(pressed, dt);
+            fields->m_divFrame = f;
+        }
+        if (fields->m_divFrame == 0 || fields->m_divSim->gameStates.empty()) return;
+
+        const auto& simP = fields->m_divSim->gameStates.back();
+        float simX = simP.pos.x, simY = simP.pos.y;
+        bool  simDead = simP.dead;
+        float realX = m_player1->getPositionX();
+        float realY = m_player1->getPositionY();
+        bool  realDead = m_player1->m_isDead;
+
+        // Remember the last ALIVE real state — the death report uses this as the clean
+        // "approach" so a same-frame pad/portal flip on the kill frame can't corrupt it.
+        if (!realDead) {
+            fields->m_prevRealValid = true;
+            fields->m_prevRealUp  = m_player1->m_isUpsideDown;
+            fields->m_prevRealVel = m_player1->m_yVelocity;
+            fields->m_prevRealX = realX; fields->m_prevRealY = realY;
+            fields->m_prevRealVeh = m_player1->m_isShip?1:m_player1->m_isBall?2:m_player1->m_isBird?3
+                                  :m_player1->m_isDart?4:m_player1->m_isRobot?5:m_player1->m_isSpider?6
+                                  :m_player1->m_isSwing?7:0;
+        }
+
+        // Establish the constant coordinate offset on the first compared frame.
+        if (!fields->m_divBaselined) {
+            fields->m_divOffX = realX - simX;
+            fields->m_divOffY = realY - simY;
+            fields->m_divBaselined = true;
+            divLog(fmt::format("baseline frame={} sim=({:.1f},{:.1f}) real=({:.1f},{:.1f}) offset=({:.1f},{:.1f})",
+                               liveFrame, simX, simY, realX, realY, fields->m_divOffX, fields->m_divOffY));
+        }
+        float dx = (realX - fields->m_divOffX) - simX;
+        float dy = (realY - fields->m_divOffY) - simY;
+
+        // Continuous drift tracking (feeds the death report's divergence summary).
+        fields->m_divRealMaxX = std::max(fields->m_divRealMaxX, realX);
+        {
+            float adx = std::fabs(dx), ady = std::fabs(dy);
+            if (std::max(adx, ady) > 2.0f && fields->m_divFirstDriftFrame == 0) {
+                fields->m_divFirstDriftFrame = liveFrame;
+                fields->m_divFirstDx = dx; fields->m_divFirstDy = dy;
+            }
+            float mag  = std::max(adx, ady);
+            float peak = std::max(std::fabs(fields->m_divMaxDx), std::fabs(fields->m_divMaxDy));
+            if (mag > peak) {
+                fields->m_divMaxDx = dx; fields->m_divMaxDy = dy;
+                fields->m_divMaxDriftFrame = liveFrame;
+            }
+        }
+
+        static const char* kVeh[] = {"Cube","Ship","Ball","Ufo","Wave","Robot","Spider","Swing"};
+        int svi = (int)simP.vehicle.type;
+        const char* simVeh = (svi >= 0 && svi < 8) ? kVeh[svi] : "?";
+        // Order/ids must match the sim's kVeh above. m_isBall MUST be tested — without
+        // it a real Ball falls through to "Cube" (id 0), so every ball section showed a
+        // bogus "simVeh=Ball realVeh=Cube" divergence and the truth file mislabelled balls.
+        const char* realVeh = m_player1->m_isShip ? "Ship" : m_player1->m_isBall ? "Ball"
+                            : m_player1->m_isBird ? "Ufo" : m_player1->m_isDart ? "Wave"
+                            : m_player1->m_isRobot ? "Robot" : m_player1->m_isSpider ? "Spider"
+                            : m_player1->m_isSwing ? "Swing" : "Cube";
+
+        // Pinpoint the exact frame either side changes vehicle or mini-state, so a
+        // few-frame portal-timing lag between sim and real is visible.
+        {
+            static std::string s_pVeh, s_pRVeh;
+            static int s_pSmall = -1, s_pRMini = -1;
+            int curRealMini = (m_player1->m_vehicleSize < 0.8f) ? 1 : 0;
+            int curSmall = simP.small ? 1 : 0;
+            if (simVeh != s_pVeh || realVeh != s_pRVeh || curSmall != s_pSmall || curRealMini != s_pRMini) {
+                divLog(fmt::format("  [trans] f={} realX={:.0f} simVeh={} realVeh={} simSmall={} realMini={} dy={:.1f} simVel={:.1f} realVel={:.1f}",
+                                   liveFrame, realX, simVeh, realVeh, curSmall, curRealMini, dy,
+                                   simP.velocity, m_player1->m_yVelocity));
+                s_pVeh = simVeh; s_pRVeh = realVeh; s_pSmall = curSmall; s_pRMini = curRealMini;
+            }
+        }
+
+        // Append this frame's REAL state to the calibration ground-truth file. Once the
+        // player is dead the position freezes, so log the first dead frame then stop —
+        // otherwise the same death frame is appended every tick (bloated / truncated file).
+        if (s_calibTruth.is_open() && !fields->m_truthDeadLogged) {
+            int rVehId = m_player1->m_isShip ? 1 : m_player1->m_isBall ? 2
+                       : m_player1->m_isBird ? 3 : m_player1->m_isDart ? 4
+                       : m_player1->m_isRobot ? 5 : m_player1->m_isSpider ? 6
+                       : m_player1->m_isSwing ? 7 : 0;
+            int rMini = (m_player1->m_vehicleSize < 0.8f) ? 1 : 0;
+            s_calibTruth << liveFrame << ' ' << realX << ' ' << realY << ' '
+                         << (realDead ? 1 : 0) << ' ' << rVehId << ' ' << rMini << ' '
+                         << m_player1->m_yVelocity << ' ' << m_player1->m_playerSpeed << "\n";
+            if (realDead) { fields->m_truthDeadLogged = true; s_calibTruth.flush(); }
+        }
+
+        // Heartbeat (every ~0.25s) — vehicle + velocity + proof the per-step
+        // injection path is live (procN ticks, injN button edges).
+        if (liveFrame % 60 == 0)
+            divLog(fmt::format("f={} realX={:.0f} dy={:.1f} dx={:.1f} simVeh={} realVeh={} simVel={:.1f} realVel={:.1f} simSmall={} realSz={:.2f} procN={} injN={} simDead={} realDead={}",
+                               liveFrame, realX, dy, dx, simVeh, realVeh,
+                               simP.velocity, m_player1->m_yVelocity,
+                               simP.small ? 1 : 0, m_player1->m_vehicleSize,
+                               s_perStepProcessCount.load(), s_perStepInjectCount.load(),
+                               simDead, realDead));
+
+        // Death mismatch — the player died in-game but the sim thinks it survived
+        // (or vice-versa). This catches hitbox/collision divergences with no drift.
+        if (realDead != simDead && !fields->m_divDeathReported) {
+            fields->m_divDeathReported = true;
+            divLog(fmt::format("*** DEATH MISMATCH ({}) frame={} realX={:.0f} simVeh={} realVeh={}  realDead={} simDead={}  sim=({:.1f},{:.1f}) real=({:.1f},{:.1f}) diff=({:.1f},{:.1f})",
+                               realDead ? "REAL died, gdsim SURVIVED (gdsim hazard too small/missing)" : "gdsim died, REAL survived (gdsim hazard too big)",
+                               liveFrame, realX, simVeh, realVeh, realDead, simDead, simX, simY,
+                               realX - fields->m_divOffX, realY - fields->m_divOffY, dx, dy));
+            // Dump the sim's player hitbox + every nearby hazard so we can tell a
+            // MISSING hazard from a too-small one (sim survived where real died).
+            if (fields->m_divSim) {
+                divLog(fmt::format("  sim player box L={:.1f} R={:.1f} B={:.1f} T={:.1f}  size=({:.1f},{:.1f})",
+                                   simP.getLeft(), simP.getRight(), simP.getBottom(), simP.getTop(),
+                                   simP.size.x, simP.size.y));
+                auto& secs = fields->m_divSim->sections;
+                int si = std::clamp((int)(simP.pos.x / (float)gdsim::Level::sectionSize), 0, (int)secs.size() - 1);
+                for (int s = std::max(0, si - 1); s <= std::min((int)secs.size() - 1, si + 1); ++s) {
+                    for (auto& oc : secs[s]) {
+                        const gdsim::Object* o = oc.operator->();
+                        if (o->prio != 2) continue;                     // hazards only
+                        if (std::abs(o->pos.x - simP.pos.x) > 60.f) continue;
+                        float gapX = std::max({0.f, o->getLeft() - simP.getRight(), simP.getLeft() - o->getRight()});
+                        float gapY = std::max({0.f, o->getBottom() - simP.getTop(), simP.getBottom() - o->getTop()});
+                        divLog(fmt::format("  hazard type={} pos=({:.1f},{:.1f}) size=({:.1f},{:.1f}) rot={:.0f} box[L={:.1f} R={:.1f} B={:.1f} T={:.1f}] gap=({:.2f},{:.2f})",
+                                           o->typeId, o->pos.x, o->pos.y, o->size.x, o->size.y, o->rotation,
+                                           o->getLeft(), o->getRight(), o->getBottom(), o->getTop(), gapX, gapY));
+                    }
+                }
+            }
+        }
+
+        if (fields->m_divDriftCount < 5 && (std::abs(dx) > 8.f || std::abs(dy) > 8.f)) {
+            fields->m_divDriftCount++;
+            fields->m_divReported = true;
+            divLog(fmt::format("*** DRIFT #{} frame={} realX={:.0f} simVeh={} realVeh={}  sim=({:.1f},{:.1f}) real=({:.1f},{:.1f}) diff=({:.1f},{:.1f})  simVel={:.1f} realVel={:.1f} procN={} injN={}",
+                               fields->m_divDriftCount,
+                               liveFrame, realX, simVeh, realVeh, simX, simY,
+                               realX - fields->m_divOffX, realY - fields->m_divOffY, dx, dy,
+                               simP.velocity, m_player1->m_yVelocity,
+                               s_perStepProcessCount.load(), s_perStepInjectCount.load()));
+        }
+    }
+
+    // Load the current trial's inputs and restart the level for a fresh attempt.
+    void arBeginTrial() {
+        if (g_replayPlayer.replay.has_value())
+            g_replayPlayer.replay->presses = g_ar.trial;
+        g_ar.trialMaxX = 0.f;
+        g_ar.trialDied = false;
+        s_replayStepHold   = false;
+        s_replayStepActive = false;
+        // Force the divergence detector to re-arm against THIS trial's clicks — its
+        // init latch (m_divInit) otherwise only fires once per level load, so every
+        // retry after the first would keep comparing against trial 1's stale input
+        // (and never write a fresh GDMod_truth_<id>.txt for the trial actually running).
+        m_fields->m_divInit = false;
+        this->resetLevel();
+    }
+
+    // A trial finished (died or completed). Update the frontier, pick the next edit,
+    // and either restart, finish (solved), or give up (stuck) — saving the best run.
+    void arOnTrialEnd(bool success) {
+        auto fields = m_fields.self();
+        if (g_ar.done) return;
+
+        if (success) {
+            ReplayLoadResult out;
+            out.framerate = g_ar.framerate;
+            out.presses   = g_ar.trial;
+            saveReplayToLocalJson(g_ar.levelId, out);
+            // This is the ONLY point that ever writes a .gdr2 for a solved level: the
+            // solution has now actually completed in the real engine (possibly after
+            // local edits above), not just in gdsim's headless model.
+            std::string gdr2Path = writeSolvedGdr2(g_ar.levelId, g_ar.levelName, out);
+            g_ar.done = true;
+            fields->m_autoRepairActive = false;
+            g_replayExternalCommands.liveReplayActive.store(false);
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
+            if (this->m_objectLayer)            this->m_objectLayer->setVisible(true);
+            if (this->m_inShaderObjectLayer)    this->m_inShaderObjectLayer->setVisible(true);
+            if (this->m_aboveShaderObjectLayer) this->m_aboveShaderObjectLayer->setVisible(true);
+            log::info("[AR] SOLVED in {} trials, {} clicks", g_ar.attempts, g_ar.trial.size());
+            // Log the FINAL, level-clearing edit too. Without this the winning
+            // correction was invisible: the last "fix #" line stopped short of the end
+            // and the correction/frame totals under-counted by one, so they disagreed
+            // with the saved "real solution". Count it before the summary prints.
+            if (g_ar.lastOpValid) {
+                g_ar.numCorrections++;
+                g_ar.totalAdjustFrames += arOpAdjustFrames(g_ar.lastOp);
+                arLog(fmt::format("fix #{}: {}  -> got past x={:.0f}, now CLEARS the level (x={:.0f})",
+                                  g_ar.numCorrections, arOpStr(g_ar.lastOp), g_ar.bestX, g_ar.trialMaxX));
+                g_ar.lastOpValid = false;
+            }
+            arLog("");
+            arLog(fmt::format("=== SOLVED in {} trials.  gdsim needed {} correction(s), "
+                              "{} frames of total adjustment (~{:.1f} ms @ {}fps) ===",
+                              g_ar.attempts, g_ar.numCorrections, g_ar.totalAdjustFrames,
+                              1000.0 * g_ar.totalAdjustFrames / (g_ar.framerate > 0 ? g_ar.framerate : 240.0),
+                              (int)g_ar.framerate));
+            arLog(fmt::format("gdsim solution : {}", arClickList(g_ar.original)));
+            arLog(fmt::format("real solution  : {}", arClickList(g_ar.trial)));
+            arLog(g_ar.numCorrections == 0
+                  ? "=> gdsim was PERFECT here (no edits needed)."
+                  : "=> the edits above are exactly where/by how much the simulator diverged from real GD.");
+
+            // ── Click alignment: per-click net shift (real press - gdsim press).
+            // A CONSISTENT nonzero shift across clicks = a systematic solver/replay
+            // timing offset (the solver's clicks all land a fixed number of frames
+            // early/late vs real GD), which is fixable at the source — not per-obstacle
+            // noise. Clicks that didn't move just had enough slack to survive the offset.
+            if (g_ar.original.size() == g_ar.trial.size() && !g_ar.original.empty()) {
+                arLog("");
+                arLog("=== click alignment (real press frame - gdsim press frame) ===");
+                std::vector<int> deltas;
+                std::string ls;
+                for (size_t i = 0; i < g_ar.trial.size(); ++i) {
+                    int d = (int)g_ar.trial[i].framePress - (int)g_ar.original[i].framePress;
+                    deltas.push_back(d);
+                    ls += fmt::format("{}{:+d}", i ? "," : "", d);
+                    arLog(fmt::format("  click #{}: gdsim f{} -> real f{}   ({:+d})",
+                                      i + 1, g_ar.original[i].framePress, g_ar.trial[i].framePress, d));
+                }
+                std::vector<int> nz;
+                for (int d : deltas) if (d != 0) nz.push_back(d);
+                arLog(fmt::format("net shifts: [{}]", ls));
+                if (nz.empty()) {
+                    arLog("=> every click matched gdsim exactly — no timing offset on this level.");
+                } else {
+                    int mn = *std::min_element(nz.begin(), nz.end());
+                    int mx = *std::max_element(nz.begin(), nz.end());
+                    if (mn == mx)
+                        arLog(fmt::format("=> SYSTEMATIC OFFSET: every adjusted click moved exactly {:+d} frame(s). "
+                                          "The solver's clicks run {} frame(s) too {} vs real GD — a fixable timing "
+                                          "bias at the source, not per-obstacle noise. The unmoved clicks just had "
+                                          "enough slack to survive the same offset.",
+                                          mn, std::abs(mn), mn > 0 ? "early" : "late"));
+                    else
+                        arLog(fmt::format("=> shifts range {:+d}..{:+d} — partly systematic, partly per-obstacle. "
+                                          "Most common nonzero shift is the likely constant offset; make another "
+                                          "level to confirm the constant part.", mn, mx));
+                }
+            }
+            size_t n = g_ar.trial.size();
+            int a = g_ar.attempts;
+            Loader::get()->queueInMainThread([n, a, gdr2Path]() {
+                FLAlertLayer::create("Solve",
+                    fmt::format(
+                        "<cg>Validated in the real engine!</c>\n{} clicks, {} trials.\n{}",
+                        n, a,
+                        gdr2Path.empty()
+                            ? std::string("<cr>Failed to write .gdr2.</c>")
+                            : fmt::format("<cy>.gdr2 saved:</c>\n{}", gdr2Path)
+                    ).c_str(), "OK")->show();
+            });
+            return;
+        }
+
+        // Died this trial.
+        g_ar.attempts++;
+        bool progressed = g_ar.trialMaxX > g_ar.bestX + 3.f;
+        if (g_ar.firstTrial) {
+            arLog(fmt::format("trial 1 (gdsim as-is): reached x={:.0f}, DIED at frame {} "
+                              "-- this is where the sim was wrong (it thought this survived)",
+                              g_ar.trialMaxX, g_ar.lastDeathFrame));
+            g_ar.base = g_ar.trial; g_ar.bestX = g_ar.trialMaxX; g_ar.firstTrial = false;
+            arBuildCandidates();
+        } else if (progressed) {
+            if (g_ar.lastOpValid) {
+                g_ar.numCorrections++;
+                g_ar.totalAdjustFrames += arOpAdjustFrames(g_ar.lastOp);
+                arLog(fmt::format("fix #{}: {}  -> got past x={:.0f}, now reaches x={:.0f}",
+                                  g_ar.numCorrections, arOpStr(g_ar.lastOp), g_ar.bestX, g_ar.trialMaxX));
+                // Update momentum tracking (see AutoRepairState::momentum* comment).
+                const auto& op = g_ar.lastOp;
+                if ((op.type == AROp::Hold || op.type == AROp::ShiftPress) && op.delta != 0) {
+                    int sign = op.delta > 0 ? 1 : -1;
+                    if (op.type == g_ar.momentumType && op.idx == g_ar.momentumIdx && sign == g_ar.momentumSign) {
+                        g_ar.momentumStreak++;
+                    } else {
+                        g_ar.momentumType = op.type; g_ar.momentumIdx = op.idx;
+                        g_ar.momentumSign = sign; g_ar.momentumStreak = 1;
+                    }
+                    g_ar.momentumLastDelta = op.delta;
+                } else {
+                    g_ar.momentumStreak = 0; g_ar.momentumIdx = -1;
+                }
+            }
+            g_ar.base  = g_ar.trial;
+            g_ar.bestX = std::max(g_ar.bestX, g_ar.trialMaxX);
+            arBuildCandidates();
+        }
+
+        if (g_ar.candIdx >= g_ar.cands.size() || g_ar.attempts >= g_ar.maxAttempts) {
+            // Exhausted local edits without breaking through — save the best run.
+            ReplayLoadResult out;
+            out.framerate = g_ar.framerate;
+            out.presses   = g_ar.base;
+            saveReplayToLocalJson(g_ar.levelId, out);
+            g_ar.done = true;
+            fields->m_autoRepairActive = false;
+            g_replayExternalCommands.liveReplayActive.store(false);
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
+            if (this->m_objectLayer)            this->m_objectLayer->setVisible(true);
+            if (this->m_inShaderObjectLayer)    this->m_inShaderObjectLayer->setVisible(true);
+            if (this->m_aboveShaderObjectLayer) this->m_aboveShaderObjectLayer->setVisible(true);
+            log::info("[AR] STUCK at x={:.0f} after {} trials", g_ar.bestX, g_ar.attempts);
+            arLog("");
+            arLog(fmt::format("=== STUCK at x={:.0f} after {} trials.  {} correction(s) applied so far, "
+                              "{} frames adjusted.  Real GD couldn't get past frame {} with local edits ===",
+                              g_ar.bestX, g_ar.attempts, g_ar.numCorrections, g_ar.totalAdjustFrames,
+                              g_ar.lastDeathFrame));
+            arLog(fmt::format("gdsim solution : {}", arClickList(g_ar.original)));
+            arLog(fmt::format("best real run  : {}", arClickList(g_ar.base)));
+            float x = g_ar.bestX;
+            int a = g_ar.attempts;
+            Loader::get()->queueInMainThread([x, a]() {
+                FLAlertLayer::create("Solve",
+                    fmt::format("<cr>Stuck at x={:.0f} after {} trials.</c>\n"
+                                "No .gdr2 written — best partial run saved locally.\n"
+                                "See GDMod_repair_log.txt for exactly where gdsim's\n"
+                                "solution parted ways with the real engine.",
+                                x, a).c_str(), "OK")->show();
+            });
+            return;
+        }
+
+        AROp op = g_ar.cands[g_ar.candIdx++];
+        g_ar.lastOp = op; g_ar.lastOpValid = true;
+        g_ar.trial = arApply(g_ar.base, op);
+        this->arBeginTrial();
+    }
+
+    // Confirm-only mode's single completion point (death or level-complete) — the
+    // non-blocking counterpart to arOnTrialEnd. The .gdr2 was already written before
+    // this pass started (doSimulate); this only reports the outcome and restores
+    // normal playback. On failure it does NOT retry — updateDivergenceDetector has
+    // already captured a full truth file (GDMod_truth_<levelId>.txt under
+    // testlevel/captures/) for this run, which is exactly the input test/regress.sh
+    // --hunt needs to turn "it didn't clear" into a concrete, fixable divergence.
+    void confirmOnlyFinish(bool success) {
+        auto fields = m_fields.self();
+        if (fields->m_confirmDone) return;
+        fields->m_confirmDone       = true;
+        fields->m_confirmOnlyActive = false;
+        g_replayExternalCommands.liveReplayActive.store(false);
+        CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
+        if (this->m_objectLayer)            this->m_objectLayer->setVisible(true);
+        if (this->m_inShaderObjectLayer)    this->m_inShaderObjectLayer->setVisible(true);
+        if (this->m_aboveShaderObjectLayer) this->m_aboveShaderObjectLayer->setVisible(true);
+
+        float x = m_player1 ? m_player1->getPositionX() : 0.f;
+        log::info("[Confirm] {}", success ? "CLEARED for real" : fmt::format("diverged near x={:.0f}", x));
+        std::string msg = success
+            ? "Confirmed: clears in real GD."
+            : fmt::format("Diverged from real GD near x={:.0f} — .gdr2 already saved; "
+                          "captured to testlevel/captures/ for a future fidelity fix "
+                          "(or toggle Repair and re-solve to force a real clear now).", x);
+        auto icon = success ? NotificationIcon::Success : NotificationIcon::Warning;
+        Loader::get()->queueInMainThread([msg, icon]() {
+            Notification::create(msg, icon, 4.f)->show();
+        });
     }
 
     void postUpdate(float dt) {
         traceDebug("[POSTDBG-ENTRY] postUpdate called dt={}", dt);
         PlayLayer::postUpdate(dt);
+
+        // ===== Auto-repair driver: fast-forward, watch for death/finish =====
+        if (m_fields->m_autoRepairActive && !g_ar.done) {
+            auto sched = CCDirector::sharedDirector()->getScheduler();
+            sched->setTimeScale(s_autoRepairSpeed);
+            g_replayExternalCommands.liveReplayActive.store(true);
+            g_replayExternalCommands.livePaused.store(false);
+            // Compare gdsim's prediction against this trial's REAL trajectory frame by
+            // frame — a physics-fidelity check that comes for free with every trial
+            // (see arBeginTrial, which resets m_divInit so each trial gets its own
+            // fresh comparison instead of reusing trial 1's).
+            if (g_ar.framerate > 0.0) {
+                uint64_t liveFrame = (uint64_t)std::llround((double)m_timePlayed * g_ar.framerate);
+                updateDivergenceDetector(liveFrame);
+            }
+            if (m_player1) {
+                float x = m_player1->getPositionX();
+                if (x > g_ar.trialMaxX) g_ar.trialMaxX = x;
+                if (m_player1->m_isDead && !g_ar.trialDied) {
+                    g_ar.trialDied = true;
+                    g_ar.lastDeathFrame = (uint64_t)std::llround(
+                        (double)m_timePlayed * g_ar.framerate);
+                    this->arOnTrialEnd(false);
+                }
+            }
+            return;
+        }
+
+        // ===== Confirm-only driver: ONE pass, report death/finish, never retry =====
+        if (m_fields->m_confirmOnlyActive && !m_fields->m_confirmDone) {
+            auto sched = CCDirector::sharedDirector()->getScheduler();
+            sched->setTimeScale(s_autoRepairSpeed);
+            g_replayExternalCommands.liveReplayActive.store(true);
+            g_replayExternalCommands.livePaused.store(false);
+            if (g_replayPlayer.replay.has_value() && g_replayPlayer.replay->framerate > 0.0) {
+                uint64_t liveFrame = (uint64_t)std::llround(
+                    (double)m_timePlayed * g_replayPlayer.replay->framerate);
+                updateDivergenceDetector(liveFrame);
+            }
+            if (m_player1 && m_player1->m_isDead) {
+                this->confirmOnlyFinish(false);
+            }
+            return;
+        }
 
         auto fields = m_fields.self();
         if (!fields->m_runtimeHitboxCaptured && m_level && m_objects && m_objects->count() > 0) {
@@ -2420,167 +1453,6 @@ class $modify(MyPlayLayer, PlayLayer) {
         }
         g_replayExternalCommands.liveReplayActive.store(false);
 
-        // ========== Replay Player Mode: Auto-inject inputs ==========
-        if (fields->m_isReplayMode && g_replayPlayer.replay.has_value()) {
-            if (!ensureReplayRuntimeReady("postUpdate")) {
-                return;
-            }
-            traceDebug("[POSTDBG] START replay mode block");
-            auto& replay = g_replayPlayer.replay.value();
-            auto scheduler = CCDirector::sharedDirector()->getScheduler();
-            float targetScale = fields->m_isSeeking
-                ? 4.0f
-                : (fields->m_frameStepActive ? 1.0f : (fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed));
-            scheduler->setTimeScale(std::max(0.0f, targetScale));
-            debugLogToFile(fmt::format("postUpdate dt={} targetScale={} currentTimeScale={}", dt, targetScale, scheduler->getTimeScale()));
-
-            float currentTime = static_cast<float>(m_timePlayed);
-            fields->m_replayCurrentTime = currentTime;
-            if (fields->m_isPaused) {
-                fields->m_pauseTime = currentTime;
-            }
-            uint64_t liveFrame = 0;
-            if (replay.framerate > 0.0) {
-                liveFrame = static_cast<uint64_t>(std::llround(static_cast<double>(currentTime) * replay.framerate));
-                g_replayExternalCommands.liveFrame.store(liveFrame);
-            }
-
-            if (!fields->m_replayFrameCursorValid) {
-                fields->m_replayFrameCursor = liveFrame == 0 ? std::numeric_limits<uint64_t>::max() : liveFrame - 1;
-                fields->m_replayFrameCursorValid = true;
-            }
-
-            if (fields->m_frameStepActive && replay.framerate > 0.0) {
-                if (liveFrame > fields->m_frameStepLastFrame) {
-                    int advanced = static_cast<int>(liveFrame - fields->m_frameStepLastFrame);
-                    fields->m_frameStepRemaining -= advanced;
-                    fields->m_frameStepLastFrame = liveFrame;
-                }
-                if (fields->m_frameStepRemaining <= 0) {
-                    fields->m_frameStepActive = false;
-                    fields->m_frameStepRemaining = 0;
-                    fields->m_isPaused = true;
-                    fields->m_pauseTime = currentTime;
-                    scheduler->setTimeScale(pausedUiTimeScale());
-                    fields->m_lastAudioSyncMs = -1.0f;
-                    applyReplayAudioSync(currentTime, true);
-                }
-            }
-
-            g_replayExternalCommands.livePaused.store(fields->m_isPaused);
-            g_replayExternalCommands.liveReplayActive.store(true);
-            // Log state only on state changes
-            static uint64_t s_lastLiveFrame = 0;
-            static bool s_lastLivePaused = false;
-            if (liveFrame != s_lastLiveFrame || fields->m_isPaused != s_lastLivePaused) {
-                s_lastLiveFrame = liveFrame;
-                s_lastLivePaused = fields->m_isPaused;
-                if (fields->m_isPaused || liveFrame % 10 == 0) {  // Log when paused or every 10 frames
-                    traceDebug("[CMDDBG] liveReplayActive=true liveFrame={} livePaused={}",
-                        liveFrame, fields->m_isPaused);
-                }
-            }
-
-            // Handle commands coming from the external replay editor window.
-            if (g_replayExternalCommands.restartRequested.exchange(false)) {
-                traceDebug("[CMDDBG] RESTART command received");
-                fields->m_isPaused = true;
-                fields->m_isSeeking = false;
-                fields->m_frameStepActive = false;
-                fields->m_frameStepRemaining = 0;
-                fields->m_seekTargetTime = 0.0f;
-                fields->m_snapshotRestoreDirty = false;
-                fields->m_snapshotRestoreTime = 0.0f;
-                fields->m_nextInputIdx = 0;
-                fields->m_replayHoldingJump = false;
-                fields->m_replayFrameCursorValid = false;
-                this->resetLevel();
-                applyReplayAudioSync(0.0f, true);
-                currentTime = static_cast<float>(m_timePlayed);
-                fields->m_replayCurrentTime = currentTime;
-            }
-
-            debugLogToFile(fmt::format("postUpdate currentTime={:.3f} isPaused={} isSeeking={}", currentTime, fields->m_isPaused, fields->m_isSeeking));
-
-            // One-shot bootstrap: if replay starts with no active music slot,
-            // start level music exactly once to recover from silent startup.
-            if (!fields->m_musicBootstrapTried && currentTime >= 0.15f) {
-                debugLogToFile(fmt::format("bootstrap check at currentTime={:.3f}", currentTime));
-                fields->m_musicBootstrapTried = true;
-                if (auto* audio = FMODAudioEngine::sharedEngine()) {
-                    bool hasMusic = false;
-                    for (int musicID = 0; musicID < 32; ++musicID) {
-                        if (audio->isMusicPlaying(musicID)) {
-                            debugLogToFile(fmt::format("  found active music musicID={}", musicID));
-                            hasMusic = true;
-                            break;
-                        }
-                    }
-                    debugLogToFile(fmt::format("  hasMusic after scan={}", hasMusic));
-                    if (!hasMusic) {
-                        debugLogToFile("  NO MUSIC FOUND - BOOTSTRAPPING");
-                        debugLogToFile("  calling prepareMusic(false)");
-                        this->prepareMusic(false);
-                        debugLogToFile("  calling startMusic()");
-                        this->startMusic();
-                        debugLogToFile("  calling resumeAllMusic()");
-                        audio->resumeAllMusic();
-                        traceDebug("[AUDIODBG] bootstrapMusic prepare+start at t={:.3f}s", currentTime);
-                        debugLogToFile("  bootstrap complete");
-                    }
-                }
-            }
-
-            // In edit mode, avoid running expensive continuous audio sync while fully paused.
-            // Manual preview/seek actions already force a sync when needed.
-            bool shouldSyncAudio = !(fields->m_isReplayEditMode && fields->m_isPaused && !fields->m_isSeeking);
-            if (shouldSyncAudio) {
-                debugLogToFile(fmt::format("calling applyReplayAudioSync currentTime={:.3f} isSeeking={}", currentTime, fields->m_isSeeking));
-                applyReplayAudioSync(currentTime, fields->m_isSeeking);
-                debugLogToFile("applyReplayAudioSync returned");
-            }
-
-            // Advance inputs across the exact frames we crossed, so skipped frames and step modes stay deterministic.
-            pumpReplayInputsThroughFrame(liveFrame);
-
-            if (fields->m_isSeeking && currentTime >= fields->m_seekTargetTime) {
-                debugLogToFile(fmt::format("seek complete currentTime={:.3f} >= seekTarget={:.3f}", currentTime, fields->m_seekTargetTime));
-                fields->m_isSeeking = false;
-                scheduler->setTimeScale(fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed);
-            }
-
-            // Update labels
-            if (fields->m_speedLabel) {
-                auto speedStr = fields->m_isSeeking
-                    ? fmt::format("{:.2f}x (seek)", g_replayPlayer.playbackSpeed)
-                    : fmt::format("{:.2f}x", g_replayPlayer.playbackSpeed);
-                fields->m_speedLabel->setString(speedStr.c_str());
-            }
-
-            if (fields->m_playPauseLabel) {
-                fields->m_playPauseLabel->setString(fields->m_isPaused ? "Play" : "Pause");
-                fields->m_playPauseLabel->setColor(fields->m_isPaused ? ccc3(120, 255, 140) : ccc3(255, 230, 120));
-            }
-
-            if (fields->m_timeLabel) {
-                float totalTime = replay.framerate > 0
-                    ? static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate)
-                    : 0.0f;
-                auto timeStr = fmt::format("{} / {}", formatTime(currentTime), formatTime(totalTime));
-                fields->m_timeLabel->setString(timeStr.c_str());
-            }
-
-            captureReplayStepSnapshot(liveFrame, currentTime);
-
-            if (fields->m_isReplayEditMode) {
-                rebuildEditTimeline(false);
-                rebuildSimplifiedBar(false);
-                updateEditTimelineCursor();
-            }
-
-            // Edit mode follows replay playback continuously; edits are applied live
-            // via replay data updates without forced reset/seek preview.
-        }
 
         // Debug counter – log every ~120 frames. BEFORE any early return!
         static int s_dbg = 0;
@@ -2625,15 +1497,36 @@ class $modify(MyPlayLayer, PlayLayer) {
         float bottomY = static_cast<float>(fields->m_barY);
         float barH = static_cast<float>(fields->m_barHeight);
 
-        // Create dot nodes once (positions are computed below each frame)
+        // Height of the input segment: inset inside the track so the hairlines
+        // frame it (a cleaner "piano-roll" look than a full-height flat block).
+        float segH = std::max(3.0f, barH - 4.0f);
+
+        // Create dot nodes once (positions are computed below each frame). Each
+        // input = a coloured HOLD segment + a brighter CAP pinned to its leading
+        // edge, so the exact press instant pops instead of the hold reading as one
+        // flat bar. The cap is a child at local x≈0 (the segment's left = press
+        // moment for normal left→right motion), so it needs no per-frame upkeep.
         if (!fields->m_dotsCreated && !fields->m_presses.empty()) {
             for (size_t i = 0; i < fields->m_presses.size(); i++) {
                 auto& press = fields->m_presses[i];
                 ccColor4B color = (press.player == 1) ? fields->m_p1Color : fields->m_p2Color;
-                auto dot = CCLayerColor::create(color, 1.0f, barH);
+                auto dot = CCLayerColor::create(color, 1.0f, segH);
                 dot->setAnchorPoint({0.0f, 0.5f});
                 dot->ignoreAnchorPointForPosition(false);
+                dot->setOpacity(255);
                 dot->setVisible(false);
+
+                // Bright press cap (a lighter tint of the player colour) at the
+                // leading edge. Fixed 3px wide; the hold body stretches behind it.
+                auto cap = CCLayerColor::create(
+                    ccc4(std::min(255, color.r + 90), std::min(255, color.g + 90),
+                         std::min(255, color.b + 90), 255),
+                    3.0f, segH);
+                cap->setAnchorPoint({0.0f, 0.0f});
+                cap->setPosition({0.0f, 0.0f});
+                cap->setID("press-cap"_spr);
+                dot->addChild(cap, 2);
+
                 fields->m_circleLayer->addChild(dot);
                 fields->m_dots.push_back({i, dot});
             }
@@ -2780,9 +1673,9 @@ class $modify(MyPlayLayer, PlayLayer) {
                 continue;
             }
 
-            float screenWidth = std::max(screenRight - screenLeft, 2.0f);
+            float screenWidth = std::max(screenRight - screenLeft, 4.0f);
             dot->setPosition({screenLeft, bottomY});
-            dot->setContentSize({screenWidth, barH});
+            dot->setContentSize({screenWidth, segH});
             dot->setVisible(true);
 
             // Log first 3 visible dots
@@ -2798,408 +1691,204 @@ class $modify(MyPlayLayer, PlayLayer) {
             if (dbg) log::info("[DBG] indicator pos=({:.2f},{:.2f})", playerScreenX, bottomY);
         }
 
-        // ========== UR Bar: Process player inputs ==========
-        if (fields->m_urBar && !fields->m_replayPressTimes.empty()) {
-            float fps = static_cast<float>(fields->m_framerate);
-            float veryF = fields->m_veryFrames;
-            float elF = fields->m_earlyLateFrames;
-            float gF = fields->m_goodFrames;
-            float urW = fields->m_urBarWidth;
-            float urH = fields->m_urBarHeight;
-            float pxPerFrame = urW / (veryF * 2.0f);
-
-            // Process new player inputs since last frame
-            while (fields->m_processedInputIdx < s_playerInputs.size()) {
-                auto& [inputTime, isPress] = s_playerInputs[fields->m_processedInputIdx];
-                fields->m_processedInputIdx++;
-
-                // Find closest unmatched replay event
-                auto& replayTimes = isPress ? fields->m_replayPressTimes : fields->m_replayReleaseTimes;
-                auto& usedFlags = isPress ? fields->m_replayPressUsed : fields->m_replayReleaseUsed;
-
-                int bestIdx = -1;
-                float bestDist = 999999.0f;
-                for (size_t i = 0; i < replayTimes.size(); i++) {
-                    if (usedFlags[i]) continue;
-                    float dist = std::abs(inputTime - replayTimes[i]);
-                    if (dist < bestDist) {
-                        bestDist = dist;
-                        bestIdx = static_cast<int>(i);
-                    }
-                }
-
-                if (bestIdx < 0) continue; // no unmatched replay event
-
-                float offsetSec = inputTime - replayTimes[bestIdx];
-                float offsetFrames = offsetSec * fps;
-
-                // Determine judgment
-                Judgment j;
-                float absOffset = std::abs(offsetFrames);
-                if (absOffset <= gF) {
-                    j = Judgment::Good;
-                } else if (absOffset <= elF) {
-                    j = (offsetFrames < 0) ? Judgment::Early : Judgment::Late;
-                } else if (absOffset <= veryF) {
-                    j = (offsetFrames < 0) ? Judgment::VeryEarly : Judgment::VeryLate;
-                } else {
-                    j = Judgment::Miss;
-                }
-
-                // Mark as used (only if not a miss)
-                if (j != Judgment::Miss) {
-                    usedFlags[bestIdx] = true;
-                }
-
-                // Record judgment
-                fields->m_judgmentCounts[static_cast<int>(j)]++;
-                fields->m_totalJudgments++;
-
-                // Compute accuracy contribution
-                float accValue = 0.0f;
-                switch (j) {
-                    case Judgment::Good:      accValue = 100.0f; break;
-                    case Judgment::Early:
-                    case Judgment::Late:      accValue = 33.33f; break;
-                    case Judgment::VeryEarly:
-                    case Judgment::VeryLate:  accValue = 16.67f; break;
-                    case Judgment::Miss:      accValue = 0.0f; break;
-                }
-                fields->m_totalAccuracy += accValue;
-
-                // Create tick mark on UR bar
-                float clampedOffset = std::max(-veryF, std::min(veryF, offsetFrames));
-                float tickX = (urW / 2.0f) + clampedOffset * pxPerFrame;
-                float tickW = 2.0f;
-                float tickH = urH + 6.0f;
-
-                // Tick color based on judgment
-                ccColor4B tickColor;
-                switch (j) {
-                    case Judgment::Good:      tickColor = ccc4(255, 255, 255, 255); break;
-                    case Judgment::Early:
-                    case Judgment::Late:      tickColor = ccc4(255, 220, 100, 255); break;
-                    case Judgment::VeryEarly:
-                    case Judgment::VeryLate:  tickColor = ccc4(255, 100, 100, 255); break;
-                    case Judgment::Miss:      tickColor = ccc4(180, 0, 0, 255); break;
-                }
-
-                auto tick = CCLayerColor::create(tickColor, tickW, tickH);
-                tick->setPosition({tickX - tickW / 2.0f, -3.0f});
-                fields->m_urBar->addChild(tick, 2);
-                fields->m_urTickNodes.push_back(tick);
-                fields->m_urTicks.push_back({offsetFrames, j, currentTime});
-
-                if (dbg) {
-                    log::info("[UR] input t={:.4f} replay={:.4f} offset={:.2f}f j={} acc={:.2f}%",
-                        inputTime, replayTimes[bestIdx], offsetFrames, static_cast<int>(j), accValue);
-                }
-            }
-
-            // Fade old ticks (older than 3 seconds)
-            for (size_t i = 0; i < fields->m_urTicks.size(); i++) {
-                float age = currentTime - fields->m_urTicks[i].timeCreated;
-                if (age > 3.0f && i < fields->m_urTickNodes.size()) {
-                    float opacity = std::max(0.0f, 1.0f - (age - 3.0f) / 2.0f);
-                    static_cast<CCLayerColor*>(fields->m_urTickNodes[i])->setOpacity(static_cast<GLubyte>(opacity * 255));
-                }
-            }
-
-            // Update accuracy label
-            if (fields->m_accuracyLabel && fields->m_totalJudgments > 0) {
-                float avgAcc = fields->m_totalAccuracy / static_cast<float>(fields->m_totalJudgments);
-                auto accText = fmt::format("{:.2f}%", avgAcc);
-                fields->m_accuracyLabel->setString(accText.c_str());
-
-                // Color based on accuracy
-                if (avgAcc >= 90.0f)      fields->m_accuracyLabel->setColor(ccc3(50, 255, 80));
-                else if (avgAcc >= 60.0f) fields->m_accuracyLabel->setColor(ccc3(255, 200, 50));
-                else                      fields->m_accuracyLabel->setColor(ccc3(255, 60, 60));
-            }
-        }
     }
 
     void levelComplete() {
+        // Auto-repair: the current trial actually finished the level in real GD.
+        if (m_fields->m_autoRepairActive && !g_ar.done) {
+            this->arOnTrialEnd(true);
+        }
+        // Confirm-only: the solve cleared for real (the .gdr2 was already written).
+        if (m_fields->m_confirmOnlyActive && !m_fields->m_confirmDone) {
+            this->confirmOnlyFinish(true);
+        }
+
         PlayLayer::levelComplete();
 
         auto fields = m_fields.self();
         if (!fields->m_active) return;
-
-        s_rhythmActive = false;
-
-        // Log final stats
-        float finalAcc = (fields->m_totalJudgments > 0)
-            ? fields->m_totalAccuracy / static_cast<float>(fields->m_totalJudgments)
-            : 0.0f;
-        log::info("[UR] Level complete! Accuracy: {:.2f}% ({} judgments)", finalAcc, fields->m_totalJudgments);
-        log::info("[UR] Good:{} Early:{} Late:{} VeryEarly:{} VeryLate:{} Miss:{}",
-            fields->m_judgmentCounts[static_cast<int>(Judgment::Good)],
-            fields->m_judgmentCounts[static_cast<int>(Judgment::Early)],
-            fields->m_judgmentCounts[static_cast<int>(Judgment::Late)],
-            fields->m_judgmentCounts[static_cast<int>(Judgment::VeryEarly)],
-            fields->m_judgmentCounts[static_cast<int>(Judgment::VeryLate)],
-            fields->m_judgmentCounts[static_cast<int>(Judgment::Miss)]);
-
-        if (fields->m_isReplayMode) {
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
-        }
     }
 
-    // Helper: format time in MM:SS
-    static std::string formatTime(float seconds) {
-        int mins = static_cast<int>(seconds) / 60;
-        int secs = static_cast<int>(seconds) % 60;
-        return fmt::format("{:02d}:{:02d}", mins, secs);
-    }
-
-    // ========== Replay Player Controls ==========
-    void onReplayPlayPause(CCObject*) {
+    // Death-debug: when the player dies during an auto-repair trial, write a full
+    // report of WHAT killed it and WHY (killing object, player state, and the gdsim
+    // comparison — did the sim predict this death?). One report per attempt, to
+    // GDMod_death_debug.txt.
+    void destroyPlayer(PlayerObject* p0, GameObject* p1) {
         auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-
-        bool wasPaused = fields->m_isPaused;
-        if (!wasPaused) {
-            fields->m_isPaused = true;
-            fields->m_pauseTime = static_cast<float>(m_timePlayed);
-        } else {
-            if (fields->m_snapshotRestoreDirty) {
-                fields->m_snapshotRestoreDirty = false;
+        PlayerObject* pl = p0 ? p0 : m_player1;
+        // GD calls destroyPlayer once during level setup (frame ~1, player still at
+        // spawn, with a placeholder object) — skip it so it doesn't consume the
+        // one-report flag and mask the REAL death. Nothing kills you this early.
+        if (fields->m_autoRepairActive && !fields->m_deathLogged && pl && m_timePlayed > 0.06f) {
+            fields->m_deathLogged = true;
+            uint64_t frame = (uint64_t)std::llround((double)m_timePlayed * fields->m_framerate);
+            float px = pl->getPositionX(), py = pl->getPositionY();
+            const char* veh = pl->m_isShip ? "Ship" : pl->m_isBird ? "UFO"
+                            : pl->m_isBall ? "Ball" : pl->m_isDart ? "Wave"
+                            : pl->m_isRobot ? "Robot" : pl->m_isSpider ? "Spider"
+                            : pl->m_isSwing ? "Swing" : "Cube";
+            deathLog(fmt::format("\n===== DEATH  frame={}  time={:.3f}s  progress={:.2f}%  x={:.1f} =====",
+                                 frame, m_timePlayed, this->getCurrentPercent(), px));
+            deathLog(fmt::format("player @death: pos=({:.1f},{:.1f})  yVel={:.3f}  veh={}  mini={:.2f}  upsideDown={} (death-frame flags may include a same-frame pad/portal flip)",
+                                 px, py, pl->m_yVelocity, veh, pl->m_vehicleSize, pl->m_isUpsideDown ? 1 : 0));
+            if (fields->m_prevRealValid) {
+                static const char* kVeh[] = {"Cube","Ship","Ball","UFO","Wave","Robot","Spider","Swing"};
+                deathLog(fmt::format("approach (last alive frame): pos=({:.1f},{:.1f})  yVel={:.3f}  veh={}  upsideDown={}  <-- the real state going IN",
+                                     fields->m_prevRealX, fields->m_prevRealY, fields->m_prevRealVel,
+                                     kVeh[fields->m_prevRealVeh & 7], fields->m_prevRealUp ? 1 : 0));
             }
+            if (p1)
+                deathLog(fmt::format("KILLED BY: objID={} ({})  pos=({:.1f},{:.1f})  delta=({:.1f},{:.1f})",
+                                     p1->m_objectID, objName(p1->m_objectID),
+                                     p1->getPositionX(), p1->getPositionY(),
+                                     p1->getPositionX() - px, p1->getPositionY() - py));
+            else
+                deathLog("KILLED BY: (no object — out of bounds / forced)");
 
-            fields->m_isPaused = false;
-            fields->m_isSeeking = false;
-            fields->m_seekTargetTime = 0.0f;
-        }
-
-        if (!fields->m_isSeeking) {
-            float scale = fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed;
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(scale);
-        }
-        // Force immediate verification that audio position and state match replay state.
-        fields->m_lastAudioSyncMs = -1.0f;
-        applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
-    }
-
-    void onReplaySpeedUp(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-
-        g_replayPlayer.playbackSpeed = std::min(4.0f, g_replayPlayer.playbackSpeed + 0.25f);
-        if (!fields->m_isPaused && !fields->m_isSeeking) {
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(g_replayPlayer.playbackSpeed);
-        }
-        // Re-check position+rate immediately after speed change.
-        fields->m_lastAudioSyncMs = -1.0f;
-        applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
-    }
-
-    void onReplaySpeedDown(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-
-        g_replayPlayer.playbackSpeed = std::max(0.25f, g_replayPlayer.playbackSpeed - 0.25f);
-        if (!fields->m_isPaused && !fields->m_isSeeking) {
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(g_replayPlayer.playbackSpeed);
-        }
-        // Re-check position+rate immediately after speed change.
-        fields->m_lastAudioSyncMs = -1.0f;
-        applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
-    }
-
-    void keyDown(cocos2d::enumKeyCodes key, double timestamp) {
-        PlayLayer::keyDown(key, timestamp);
-
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode) return;
-
-        // Space toggles replay pause/play like a video player.
-        if (key == cocos2d::enumKeyCodes::KEY_Space) {
-            onReplayPlayPause(nullptr);
-        }
-    }
-
-    bool ccTouchBegan(cocos2d::CCTouch* touch, cocos2d::CCEvent* event) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value() || !fields->m_editTimeline) {
-            return PlayLayer::ccTouchBegan(touch, event);
-        }
-
-        auto world = touch->getLocation();
-        auto local = fields->m_editTimeline->convertToNodeSpace(world);
-        auto sz = fields->m_editTimeline->getContentSize();
-
-        if (local.x < 0.0f || local.y < 0.0f || local.x > sz.width || local.y > sz.height) {
-            return PlayLayer::ccTouchBegan(touch, event);
-        }
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (replay.presses.empty()) {
-            return PlayLayer::ccTouchBegan(touch, event);
-        }
-
-        size_t hitIdx = std::numeric_limits<size_t>::max();
-        float bestDist = std::numeric_limits<float>::max();
-
-        for (size_t i = 0; i < replay.presses.size(); ++i) {
-            auto const& p = replay.presses[i];
-            float x0 = timelineXFromFrame(p.framePress);
-            float x1 = timelineXFromFrame(p.frameRelease);
-            float left = std::min(x0, x1);
-            float right = std::max(x0, x1);
-            if (local.x >= left - 6.0f && local.x <= right + 6.0f) {
-                float center = (left + right) * 0.5f;
-                float d = std::abs(local.x - center);
-                if (d < bestDist) {
-                    bestDist = d;
-                    hitIdx = i;
+            // Input context: was a click held at the death frame, and where are the
+            // nearest presses/releases? Tells you if the solution *intended* an input
+            // right here (so a mis-timed click is suspect) or if the death is between
+            // clicks (pure physics/geometry).
+            if (g_replayPlayer.replay.has_value()) {
+                const auto& presses = g_replayPlayer.replay->presses;
+                bool held = false; uint64_t heldPress = 0, heldRel = 0;
+                uint64_t prevRel = 0, nextPress = 0;   // nearest edges around `frame`
+                int idxHeld = -1;
+                for (size_t i = 0; i < presses.size(); ++i) {
+                    const auto& pr = presses[i];
+                    if (pr.framePress <= frame && frame < pr.frameRelease) {
+                        held = true; heldPress = pr.framePress; heldRel = pr.frameRelease; idxHeld = (int)i;
+                    }
+                    if (pr.frameRelease <= frame) prevRel = std::max(prevRel, pr.frameRelease);
+                    if (pr.framePress   >  frame && (nextPress == 0 || pr.framePress < nextPress))
+                        nextPress = pr.framePress;
                 }
+                if (held)
+                    deathLog(fmt::format("input @death: HOLDING click #{} (press f{} -> release f{}), {} frame(s) into the hold",
+                                         idxHeld, heldPress, heldRel, frame - heldPress));
+                else
+                    deathLog(fmt::format("input @death: no click held. prev release f{} ({} frames ago), next press f{} (in {} frames)",
+                                         prevRel, prevRel ? frame - prevRel : 0,
+                                         nextPress, nextPress ? nextPress - frame : 0));
+                deathLog(fmt::format("total clicks in solution: {}", presses.size()));
             }
-        }
 
-        if (hitIdx == std::numeric_limits<size_t>::max()) {
-            return PlayLayer::ccTouchBegan(touch, event);
-        }
-
-        fields->m_editSelectedIdx = hitIdx;
-        auto const& sel = replay.presses[hitIdx];
-        float pressX = timelineXFromFrame(sel.framePress);
-        float releaseX = timelineXFromFrame(sel.frameRelease);
-        float edgeTolerance = 8.0f;
-        if (std::abs(local.x - pressX) <= edgeTolerance) {
-            fields->m_timelineDragMode = 1;
-        } else if (std::abs(local.x - releaseX) <= edgeTolerance) {
-            fields->m_timelineDragMode = 2;
-        } else {
-            fields->m_timelineDragMode = 3;
-        }
-
-        fields->m_timelineDragging = true;
-        fields->m_timelineDragIdx = hitIdx;
-        fields->m_timelineDragStartFrame = frameFromTimelineX(local.x);
-        fields->m_timelineOrigPress = sel.framePress;
-        fields->m_timelineOrigRelease = sel.frameRelease;
-
-        updateReplayEditLabels();
-        return true;
-    }
-
-    void ccTouchMoved(cocos2d::CCTouch* touch, cocos2d::CCEvent* event) {
-        auto fields = m_fields.self();
-        if (!fields->m_timelineDragging || !fields->m_isReplayEditMode || !g_replayPlayer.replay.has_value() || !fields->m_editTimeline) {
-            PlayLayer::ccTouchMoved(touch, event);
-            return;
-        }
-
-        auto& replay = g_replayPlayer.replay.value();
-        if (fields->m_timelineDragIdx >= replay.presses.size()) return;
-
-        auto world = touch->getLocation();
-        auto local = fields->m_editTimeline->convertToNodeSpace(world);
-        uint64_t nowFrame = frameFromTimelineX(local.x);
-
-        auto& p = replay.presses[fields->m_timelineDragIdx];
-        if (fields->m_timelineDragMode == 1) {
-            p.framePress = nowFrame;
-            if (p.frameRelease <= p.framePress) p.frameRelease = p.framePress + 1;
-        } else if (fields->m_timelineDragMode == 2) {
-            p.frameRelease = std::max<uint64_t>(nowFrame, p.framePress + 1);
-        } else if (fields->m_timelineDragMode == 3) {
-            int64_t delta = static_cast<int64_t>(nowFrame) - static_cast<int64_t>(fields->m_timelineDragStartFrame);
-            int64_t newPress = static_cast<int64_t>(fields->m_timelineOrigPress) + delta;
-            int64_t newRelease = static_cast<int64_t>(fields->m_timelineOrigRelease) + delta;
-            if (newPress < 0) {
-                int64_t shift = -newPress;
-                newPress += shift;
-                newRelease += shift;
+            // Divergence summary: did real GD track gdsim up to the death, or drift off?
+            // This is the crux of "solves in sim, dies in the watch" — a large drift
+            // before death means the real run desynced from the path the solver found.
+            {
+                float peak = std::max(std::fabs(fields->m_divMaxDx), std::fabs(fields->m_divMaxDy));
+                if (fields->m_divFirstDriftFrame == 0)
+                    deathLog("divergence: real GD tracked gdsim to <2u the whole way (no drift before death).");
+                else
+                    deathLog(fmt::format("divergence: first drifted >2u at frame {} (Δ={:.1f},{:.1f}); peak Δ=({:.1f},{:.1f}) at frame {}. realMaxX={:.0f}",
+                                         fields->m_divFirstDriftFrame, fields->m_divFirstDx, fields->m_divFirstDy,
+                                         fields->m_divMaxDx, fields->m_divMaxDy, fields->m_divMaxDriftFrame,
+                                         fields->m_divRealMaxX));
+                (void)peak;
             }
-            p.framePress = snapFrameToGrid(static_cast<uint64_t>(std::max<int64_t>(0, newPress)));
-            p.frameRelease = snapFrameToGrid(static_cast<uint64_t>(std::max<int64_t>(p.framePress + 1, newRelease)));
-            if (p.frameRelease <= p.framePress) p.frameRelease = p.framePress + 1;
+
+            // gdsim comparison: did the sim predict this death, and where?
+            // velMismatch: sim and real vertical velocity point OPPOSITE ways at the
+            // death — the tell for a gravity/jump-phase divergence (the click lands on
+            // a different arc phase / flip side), which no hazardInflate can fix but a
+            // 1-2 frame click shift (Auto-fix) can. Set here, used by the VERDICT below.
+            bool  velMismatch = false;
+            bool  simSurvived = false;
+            if (fields->m_divSim && !fields->m_divSim->gameStates.empty()) {
+                auto& sp = fields->m_divSim->gameStates.back();
+                simSurvived = !sp.dead;
+                const float kUnit = 54.f;            // gdsim stores velocity = real yVel * 54
+                float simVelReal = sp.velocity / kUnit;
+                velMismatch = (simVelReal * pl->m_yVelocity < -0.5f);
+                deathLog(fmt::format("gdsim: dead={}  cause={}  killer=id{} @({:.0f},{:.0f})  simPos=({:.1f},{:.1f})  simVel={:.1f}  yOffset={:.1f}",
+                                     sp.dead ? 1 : 0, sp.deathCause ? sp.deathCause : "-",
+                                     sp.deathObjType, sp.deathObjPos.x, sp.deathObjPos.y,
+                                     sp.pos.x, sp.pos.y, sp.velocity, fields->m_divOffY));
+                deathLog(fmt::format("  gdsim gravity state: upsideDown={} grounded={} small={}  velReal={:.2f}   vs REAL upsideDown={} yVel={:.2f}",
+                                     sp.upsideDown ? 1 : 0, sp.grounded ? 1 : 0, sp.small ? 1 : 0,
+                                     simVelReal, pl->m_isUpsideDown ? 1 : 0, pl->m_yVelocity));
+                if (velMismatch)
+                    deathLog("  >>> VERTICAL DIRECTION MISMATCH: gdsim velocity is the OPPOSITE sign to real. "
+                             "The jump/flip lands on a different arc phase — a gravity/timing divergence, "
+                             "NOT a hitbox-size gap. A 1-2 frame click shift (Auto-fix) fixes it.");
+                else if (!sp.dead)
+                    deathLog("  >>> gdsim SURVIVED here: the sim is MISSING this death "
+                             "(hitbox too small or the ~2u jump phase error). Fidelity gap.");
+                deathLog(fmt::format("  sim player box L={:.1f} R={:.1f} B={:.1f} T={:.1f}",
+                                     sp.getLeft(), sp.getRight(), sp.getBottom(), sp.getTop()));
+                auto& secs = fields->m_divSim->sections;
+                int si = std::clamp((int)(sp.pos.x / (float)gdsim::Level::sectionSize), 0, (int)secs.size() - 1);
+                for (int s = std::max(0, si - 1); s <= std::min((int)secs.size() - 1, si + 1); ++s)
+                    for (auto& oc : secs[s]) {
+                        const gdsim::Object* o = oc.operator->();
+                        if (std::abs(o->pos.x - sp.pos.x) > 50.f) continue;
+                        float gapX = std::max({0.f, o->getLeft() - sp.getRight(), sp.getLeft() - o->getRight()});
+                        float gapY = std::max({0.f, o->getBottom() - sp.getTop(), sp.getBottom() - o->getTop()});
+                        deathLog(fmt::format("  near {}: id={} pos=({:.1f},{:.1f}) box[L={:.1f} R={:.1f} B={:.1f} T={:.1f}] gap=({:.2f},{:.2f})",
+                                             o->prio == 2 ? "HAZARD" : "solid", o->typeId, o->pos.x, o->pos.y,
+                                             o->getLeft(), o->getRight(), o->getBottom(), o->getTop(), gapX, gapY));
+                    }
+            }
+
+            // ── VERDICT ──────────────────────────────────────────────────────────
+            // One-line root-cause classification so you don't have to read the whole
+            // report: did the solver hand over a losing path, or did the real run
+            // desync from a winning one (and by how much)?
+            {
+                float peak = std::max(std::fabs(fields->m_divMaxDx), std::fabs(fields->m_divMaxDy));
+                std::string v;
+                if (!simSurvived)
+                    v = "gdsim ALSO dies at ~this point -> the solved path is genuinely losing "
+                        "(not a fidelity gap). The solver produced a bad solution; re-Solve "
+                        "(try Center off) or check for an unmodeled mechanic near this X.";
+                else if (velMismatch)
+                    v = fmt::format("TIMING / GRAVITY-PHASE gap: gdsim SURVIVES but its vertical velocity is "
+                                    "OPPOSITE real's here (sim on one side of the arc/flip, real on the other, "
+                                    "peak drift only {:.1f}u). Not a hazard-size issue — the click lands a frame "
+                                    "or two off the real arc. Auto-fix (shift clicks) recovers it; raising "
+                                    "hazardInflate will NOT.", peak);
+                else if (peak > 6.f)
+                    v = fmt::format("DESYNC: gdsim SURVIVES but the real run drifted {:.1f}u off the "
+                                    "simulated path (onset frame {}). The click timing that works in "
+                                    "the sim doesn't line up with real GD here. Auto-fix should recover it.",
+                                    peak, fields->m_divFirstDriftFrame);
+                else
+                    v = fmt::format("FIDELITY GAP: gdsim SURVIVES with only {:.1f}u drift and same velocity "
+                                    "direction -> the sim's hazard/hitbox is slightly smaller than real GD "
+                                    "(a graze the sim misses). Raise hazardInflate or run Auto-fix.", peak);
+                deathLog("VERDICT: " + v);
+            }
+            deathLog("(written to " + deathLogPath() + ")");
         }
-
-        rebuildReplayRuntimeFromCurrentState();
-        updateReplayEditLabels();
-    }
-
-    void ccTouchEnded(cocos2d::CCTouch* touch, cocos2d::CCEvent* event) {
-        auto fields = m_fields.self();
-        fields->m_timelineDragging = false;
-        fields->m_timelineDragMode = 0;
-        PlayLayer::ccTouchEnded(touch, event);
-    }
-
-    void onReplayRewind(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode || !g_replayPlayer.replay.has_value()) return;
-
-        float currentTime = static_cast<float>(m_timePlayed);
-        float target = std::max(0.0f, currentTime - 5.0f);
-
-        fields->m_isPaused = false;
-        fields->m_nextInputIdx = 0;
-
-        if (target <= 0.05f) {
-            fields->m_isSeeking = false;
-            fields->m_seekTargetTime = 0.0f;
-            this->resetLevel();
-            applyReplayAudioSync(0.0f, true);
-            return;
-        }
-
-        fields->m_isSeeking = true;
-        fields->m_seekTargetTime = target;
-        fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
-        this->resetLevel();
-        applyReplayAudioSync(0.0f, true);
-    }
-
-    void onReplaySkipForward(CCObject*) {
-        auto fields = m_fields.self();
-        if (!fields->m_isReplayMode || !g_replayPlayer.replay.has_value()) return;
-
-        auto& replay = g_replayPlayer.replay.value();
-        float totalTime = replay.framerate > 0
-            ? static_cast<float>(replay.presses.back().frameRelease) / static_cast<float>(replay.framerate)
-            : 0.0f;
-        float currentTime = static_cast<float>(m_timePlayed);
-        float target = std::min(totalTime, currentTime + 5.0f);
-
-        fields->m_isPaused = false;
-        fields->m_isSeeking = true;
-        fields->m_seekTargetTime = target;
-        fields->m_seekResumeSpeed = g_replayPlayer.playbackSpeed;
-        applyReplayAudioSync(target, true);
+        PlayLayer::destroyPlayer(p0, p1);
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
 
         auto fields = m_fields.self();
-        if (fields->m_isReplayMode) {
-            this->togglePracticeMode(true);
-            fields->m_nextInputIdx = 0;
-            fields->m_replayCurrentTime = 0.0f;
-            fields->m_pauseTime = 0.0f;
-            fields->m_snapshotRestoreDirty = false;
-            fields->m_snapshotRestoreTime = 0.0f;
-            fields->m_frameStepActive = false;
-            fields->m_frameStepRemaining = 0;
-            fields->m_replayStepHistory.clear();
-            fields->m_replayHoldingJump = false;
-            float scale = fields->m_isSeeking ? 4.0f : (fields->m_isPaused ? pausedUiTimeScale() : g_replayPlayer.playbackSpeed);
-            CCDirector::sharedDirector()->getScheduler()->setTimeScale(scale);
-            fields->m_lastAudioSyncMs = -1.0f;
-            // Death/respawn can reset pitch internally; force a fresh pitch apply.
-            fields->m_lastAudioRate = -1.0f;
-            fields->m_audioPausedByReplay = false;
-            fields->m_audioMusicID = -1;
-            fields->m_musicBootstrapTried = false;
-            fields->m_nextMusicRetryAt = 0.25f;
-            fields->m_nextAudioDebugAt = 0.0f;
-            fields->m_lastAutoSeekAt = -1000.0f;
-            fields->m_replayMusicInitialOffset = -1;
-            fields->m_lastAutoSeekAt = -1000.0f;
-            applyReplayAudioSync(static_cast<float>(m_timePlayed), true);
+        if (fields->m_autoRepairActive) {
+            // Re-anchor the per-step injection clock to the (reset) play time and
+            // keep fast-forward + the injection gate live for the next trial.
+            s_replayStepHold   = false;
+            s_replayStepTime   = static_cast<double>(m_timePlayed);
+            s_replayStepActive = false;
+            g_replayExternalCommands.liveReplayActive.store(true);
+            g_replayExternalCommands.livePaused.store(false);
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(s_autoRepairSpeed);
+        }
+        // Confirm-only is a single pass, not a retry loop — a manual reset mid-pass
+        // (practice mode, user hit retry) just drops out of it quietly instead of
+        // trying to keep going, so speed/render state can't get stuck.
+        if (fields->m_confirmOnlyActive && !fields->m_confirmDone) {
+            fields->m_confirmOnlyActive = false;
+            fields->m_confirmDone       = true;
+            g_replayExternalCommands.liveReplayActive.store(false);
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
+            if (this->m_objectLayer)            this->m_objectLayer->setVisible(true);
+            if (this->m_inShaderObjectLayer)    this->m_inShaderObjectLayer->setVisible(true);
+            if (this->m_aboveShaderObjectLayer) this->m_aboveShaderObjectLayer->setVisible(true);
         }
 
         if (fields->m_active && !fields->m_posHistory.empty()) {
@@ -3211,33 +1900,7 @@ class $modify(MyPlayLayer, PlayLayer) {
             fields->m_posHistory.erase(it, fields->m_posHistory.end());
         }
 
-        // Reset UR bar state
-        if (fields->m_active && fields->m_urBar) {
-            // Remove old tick nodes
-            for (auto* tick : fields->m_urTickNodes) {
-                if (tick) tick->removeFromParent();
-            }
-            fields->m_urTickNodes.clear();
-            fields->m_urTicks.clear();
-            fields->m_processedInputIdx = 0;
-
-            // Reset match tracking
-            std::fill(fields->m_replayPressUsed.begin(), fields->m_replayPressUsed.end(), false);
-            std::fill(fields->m_replayReleaseUsed.begin(), fields->m_replayReleaseUsed.end(), false);
-
-            // Reset accuracy
-            for (int i = 0; i < 6; i++) fields->m_judgmentCounts[i] = 0;
-            fields->m_totalAccuracy = 0.0f;
-            fields->m_totalJudgments = 0;
-
-            if (fields->m_accuracyLabel) {
-                fields->m_accuracyLabel->setString("0.00%");
-                fields->m_accuracyLabel->setColor(ccc3(255, 255, 255));
-            }
-
-            // Clear player inputs
-            s_playerInputs.clear();
-            s_rhythmActive = true;
+        if (fields->m_active) {
             s_replayInputInjectionActive = false;
         }
     }
@@ -3247,86 +1910,27 @@ class $modify(MyPlayLayer, PlayLayer) {
         g_replayExternalCommands.liveReplayActive.store(false);
         g_replayExternalCommands.livePaused.store(false);
         g_replayExternalCommands.liveFrame.store(0);
-        if (fields->m_isReplayMode) {
+        if (fields->m_autoRepairActive) {
+            fields->m_autoRepairActive = false;
+            g_ar.done = true;
+            g_ar.active = false;
             CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
-            if (auto* audio = FMODAudioEngine::sharedEngine()) {
-                for (int musicID = 0; musicID < 32; ++musicID) {
-                    int channelID = audio->getMusicChannelID(musicID);
-                    if (channelID >= 0) {
-                        audio->setChannelPitch(musicID, AudioTargetType::MusicChannel, 1.0f);
-                    }
-                }
-            }
             g_replayPlayer.isActive = false;
             g_replayPlayer.replay.reset();
-            g_replayPlayer.playbackSpeed = 1.0f;
-            g_replayPlayer.isPaused = false;
-            g_replayPlayer.pauseTime = 0.0f;
-            g_replayPlayer.inputIndex = 0.0f;
-            g_replayPlayer.isEditMode = false;
-            g_replayPlayer.levelId = 0;
-            g_replayPlayer.sourceReplayPath.clear();
+        }
+        if (fields->m_confirmOnlyActive) {
+            fields->m_confirmOnlyActive = false;
+            fields->m_confirmDone       = true;
+            CCDirector::sharedDirector()->getScheduler()->setTimeScale(1.0f);
+            g_replayPlayer.isActive = false;
+            g_replayPlayer.replay.reset();
         }
 
-        s_rhythmActive = false;
-        s_playerInputs.clear();
         s_replayInputInjectionActive = false;
         PlayLayer::onQuit();
     }
-};
 
-// ============================================================
-// EndLevelLayer – show rhythm game results
-// ============================================================
-class $modify(MyEndLevel, EndLevelLayer) {
-    void customSetup() {
-        EndLevelLayer::customSetup();
-
-        auto pl = PlayLayer::get();
-        if (!pl) return;
-
-        auto fields = static_cast<MyPlayLayer*>(pl)->m_fields.self();
-        if (!fields->m_active || fields->m_totalJudgments == 0) return;
-
-        float finalAcc = fields->m_totalAccuracy / static_cast<float>(fields->m_totalJudgments);
-        int good = fields->m_judgmentCounts[static_cast<int>(Judgment::Good)];
-        int early = fields->m_judgmentCounts[static_cast<int>(Judgment::Early)];
-        int late = fields->m_judgmentCounts[static_cast<int>(Judgment::Late)];
-        int veryEarly = fields->m_judgmentCounts[static_cast<int>(Judgment::VeryEarly)];
-        int veryLate = fields->m_judgmentCounts[static_cast<int>(Judgment::VeryLate)];
-        int miss = fields->m_judgmentCounts[static_cast<int>(Judgment::Miss)];
-
-        // Build results string
-        auto resultStr = fmt::format(
-            "Accuracy: {:.2f}%\n"
-            "Good: {}  Early: {}  Late: {}\n"
-            "V.Early: {}  V.Late: {}  Miss: {}",
-            finalAcc, good, early, late, veryEarly, veryLate, miss);
-
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
-
-        // Background panel for results
-        auto bg = CCLayerColor::create(ccc4(0, 0, 0, 160), 280.0f, 70.0f);
-        bg->setPosition({winSize.width / 2.0f - 140.0f, 10.0f});
-        bg->setZOrder(100);
-        this->addChild(bg);
-
-        auto accText = fmt::format("Rhythm: {:.2f}%", finalAcc);
-        auto accLabel = CCLabelBMFont::create(accText.c_str(), "bigFont.fnt");
-        accLabel->setScale(0.5f);
-        accLabel->setPosition({winSize.width / 2.0f, 65.0f});
-        accLabel->setZOrder(101);
-        if (finalAcc >= 90.0f)      accLabel->setColor(ccc3(50, 255, 80));
-        else if (finalAcc >= 60.0f) accLabel->setColor(ccc3(255, 200, 50));
-        else                        accLabel->setColor(ccc3(255, 60, 60));
-        this->addChild(accLabel);
-
-        // Breakdown label
-        auto breakLabel = CCLabelBMFont::create(resultStr.c_str(), "chatFont.fnt");
-        breakLabel->setScale(0.6f);
-        breakLabel->setPosition({winSize.width / 2.0f, 35.0f});
-        breakLabel->setZOrder(101);
-        breakLabel->setColor(ccc3(220, 220, 220));
-        this->addChild(breakLabel);
+    void onExit() {
+        PlayLayer::onExit();
     }
 };
