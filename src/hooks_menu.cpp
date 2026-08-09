@@ -288,6 +288,20 @@ public:
             uint64_t trajDeathFrame = 0;
             std::pair<float, float> trajDeath{0.f, 0.f};
             if (!result.clicks.empty()) {
+                // Dump the exact click list this attempt is about to re-verify — a
+                // trajDied result previously vanished with no way to replay it outside
+                // the game (no .gdr2 is written on failure). Same frame-pair format
+                // test/gdrcheck.cpp's NPRESS section already parses, so a failed solve
+                // can go straight into that tool with last_level.txt.
+                {
+                    std::ofstream ck(gdsim::debugPath(fmt::format("GDMod_solve_clicks_{}.txt", levelId)),
+                                     std::ios::trunc);
+                    if (ck.is_open()) {
+                        ck << "NPRESS " << result.clicks.size() << "\n";
+                        for (auto& c : result.clicks)
+                            ck << c.pressFrame << ' ' << c.releaseFrame << " 1\n";
+                    }
+                }
                 gdsim::Level trajSim(levelStr);
                 size_t inputSz = static_cast<size_t>(
                     result.framesTotal > 0 ? result.framesTotal + 2 : cfg.maxFrames + 2);

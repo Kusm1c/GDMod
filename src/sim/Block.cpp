@@ -165,6 +165,20 @@ void Block::collide(Player& p) const {
         constexpr float kSolidGraze = 0.75f;
         if (std::min(penX, penY) <= kSolidGraze) blockHit = false;
     }
+    // Pre-existing overlap (the player was ALSO deeply inside this exact block on the
+    // PREVIOUS frame) is not a new collision — GD kills on the TRANSITION into contact,
+    // not a static "currently overlapping" state (same discriminator already used for
+    // orb touch timing, see orb_touch_timing_sameframe — touching(prevPlayer())).
+    // FOUND 2026-08-08 by batch-replaying ~150 real, human-verified-clearing macros
+    // (Paul's Macro Demonlist) through gdsim via test/gdrcheck.cpp: "block" was by far
+    // the single most common false-death cause, overwhelmingly on frame 1 — a level's
+    // spawn point sitting flush against/inside a placed ground-row block (extremely
+    // common, purely decorative in that position) killed the run before any real
+    // collision could occur. Two unrelated levels (BOOBAWAMBA, Saul Goodman) showed
+    // the IDENTICAL frame-1 death coordinates, confirming this is systemic, not a
+    // per-level geometry fluke.
+    if (blockHit && p.prevPlayer().blockDeathHitbox().intersects(*this)) blockHit = false;
+
     if (blockHit) {
         p.dead = true; p.deathCause = "block";
         p.deathObjType = typeId; p.deathObjPos = pos;

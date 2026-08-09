@@ -970,10 +970,17 @@ class $modify(MyPlayLayer, PlayLayer) {
             uint64_t maxF = 16;
             for (auto& p : replay.presses) maxF = std::max(maxF, p.frameRelease);
             fields->m_divInput.assign(maxF + 4, false);
+            // Merge BOTH player tags into one hold timeline — matches the real input
+            // injection path (replayHeldAtFrame above, used by processCommands) which
+            // never filtered by player. This used to be player==1-only and silently
+            // fed a mostly-empty input array into the divergence sim for any imported
+            // replay whose bot splits real single-avatar gameplay across P1/P2 GDR2
+            // tags (confirmed on EclipseBot macros — see the P1/P2-merge comment in
+            // test/gdrcheck.cpp), making this debug sim look wrong when actual
+            // gameplay was fine.
             for (auto& p : replay.presses)
-                if (p.player == 1)
-                    for (uint64_t f = p.framePress; f < p.frameRelease && f < fields->m_divInput.size(); ++f)
-                        fields->m_divInput[f] = true;
+                for (uint64_t f = p.framePress; f < p.frameRelease && f < fields->m_divInput.size(); ++f)
+                    fields->m_divInput[f] = true;
 
             fields->m_divFrame = 0;
             fields->m_divReported = false;

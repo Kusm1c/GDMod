@@ -30,6 +30,35 @@ ZeroMarginResult verifyZeroMargin(const std::string& levelStr,
     for (auto& c : clicks)
         for (uint64_t f = c.pressFrame; f < c.releaseFrame && f < inputAt.size(); ++f)
             inputAt[f] = true;
+    // OPEN (2026-08-09) — this check itself was proven to give a false "OK" on level
+    // 13519 ("The Nightmare"): two INDEPENDENT solves (135 and 237 clicks, different
+    // runs) both reported result.solved=true (meaning THIS function said ok=true), yet
+    // replaying the exact same click list in a brand-new, single-pass process (no
+    // relation to the solver's `sim`) dies at frame 5317/x=6905 on a toggle-group
+    // block (id=220) every time. Debug printouts confirmed the trajectory (x/y per
+    // frame) is BIT-IDENTICAL between this function's zeroSim and the independent
+    // replay right up to the death frame — only the collision OUTCOME differs, so
+    // it's not a dt/normalization/calibration mismatch (all ruled out). The likely
+    // cause: block 220 sits in a Toggle-triggered group (Level.cpp classifies
+    // Toggle/Move/Rotate/Follow targets as "movable", posed per-frame with an
+    // active/inactive flag) — touch-triggered toggle state is already documented as
+    // PATH-DEPENDENT (see gdsim_gaps_from_gdcs_docs memory), and `sim` (the solver's
+    // main Level, reused and rolled back thousands of times across beam/center/
+    // robustify) could carry stale touch-fired state from an explored-then-rejected
+    // branch that a truly fresh Level never sees — but this wasn't confirmed before
+    // time ran out; the print instrumentation (grep GDSIM_DEBUG_VERIFYZM in git
+    // history around this commit) is the fastest way to pick this back up: log
+    // whether the toggle group covering the death object is active in `zeroSim` vs.
+    // an independent single-pass replay of the identical clicks.
+    //
+    // Practical impact: NOT a safety bug — hooks_menu.cpp's own independent
+    // re-simulation after solveLevel() returns (a second, unrelated fresh Level)
+    // correctly catches this and blocks the .gdr2 from being written (confirmed:
+    // it's what produced the "zero-margin re-check DIES" alerts on 7887341/13519).
+    // The impact is solves-that-should-fail-faster: solveLevel()'s descending-margin
+    // retry loop stops at the first attempt THIS check calls ok, so a false "OK"
+    // wastes the rest of the adaptive-margin/algorithm cascade on a doomed attempt
+    // instead of continuing to search for one that's genuinely zero-margin-safe.
     Level zeroSim(levelStr);
     zeroSim.hazardInflate = 0.f;
     zeroSim.flightHazardInflate = 0.f;
