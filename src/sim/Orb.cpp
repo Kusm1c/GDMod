@@ -1,5 +1,7 @@
 #include "Orb.hpp"
 #include "Player.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 namespace gdsim {
 
@@ -81,6 +83,9 @@ void Orb::collide(Player& p) const {
     if (p.buffer || (p.prevPlayer().buffer && !p.button)
         || (p.vehicle.type == VehicleType::Ball && p.vehicleBuffer))
     {
+        if (getenv("GDSIM_ORBTOUCH_DEBUG"))
+            std::fprintf(stderr, "ORB-TOUCH f=%d type=%d typeId=%d pos=(%.2f,%.2f) rot=%.2f playerXY=(%.2f,%.2f) velBefore=%.3f\n",
+                         p.frame, (int)type, typeId, pos.x, pos.y, rotation, p.pos.x, p.pos.y, p.velocity);
         p.buffer = false;
         p.vehicleBuffer = false;
         EffectObject::collide(p);
@@ -98,6 +103,22 @@ void Orb::collide(Player& p) const {
             // Dash orb: glide along the orb's angle at constant velocity (gravity
             // off) for as long as the button is held. velocity = Xspeed*tan(angle)
             // makes the player track the orb's line. (best-effort; needs capture.)
+            //
+            // TRIED 2026-08-10 (macro-demonlist level 82172844 "Cobwebs"): snapping
+            // p.pos.y onto the line through the orb's own position at touch time
+            // (`pos.y + dashTan*(p.pos.x - pos.x)`) fixed a false hazard death in
+            // Cobwebs (player touched a 0° dash orb at (1155,1005) while sitting
+            // 11.76u above it, at y=1016.76 — gdsim then held the WHOLE dash at
+            // 1016.76, clipping a hazard the corridor was clearly built to clear at
+            // the orb's own y=1005) — but REGRESSED a different real macro (Cold
+            // Sweat, 63996127: touch was ~20u X-past the orb, and snapping there
+            // introduced a NEW death, 6.62%->1.14%). Isolated batch validation: 1
+            // better / 1 worse — not the clean win the other two fixes this session
+            // got, so reverted rather than kept on a coin-flip. Both touches here
+            // were far (X and/or Y) from the orb's own position when they fired —
+            // real GD's true touch timing/hitbox for Dash specifically, and whether
+            // it snaps at all, needs a live capture (memory read or physlab-style
+            // no-input course) before trying this again.
             p.dashTan  = std::tan(rotation * 0.017453292519943295);  // rotation is in degrees
             p.dashing  = true;
             p.velocity = player_speeds[p.speed] * p.dashTan;

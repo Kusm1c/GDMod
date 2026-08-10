@@ -1,5 +1,7 @@
 #include "Portals.hpp"
 #include "Player.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 namespace gdsim {
 
@@ -22,6 +24,10 @@ VehiclePortal::VehiclePortal(Vec2D s, std::unordered_map<int, std::string>&& fie
 }
 
 void VehiclePortal::collide(Player& player) const {
+    if (getenv("GDSIM_PORTAL_DEBUG"))
+        std::fprintf(stderr, "VEHPORTAL collide f=%llu playerXY=(%.2f,%.2f) portalXY=(%.2f,%.2f) fromVeh=%d toVeh=%d\n",
+                     (unsigned long long)player.frame, player.pos.x, player.pos.y, pos.x, pos.y,
+                     (int)player.vehicle.type, (int)type);
     EffectObject::collide(player);
     if (player.vehicle.type != type) {
         player.size = Vec2D(30, 30) * (player.small ? 0.6f : 1.0f);

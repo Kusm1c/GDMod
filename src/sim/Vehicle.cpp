@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 
 namespace gdsim {
 
@@ -170,9 +171,16 @@ static Vehicle cube() {
                 auto time = std::clamp(10*(p.timeElapsed - p.slopeData.elapsed), 0.4, 1.0);
                 double vel = 0.9 * std::min(1.12 / p.slopeData.slope->angle(), 1.54)
                            * (p.slopeData.slope->size.y * player_speeds[p.speed] / p.slopeData.slope->size.x);
+                if (getenv("GDSIM_JUMP_DEBUG"))
+                    std::fprintf(stderr, "JUMP-SLOPE f=%d speed=%d angle=%.4f slopeSize=(%.2f,%.2f) time=%.4f vel=%.4f result=%.4f\n",
+                                 p.frame, p.speed, p.slopeData.slope->angle(), p.slopeData.slope->size.x, p.slopeData.slope->size.y,
+                                 time, vel, 0.25*time*vel + jumpHeights[p.speed]);
                 p.setVelocity(0.25*time*vel + jumpHeights[p.speed], p.prevPlayer().input);
                 p.grounded = false;
             } else {
+                if (getenv("GDSIM_JUMP_DEBUG"))
+                    std::fprintf(stderr, "JUMP-FLAT f=%d speed=%d jumpHeight=%.4f small=%d result=%.4f\n",
+                                 p.frame, p.speed, jumpHeights[p.speed], p.small, jumpHeights[p.speed] * (p.small ? 0.8 : 1.0));
                 p.setVelocity(jumpHeights[p.speed], p.prevPlayer().input);
                 p.grounded = false;
             }

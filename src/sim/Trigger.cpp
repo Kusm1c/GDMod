@@ -89,6 +89,7 @@ std::vector<int> parseGroups(const std::string& field57) {
 std::optional<Trigger> parseTrigger(int id, const std::unordered_map<int, std::string>& f) {
     Trigger t;
     t.x              = ff(f, 2);
+    t.y              = ff(f, 3);
     t.targetGroup    = fi(f, 51);
     t.duration       = ff(f, 10);
     t.easing         = fi(f, 30);

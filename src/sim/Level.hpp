@@ -48,6 +48,27 @@ public:
     // search the window around the player and pose ONLY nearby objects instead of
     // every movable object every frame (posing all of them was the hang/slowdown).
     std::vector<std::pair<float,int>> movableStartSortedX;
+    // (x, index into `triggers`) for touchTriggered ones only, X-sorted (a subrange
+    // of the already-X-sorted `triggers`, so no separate sort needed). Used by
+    // stepPlayer to detect the player's hitbox reaching a touch trigger's position
+    // and fire it dynamically — see modelTouchTriggers.
+    std::vector<std::pair<float,int>> touchTriggerSortedX;
+    // Touch triggers fire when the PLAYER'S HITBOX overlaps the (invisible) trigger
+    // object's own position, not from a fixed X(frame) timeline — genuinely
+    // path-dependent (a solver branch that never reaches a touch trigger's Y never
+    // fires it). Modeling this during the solver's beam search would make trigger
+    // state branch-dependent, breaking the "pure function of frame, rollback-safe"
+    // invariant every other trigger relies on (see buildTriggerTimeline's comment) —
+    // so this defaults OFF and the solver never touches it. It exists for FORWARD-
+    // ONLY replay validation (gdrcheck, verifyZeroMargin, real gameplay/divergence),
+    // where a Level is only ever stepped forward once, never rolled back, so mutating
+    // Trigger::fireFrame in place as the player's real path touches triggers is safe.
+    // Default hitbox half-size is a placeholder (GD's own touch-trigger collision
+    // size isn't in this project's Object.cpp table — triggers aren't Objects) —
+    // calibrate against a real capture before trusting this for anything but the
+    // 2026-08-09 macro-demonlist batch's aggregate pass/fail rate.
+    bool modelTouchTriggers = false;
+    static constexpr float kTouchTriggerHalfSize = 10.f;
     // Largest distance any single object's centre can travel in X from its start
     // (sum of its move triggers' |moveX|*moveScale), used to widen the start-X
     // window so an object that moved INTO the player's reach is never missed.

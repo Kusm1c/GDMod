@@ -1,5 +1,7 @@
 #include "Pad.hpp"
 #include "Player.hpp"
+#include <cstdio>
+#include <cstdlib>
 
 namespace gdsim {
 
@@ -74,6 +76,9 @@ void Pad::collide(Player& p) const {
         // Return WITHOUT marking the pad used so it fires on the next (still-overlapping)
         // frame. Non-wave pads keep their existing velocityOverride next-frame handling.
         if (p.vehicle.type == VehicleType::Wave && !Object::touching(p.prevPlayer())) return;
+        if (getenv("GDSIM_ORBTOUCH_DEBUG"))
+            std::fprintf(stderr, "PAD-TOUCH f=%d typeId=%d pos=(%.2f,%.2f) playerXY=(%.2f,%.2f) velBefore=%.3f\n",
+                         p.frame, typeId, pos.x, pos.y, p.pos.x, p.pos.y, p.velocity);
         p.upsideDown = !p.upsideDown;
         if (p.vehicle.type == VehicleType::Wave) p.velocity = -p.velocity;
     }

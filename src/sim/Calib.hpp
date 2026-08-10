@@ -15,25 +15,35 @@ namespace gdsim {
 
 // Portal trigger categories (which CalibParams.portalReach entry applies).
 enum PortalCat : int {
-    PCAT_NONE    = 0,
-    PCAT_SPEED   = 1,
-    PCAT_SIZE    = 2,
-    PCAT_VEHICLE = 3,
-    PCAT_GRAVITY = 4,
-    PCAT_DUAL    = 5,
-    PCAT_COUNT   = 6,
+    PCAT_NONE     = 0,
+    PCAT_SPEED    = 1,
+    PCAT_SIZE     = 2,
+    PCAT_VEHICLE  = 3,
+    PCAT_GRAVITY  = 4,
+    PCAT_DUAL     = 5,
+    PCAT_TELEPORT = 6,
+    PCAT_COUNT    = 7,
 };
 
 struct CalibParams {
     // Extra half-extent (world units) added to a portal's hitbox per category, so
     // it fires earlier (+) / later (-) to land on GD's exact trigger frame.
-    // PCAT order: NONE, SPEED, SIZE, VEHICLE, GRAVITY, DUAL. SIZE gets a +1u
-    // forgiveness: when a mini portal is STACKED behind a wider wave portal at the
-    // same X, the wave shrinks the player before its tiny hitbox reaches the narrower
-    // mini portal, so gdsim ran a 1× wave where the real game runs a 2× mini wave.
-    // NEVER make VEHICLE reach negative — it delays the gamemode change a frame and
-    // desyncs fast sections (the calibrator's old −2 did exactly that).
-    float portalReach[PCAT_COUNT] = {0.f, 0.f, 1.f, 0.f, 0.f, 0.f};
+    // PCAT order: NONE, SPEED, SIZE, VEHICLE, GRAVITY, DUAL, TELEPORT. SIZE gets a
+    // +1u forgiveness: when a mini portal is STACKED behind a wider wave portal at
+    // the same X, the wave shrinks the player before its tiny hitbox reaches the
+    // narrower mini portal, so gdsim ran a 1× wave where the real game runs a 2×
+    // mini wave. NEVER make VEHICLE reach negative — it delays the gamemode change
+    // a frame and desyncs fast sections (the calibrator's old −2 did exactly that).
+    // TELEPORT gets +5u: TeleportPortal never had a triggerCat at all until found
+    // 2026-08-10 via level 82172844 ("Cobwebs") — its very first teleport portal
+    // sits at x=-29 (behind spawn) and was geometrically unreachable by a MINI
+    // player's hitbox (needs the player's raw `size` — currently the "cube's
+    // 30/18" convention, i.e. half-width 9 when mini — to reach 3+ units further
+    // back than it can) even though a full-size player's half-width (15) would
+    // have reached it fine. +5 closes that specific gap with a small margin; not
+    // independently re-derived from a real capture, so treat it as a placeholder
+    // pending real evidence, same caveat as the untouched categories below.
+    float portalReach[PCAT_COUNT] = {0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 5.f};
 
     // Frames a speed-portal change is delayed before it reaches the X-position
     // integrator (GD applies it later than the wave Y-rate etc.). 1 = current.

@@ -27,10 +27,21 @@ Hazard::Hazard(Vec2D s, std::unordered_map<int, std::string>&& fields) : Object(
 // never handled the (very common) case where the closest point on the box is on a
 // FLAT EDGE, not a corner. Standard clamp-to-box closest-point test; correct for all
 // cases once paired with the correct radius above.
+// FOUND 2026-08-10 (level 127323087 "Society"): this used the player's RAW `size`
+// (getLeft/Right/Bottom/Top read the 30×30, mini-scaled-18×18, "cube's 30/18"
+// bounding box — see Player::Player()'s default and Level.cpp:74's comment) —
+// NOT the small ~9×9 inner death hitbox every OTHER hazard test in this file
+// correctly uses (see Hazard::collide's own comment: "a hazard kills when the
+// player's SMALL inner death hitbox ... intersects it, NOT the full 30×30 icon
+// box"). A sawblade is exactly as lethal-hitbox-small as a spike in real GD —
+// there's no reason it would use a 3x-larger player box. Confirmed via a real,
+// human-verified-clearing macro: it clipped a sawblade using the oversized box
+// while the small inner hitbox (checked by hand) does not overlap at all.
 bool Sawblade::touching(Player const& p) const {
     float radius = size.x / 2.0f;
-    float closestX = std::clamp(pos.x, p.getLeft(), p.getRight());
-    float closestY = std::clamp(pos.y, p.getBottom(), p.getTop());
+    Entity inner = p.innerHitbox();
+    float closestX = std::clamp(pos.x, inner.getLeft(), inner.getRight());
+    float closestY = std::clamp(pos.y, inner.getBottom(), inner.getTop());
     float dx = pos.x - closestX;
     float dy = pos.y - closestY;
     return (dx * dx + dy * dy) <= radius * radius;

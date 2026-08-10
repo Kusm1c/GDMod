@@ -143,7 +143,6 @@ static int effectiveLevelKey(GJGameLevel* level) {
 // User-toggleable solver post-processing (set via the Optimize / Center toggles).
 static bool s_solverOptimize = true;
 static bool s_solverCenter   = true;
-static bool s_solverHumanLimits = false; // cap to ~14 clicks/s (replay-robust, no superhuman bursts)
 // Default OFF: a solve that passes gdsim's own zero-margin re-check writes the
 // .gdr2 immediately and only runs ONE non-blocking real-game confirmation pass
 // afterward (see doSimulate) — correctness comes from gdsim, not a real-game gate.
@@ -263,12 +262,15 @@ public:
             cfg.progress   = progress.get();
             cfg.doOptimize = s_solverOptimize;
             cfg.doCenter   = s_solverCenter;
-            // Human click-rate cap is in FRAMES, so it MUST scale with the target fps.
-            // A fixed 17 was ~14 clicks/s at 240fps but only 3.5 clicks/s at 60fps —
-            // which made frame-perfect 60fps waves the user CAN clear report as "not
-            // humanly possible". Keep a constant ~14 clicks/s across all framerates.
-            cfg.minClickGap = s_solverHumanLimits
-                ? std::max(1, (int)std::lround(s_solverFps / 14.0)) : 0;
+            // Click-rate cap, internal default (no UI toggle — 2026-08-10, user
+            // request): 21 clicks/s. Removing this entirely (same day, earlier)
+            // let the solver consider a click on literally every frame, which
+            // massively inflates the search space — Cobwebs (82172844) went from
+            // a ~28min solve to not converging in 30+ min with no cap at all,
+            // restarting from scratch repeatedly. GD players don't click faster
+            // than this in practice either, so this isn't just a search-space
+            // trick — it's a reasonable prior. In FRAMES, scaled to the target fps.
+            cfg.minClickGap = std::max(1, (int)std::lround(s_solverFps / 21.0));
             cfg.dt = (float)(1.0 / s_solverFps);            // 1/240 — GD's fixed physics step
 
             // "Sim Cube" routes to the decision-point cube solver (long/frame-perfect
@@ -468,8 +470,7 @@ protected:
             m_mainLayer->addChild(l);
         };
         addTog("Optimize", s_solverOptimize,    menu_selector(PathfinderMenuPopup::onTogOptimize), 36.f);
-        addTog("Center",   s_solverCenter,      menu_selector(PathfinderMenuPopup::onTogCenter),   145.f);
-        addTog("Human",    s_solverHumanLimits, menu_selector(PathfinderMenuPopup::onTogHuman),    235.f);
+        addTog("Center",   s_solverCenter,      menu_selector(PathfinderMenuPopup::onTogCenter),   180.f);
 
         // Repair: OFF by default (write .gdr2 immediately, confirm in-game once,
         // non-blocking). ON opts back into withholding the .gdr2 until a real-engine
@@ -508,7 +509,6 @@ protected:
 
     void onTogOptimize(CCObject*)    { s_solverOptimize    = !s_solverOptimize; }
     void onTogCenter(CCObject*)      { s_solverCenter      = !s_solverCenter; }
-    void onTogHuman(CCObject*)       { s_solverHumanLimits = !s_solverHumanLimits; }
     void onTogAutoRepair(CCObject*)  { s_solverAutoRepair  = !s_solverAutoRepair; }
 
 public:

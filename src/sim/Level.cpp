@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <unordered_set>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace gdsim {
 
@@ -148,7 +150,12 @@ Level::Level(std::string const& lvlString) {
             t.kind == TriggerKind::Toggle || t.kind == TriggerKind::Follow)
             movableGroups.insert(t.targetGroup);
 
+    int dbgPortalCreated = 0, dbgPortalSections = 0, dbgPortalMovable = 0;
     for (auto& [oc, groups] : created) {
+        bool isPortal = oc->typeId==12||oc->typeId==13||oc->typeId==47||oc->typeId==111||
+                        oc->typeId==660||oc->typeId==745||oc->typeId==1331||oc->typeId==1933||oc->typeId==2751||
+                        oc->typeId==747;
+        if (isPortal) dbgPortalCreated++;
         bool mov = false;
         for (int g : groups) if (movableGroups.count(g)) { mov = true; break; }
         if (mov) {
@@ -156,10 +163,26 @@ Level::Level(std::string const& lvlString) {
             movable.push_back(oc);
             movableMeta.push_back({idx, oc->pos, oc->rotation});
             for (int g : groups) if (movableGroups.count(g)) groupToMovable[g].push_back(idx);
+            if (isPortal) dbgPortalMovable++;
         } else {
             size_t sectionPos = (size_t)std::max(.0f, oc->pos.x / (float)sectionSize);
             if (sectionPos >= sections.size()) sections.resize(sectionPos + 1);
             sections[sectionPos].push_back(oc);
+            if (isPortal) dbgPortalSections++;
+        }
+    }
+    if (getenv("GDSIM_PORTAL_DEBUG"))
+        std::fprintf(stderr, "LEVEL-LOAD: portals created=%d insections=%d inmovable=%d totalsections=%zu totalcreated=%zu\n",
+                     dbgPortalCreated, dbgPortalSections, dbgPortalMovable, sections.size(), created.size());
+    if (getenv("GDSIM_PORTAL_DEBUG")) {
+        for (size_t idx = 0; idx < movable.size(); ++idx) {
+            const Object* o = movable[idx].operator->();
+            bool isPortal = o->typeId==12||o->typeId==13||o->typeId==47||o->typeId==111||
+                            o->typeId==660||o->typeId==745||o->typeId==1331||o->typeId==1933||o->typeId==2751||
+                            o->typeId==747;
+            if (isPortal)
+                std::fprintf(stderr, "  movable portal idx=%zu typeId=%d startPos=(%.2f,%.2f) numTriggers=(filled later)\n",
+                             idx, o->typeId, movableMeta[idx].startPos.x, movableMeta[idx].startPos.y);
         }
     }
 
@@ -207,6 +230,12 @@ Level::Level(std::string const& lvlString) {
         }
         std::sort(movableStartSortedX.begin(), movableStartSortedX.end(),
                   [](const auto& a, const auto& b){ return a.first < b.first; });
+
+        // `triggers` is already X-sorted above, so filtering preserves order — no
+        // separate sort needed.
+        for (int ti = 0; ti < (int)triggers.size(); ++ti)
+            if (triggers[ti].touchTriggered)
+                touchTriggerSortedX.push_back({triggers[ti].x, ti});
     }
 }
 
@@ -255,10 +284,32 @@ void Level::buildTriggerTimeline() {
     // Spawn/touch triggers do NOT fire by X — drop the X fire-frame the walk gave
     // them. Touch stays unfired (path-dependent, not modelled). Spawn-triggered ones
     // get their fire-frame from the spawn propagation below.
-    // (Also clears preApplied: a touch/spawn trigger behind the spawn is still gated
-    // on its touch/spawn event — being before the start does not auto-apply it.)
-    for (auto& t : triggers)
-        if (t.spawnTriggered || t.touchTriggered) { t.fireFrame = -1; t.preApplied = false; }
+    //
+    // EXCEPTION found 2026-08-10 (level 127323087 "Society"): a touch-triggered
+    // trigger that is ALSO preApplied (positioned behind spawn, x < the player's
+    // starting X) can NEVER fire under the blanket "wipe" this used to do — the
+    // player only ever moves forward from spawn, so a touch-triggered object
+    // behind it is not just "not yet touched", it is PERMANENTLY unreachable by
+    // any mechanism this sim (or real GD's replay) has. Society's very first
+    // teleport portal (id=747, right at spawn) is toggled OFF by default and
+    // re-enabled via a spawn-chain rooted at a touch-triggered Spawn trigger at
+    // x=-105 (with an outer root at x=-1065) — both were being wiped here,
+    // permanently killing the chain and leaving the portal off for the entire
+    // level, so the player floated through empty space exactly like Cobwebs did
+    // before the PCAT_TELEPORT fix (see that fix's comment). A trigger placed
+    // this far behind spawn, touch-triggered or not, is a standard GD technique
+    // for "fire once, guaranteed, at attempt start" — not a real request to wait
+    // for a physical touch that can't happen. Only wipe touch-triggered ones that
+    // the X-walk did NOT already preApply (i.e. still ahead of spawn — those stay
+    // unfired, matching the existing "touch = path-dependent" architecture).
+    // Spawn-triggered ones are unconditionally wiped regardless of preApplied,
+    // since their real fire-frame must come from their OWN parent chain below,
+    // not their (often irrelevant) placement X — if that parent is itself
+    // preApplied, the propagation loop resolves this correctly on its own.
+    for (auto& t : triggers) {
+        if (t.spawnTriggered) { t.fireFrame = -1; t.preApplied = false; }
+        else if (t.touchTriggered && !t.preApplied) { t.fireFrame = -1; }
+    }
 
     // ── Spawn propagation ───────────────────────────────────────────────────
     // A Spawn trigger fires its targetGroup's members at fireFrame + spawnDelay.
@@ -409,6 +460,28 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
         }
     }
 
+    // Fire any not-yet-fired touch trigger the player's hitbox now overlaps (see
+    // Level.hpp's modelTouchTriggers comment: forward-replay-only, never during
+    // solving). Must run BEFORE this frame's movable posing below so a trigger
+    // fired this exact frame already affects this frame's pose (same-frame effect,
+    // matching the rest of this codebase's philosophy for portals/orbs/gravity).
+    if (modelTouchTriggers && !touchTriggerSortedX.empty()) {
+        const float reach = 220.f;
+        const float lo = p.pos.x - reach, hi = p.pos.x + reach;
+        auto first = std::lower_bound(touchTriggerSortedX.begin(), touchTriggerSortedX.end(), lo,
+                         [](const std::pair<float,int>& e, float v){ return e.first < v; });
+        for (auto it = first; it != touchTriggerSortedX.end() && it->first <= hi; ++it) {
+            Trigger& t = triggers[it->second];
+            if (t.fireFrame >= 0) continue;   // already fired
+            if (std::abs(p.pos.x - t.x) > kTouchTriggerHalfSize + p.size.x * 0.5f) continue;
+            if (std::abs(p.pos.y - t.y) > kTouchTriggerHalfSize + p.size.y * 0.5f) continue;
+            t.fireFrame = (int)p.frame;
+            if (getenv("GDSIM_TOUCHTRIG_DEBUG"))
+                std::fprintf(stderr, "TOUCHTRIG fired ti=%d f=%d group=%d x=%.2f y=%.2f playerXY=(%.2f,%.2f)\n",
+                             it->second, (int)p.frame, t.targetGroup, t.x, t.y, p.pos.x, p.pos.y);
+        }
+    }
+
     // Trigger-animated collision objects: pose ONLY the ones whose start X (widened
     // by their max travel) is near the player, recomputed for this exact frame from
     // each object's own triggers, then fold into the same block/hazard/effect path.
@@ -427,6 +500,37 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
             if (std::abs(it->first - p.pos.x) > 220.f + movableExtent[idx]) continue;
             Vec2D pos; float rot; bool active;
             poseMovable(idx, p.frame, pos, rot, active);
+            if (getenv("GDSIM_BLOCKTRIG_DEBUG") && p.frame >= 130 && p.frame <= 146
+                && (movable[idx].operator->()->typeId == 1 || movable[idx].operator->()->typeId == 84)
+                && std::abs(pos.x - p.pos.x) < 60.f) {
+                const Object* o = movable[idx].operator->();
+                std::fprintf(stderr, "BLOCKTRIG f=%llu idx=%d typeId=%d startPos=(%.2f,%.2f) posedPos=(%.2f,%.2f) active=%d numTrig=%zu\n",
+                             (unsigned long long)p.frame, idx, o->typeId,
+                             movableMeta[idx].startPos.x, movableMeta[idx].startPos.y, pos.x, pos.y, active, movableToTriggers[idx].size());
+                for (int ti : movableToTriggers[idx]) {
+                    const Trigger& t = triggers[ti];
+                    std::fprintf(stderr, "    trig ti=%d kind=%d x=%.2f fireFrame=%d dur=%.3f moveXY=(%.2f,%.2f) easing=%d toggleOn=%d touchTrig=%d preApplied=%d\n",
+                                 ti, (int)t.kind, t.x, t.fireFrame, t.duration, t.moveX, t.moveY, t.easing, t.toggleOn, t.touchTriggered, t.preApplied);
+                }
+            }
+            if (getenv("GDSIM_MOVABLE_DEBUG") && movable[idx].operator->()->typeId == 747 && p.frame == 2) {
+                std::fprintf(stderr, "MOVABLE-747 f=%llu idx=%d pos=(%.2f,%.2f) active=%d playerX=%.2f numTrig=%zu\n",
+                             (unsigned long long)p.frame, idx, pos.x, pos.y, active, p.pos.x, movableToTriggers[idx].size());
+                for (int ti : movableToTriggers[idx]) {
+                    const Trigger& t = triggers[ti];
+                    std::string og; for (int g : t.ownGroups) og += std::to_string(g) + ",";
+                    std::fprintf(stderr, "    trig ti=%d kind=%d x=%.2f fireFrame=%d touchTrig=%d spawnTrig=%d toggleOn=%d targetGroup=%d preApplied=%d ownGroups=%s\n",
+                                 ti, (int)t.kind, t.x, t.fireFrame, t.touchTriggered, t.spawnTriggered, t.toggleOn, t.targetGroup, t.preApplied, og.c_str());
+                }
+                for (size_t ti = 0; ti < triggers.size(); ++ti) {
+                    const Trigger& t = triggers[ti];
+                    if (t.kind == TriggerKind::Spawn && t.x < 2000.f) {
+                        std::string og; for (int g : t.ownGroups) og += std::to_string(g) + ",";
+                        std::fprintf(stderr, "  SPAWN-TRIG ti=%zu x=%.2f fireFrame=%d targetGroup=%d spawnDelay=%.2f preApplied=%d spawnTrig=%d touchTrig=%d ownGroups=%s\n",
+                                     ti, t.x, t.fireFrame, t.targetGroup, t.spawnDelay, t.preApplied, t.spawnTriggered, t.touchTriggered, og.c_str());
+                    }
+                }
+            }
             if (!active) continue;                              // toggled off → no collision
             if (std::abs(pos.x - p.pos.x) > 220.f) continue;    // not actually in reach now
             auto& oc = movable[idx];
@@ -476,6 +580,62 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
         const double v0 = (p.input * 2 - 1) * player_speeds[(int)p.speed]
                           * (p.small ? 2.0 : 1.0);
         p.pos.y += (float)(2.0 * p.grav(v0) * p.dt);
+    }
+
+    // Same fix, generalized to Cube/Robot (2026-08-10): these modes carry a TRUE
+    // accumulated `velocity` (not wave's per-frame-recomputed synthetic one), but
+    // preCollision integrates Y with it BEFORE this frame's gravity-orb/portal
+    // effect can flip upsideDown — same one-frame-stale-gravity bug as the wave
+    // case above, just never generalized past wave. FOUND via the macro-demonlist
+    // batch (level 82172844 "Cobwebs"): a cube clicks a gravity orb mid-fall, and
+    // the very next frame reports a DEEP (15.7×13.8u) "block-side" overlap that a
+    // real, human-verified-clearing run does not hit.
+    //
+    // TWICE-CORRECTED same day. v1 used `2*grav_new(velocity)` (wave's shortcut,
+    // but velocity there is a fresh per-frame value; here it's the POST-effect
+    // p.velocity) — wrong because a gravity-flip ORB (Blue/Green/1751, Orb.cpp)
+    // and a gravity PAD both set p.velocity AND p.velocityOverride=true in the same
+    // collide() call: that override means the boost is explicitly DEFERRED to next
+    // frame (see orb_touch_timing_sameframe / Orb.cpp's own comment — "the orb
+    // frame still moves with the OLD velocity"), so using the already-boosted
+    // p.velocity here un-defers it a frame early (measured: INCREASED the Cobwebs
+    // overlap, 13.8u -> 15.4u). v2 tried "undo old, redo new" using preFrameVelocity
+    // for the old term but p.velocity (still post-effect) for the new term — same
+    // bug, just reshaped; it improved penX but left penY worse (17.56u) since it's
+    // still reading the boosted velocity.
+    //
+    // The correct form drops p.velocity entirely and mirrors the wave formula
+    // exactly: 2*grav_new(preFrameVelocity). Proof it's right for BOTH cases below
+    // (grav_old(v) == -grav_new(v) on any flip, so undo+redo of the SAME v collapses
+    // to 2x — this is just that shortcut applied to the value preCollision actually
+    // used, preFrameVelocity, instead of the post-effect velocity):
+    //  - DEFERRED (orb/pad, velocityOverride=true): postCollision's OWN semi-implicit
+    //    resync is gated off by `!velocityOverride`, so this is the ONLY correction
+    //    that runs this frame. Net Y this frame = grav_old(preFrameVelocity)*dt
+    //    [preCollision] + 2*grav_new(preFrameVelocity)*dt [this] =
+    //    grav_new(preFrameVelocity)*dt — old (pre-boost) velocity, new gravity sign.
+    //    Exactly the deferred model: gravity flips immediately, the velocity SET
+    //    lands next frame.
+    //  - NOT DEFERRED (GravityPortal: sets velocity=-v/2 with no override):
+    //    postCollision's semi-implicit resync DOES still fire afterward — its delta
+    //    is `grav_new(v_final)*dt - grav_new(preFrameVelocity)*dt` (v_final = velocity
+    //    after the portal AND this frame's gravity accel). Added to this correction's
+    //    net (grav_new(preFrameVelocity)*dt), the preFrameVelocity terms cancel
+    //    exactly, leaving grav_new(v_final)*dt — the correct single semi-implicit
+    //    step using the frame's true final velocity. Using post-effect p.velocity
+    //    here (v1/v2) instead double-counted against that same postCollision resync.
+    // Excludes Spider (its own orb grounds + repositions Y explicitly, so this
+    // would double-correct) and Ball/Ufo/Ship/Swing (their flip handling is
+    // already separate — Ball flips via its own clamp() on ceiling contact, not a
+    // portal touch mid-frame the way this generic effects-order gap applies to).
+    else if (p.upsideDown != upBeforeEffects && !p.dead && !p.grounded
+             && (p.vehicle.type == VehicleType::Cube || p.vehicle.type == VehicleType::Robot)
+             && !getenv("GDSIM_NOCUBEFLIPCORR")) {
+        double delta = 2.0 * p.grav(p.preFrameVelocity) * p.dt;
+        if (getenv("GDSIM_GRAVFLIP_DEBUG"))
+            std::fprintf(stderr, "GRAVFLIP-CORR f=%d preFrameVel=%.3f velocity=%.3f upBefore=%d upAfter=%d delta=%.3f posY_before=%.3f posY_after=%.3f\n",
+                         p.frame, p.preFrameVelocity, p.velocity, upBeforeEffects, p.upsideDown, delta, p.pos.y, p.pos.y + (float)delta);
+        p.pos.y += (float)delta;
     }
 
     for (int i = (int)blocks.size() - 1; i >= 0; --i) {

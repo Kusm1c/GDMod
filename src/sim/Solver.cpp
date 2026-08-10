@@ -405,6 +405,37 @@ static SolverResult solveLevelImpl(const std::string& levelStr,
         }
         dlog("ZERO-MARGIN CHECK: OK — completes at real physics too");
 
+        // Click-rate compliance gate (2026-08-10): only Beam's OWN move-generation
+        // enforces cfg.minClickGap (Solver_Beam.cpp) — PathSeeker's random-toggle
+        // search and the Greedy/GA fallbacks below do not, so a solution reaching
+        // this point via one of THEM could contain a tighter-than-requested click
+        // pair. Previously this was handled by never even trying those solvers
+        // when a click cap was set (see the "Human-limits beam failed; not
+        // falling back" comment above) — but that meant a single hard spot
+        // anywhere in a long level (that beam's BFS-style search got stuck on,
+        // regardless of click rate) made the WHOLE solve fail immediately,
+        // discarding PathSeeker/Greedy/GA's genuinely different search
+        // strategies entirely. Now every solver gets a chance, and this checks
+        // the ACTUAL resulting click gaps directly — reject (fall through to the
+        // next solver) only if the found solution truly needs faster clicking
+        // than requested, rather than refusing to look at all.
+        if (cfg.minClickGap > 0) {
+            std::vector<SolverClick> sorted = clicks;
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const SolverClick& a, const SolverClick& b) { return a.pressFrame < b.pressFrame; });
+            for (size_t i = 1; i < sorted.size(); ++i) {
+                int64_t gap = (int64_t)sorted[i].pressFrame - (int64_t)sorted[i - 1].pressFrame;
+                if (gap < cfg.minClickGap) {
+                    dlog("CLICK-RATE CHECK: FAILS — gap=" + std::to_string(gap) + "f between clicks at f="
+                         + std::to_string(sorted[i - 1].pressFrame) + " and f=" + std::to_string(sorted[i].pressFrame)
+                         + " (need >=" + std::to_string(cfg.minClickGap) + "f) — via " + via + ", NOT a human-rate solve");
+                    if (prog) prog->addLog(std::string(via) + " found a solve but it needs faster clicking than requested — discarding");
+                    return false;
+                }
+            }
+            dlog("CLICK-RATE CHECK: OK — every click gap respects the requested cap");
+        }
+
         result.solved      = true;
         result.clicks      = std::move(clicks);
         result.framesTotal = (int)cfg.maxFrames;
@@ -441,19 +472,16 @@ static SolverResult solveLevelImpl(const std::string& levelStr,
             writeProfile("CANCELLED during beam");
             return result;
         }
-        // Under human limits, the other solvers don't enforce the click-rate cap,
-        // so falling through would produce a superhuman solution. Stop here.
-        if (cfg.minClickGap > 0) {
-            int cps = (int)((1.0 / (double)cfg.dt) / cfg.minClickGap + 0.5); // actual fps, not hardcoded 240
-
-            result.message = "No solution within human limits (~" + std::to_string(cps)
-                           + " clicks/s). Open View Level to see how far it got — it needs "
-                             "faster input there.";
-            dlog("Human-limits beam failed; not falling back to unconstrained solvers");
-            if (prog) { prog->addLog(result.message); prog->done.store(true); }
-            writeProfile("FAILED: beam under human limits (inflate=" + f2(cfg.hazardInflate) + ")");
-            return result;
-        }
+        // Beam failed (or "succeeded" but violated the click-rate cap — see
+        // finalizeSolved's CLICK-RATE CHECK) — fall through to PathSeeker/Greedy/
+        // GA regardless of cfg.minClickGap (2026-08-10, was previously blocked
+        // here entirely under human limits — see this function's git history —
+        // which meant one hard spot anywhere in the level failed the WHOLE solve
+        // instantly instead of giving PathSeeker's genuinely different search
+        // strategy a chance). Each fallback's own finalizeSolved call re-checks
+        // click-rate compliance on ITS result, so this can't silently accept a
+        // superhuman solution — it can only find one that's ACTUALLY human-rate,
+        // via whichever algorithm happens to reach it.
         result.clicks.clear();   // unconstrained fall-through reconstructs its own path
         dlog("Beam search did not solve — falling back to randomized path seeker");
         if (prog) prog->addLog("Beam search failed — trying randomized...");

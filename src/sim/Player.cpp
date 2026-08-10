@@ -4,6 +4,8 @@
 #include "Calib.hpp"
 #include <cmath>
 #include <climits>
+#include <cstdio>
+#include <cstdlib>
 
 namespace gdsim {
 
@@ -182,8 +184,13 @@ void Player::preCollision(bool pressed) {
 }
 
 void Player::postCollision() {
-    if (small != prevPlayer().small)
+    if (small != prevPlayer().small) {
+        Vec2D oldSize = size;
         size = small ? (size * 0.6f) : (size / 0.6f);
+        if (getenv("GDSIM_SIZE_DEBUG"))
+            std::fprintf(stderr, "SIZE-TOGGLE f=%d small=%d oldSize=(%f,%f) newSize=(%f,%f) veh=%d\n",
+                         frame, small, oldSize.x, oldSize.y, size.x, size.y, (int)vehicle.type);
+    }
 
     if (gravBottom(*this) <= gravFloor() && !velocityOverride && velocity <= 0) {
         pos.y = grav(gravFloor()) + grav(size.y / 2);
@@ -199,6 +206,9 @@ void Player::postCollision() {
 #endif
 
     if (pos.y > 1476.3f || (upsideDown && getBottom() < floor)) {
+        if (getenv("GDSIM_BOUNDS_DEBUG"))
+            std::fprintf(stderr, "BOUNDS f=%d pos.y=%f getBottom=%f floor=%f ceiling=%f size.y=%f upsideDown=%d small=%d\n",
+                         frame, pos.y, getBottom(), floor, ceiling, size.y, upsideDown, small);
         dead = true; deathCause = "bounds";
         return;
     }

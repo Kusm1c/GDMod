@@ -22,6 +22,7 @@ enum class TriggerKind { Move, Rotate, Toggle, Alpha, Spawn, Follow };
 struct Trigger {
     TriggerKind kind = TriggerKind::Move;
     float    x = 0.f;             // activation X (the trigger object's position.x)
+    float    y = 0.f;             // activation Y (field 3) — only used by touchTriggered
     int      targetGroup = 0;     // group to affect / spawn (field 51)
 
     // Spawn trigger (1268): when it fires, every spawn-triggered trigger that is a

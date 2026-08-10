@@ -5,6 +5,8 @@
 #include <cmath>
 #include <array>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace gdsim {
 
@@ -177,7 +179,26 @@ void Block::collide(Player& p) const {
     // collision could occur. Two unrelated levels (BOOBAWAMBA, Saul Goodman) showed
     // the IDENTICAL frame-1 death coordinates, confirming this is systemic, not a
     // per-level geometry fluke.
-    if (blockHit && p.prevPlayer().blockDeathHitbox().intersects(*this)) blockHit = false;
+    //
+    // notNewCollision tracks WHY blockHit went false here, separately from the
+    // graze-tolerance case above. FOUND 2026-08-10 (macro-demonlist level 82172844
+    // "Cobwebs", ground truth Cobwebs.gdr2): once the small 7×7 hitbox is fully
+    // swallowed by a block (common right after a gravity-flip orb's same-frame Y
+    // jump), it reports the SAME saturated penX/penY on every subsequent frame, so
+    // this rule keeps forgiving it as "not new" frame after frame — correctly, since
+    // by ITS OWN reasoning (no transition into contact) there's nothing to kill on.
+    // But the code below used to fall through into the block-SIDE branch (the
+    // oversized-hitbox rising-corner check) regardless of WHY blockHit was false,
+    // re-evaluating the exact same continuing contact with a totally different
+    // (much bigger) hitbox and re-killing it anyway — directly contradicting the
+    // "not new, don't kill" verdict this rule just made. The block-side branch's
+    // actual job is to catch what the GRAZE tolerance (above) wrongly excused, not
+    // to second-guess this rule, so only let it run in that case.
+    bool notNewCollision = false;
+    if (blockHit && p.prevPlayer().blockDeathHitbox().intersects(*this)) {
+        blockHit = false;
+        notNewCollision = true;
+    }
 
     if (blockHit) {
         p.dead = true; p.deathCause = "block";
@@ -206,7 +227,7 @@ void Block::collide(Player& p) const {
                 p.velocity = 0;
             }
         } else if ((p.vehicle.type == VehicleType::Cube || p.vehicle.type == VehicleType::Robot
-                    || p.vehicle.type == VehicleType::Spider) && p.grav(p.velocity) > 0) {
+                    || p.vehicle.type == VehicleType::Spider) && p.grav(p.velocity) > 0 && !notNewCollision) {
             // The 7×7 inner death-box missed and this isn't a top-landing (the player
             // is RISING into a block's side/corner). The 7×7 is only lenient for the
             // top-corner graze you get while LANDING; a deep overlap on the way UP is a
@@ -228,6 +249,10 @@ void Block::collide(Player& p) const {
             // deep" at truth 144641895's real death) once frame-indexing is aligned.
             // 10.0 sits inside both levels' required range.
             constexpr float kSideSmashPen = 10.f;
+            if (getenv("GDSIM_BLOCKSIDE_DEBUG"))
+                std::fprintf(stderr, "BLOCKSIDE-CHECK f=%llu typeId=%d pos=(%.2f,%.2f) rot=%.2f size=(%.2f,%.2f) penX=%.2f penY=%.2f playerXY=(%.2f,%.2f) upsideDown=%d velraw=%.2f\n",
+                             (unsigned long long)p.frame, typeId, pos.x, pos.y, rotation, size.x, size.y,
+                             penX, penY, p.pos.x, p.pos.y, p.upsideDown, p.velocity);
             if (penX > kSideSmashPen && penY > kSideSmashPen) {
                 p.dead = true; p.deathCause = "block-side";
                 p.deathObjType = typeId; p.deathObjPos = pos;
