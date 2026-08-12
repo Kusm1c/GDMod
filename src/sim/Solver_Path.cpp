@@ -111,6 +111,10 @@ bool solveLevelPath(Level& sim, float end, const SolverConfig& cfg,
         if (cancelled && cancelled->load()) {
             dlog("PathSeeker cancelled"); extractClicks(out); return false;
         }
+        waitWhilePaused(cfg, cancelled);
+        if (cancelled && cancelled->load()) {
+            dlog("PathSeeker cancelled (while paused)"); extractClicks(out); return false;
+        }
         if (elapsed() > kLimit) {
             dlog("PathSeeker timeout, best X=" + std::to_string((int)sim.latestState().pos.x));
             if (prog) prog->addLog("Randomized search timeout");
@@ -250,6 +254,7 @@ void optimizeClicks(Level& sim, float end, const SolverConfig& cfg,
 
     int removed = 0;
     for (int i = (int)clicks.size() - 1; i >= 0; --i) {
+        waitWhilePaused(cfg, cancelled);
         if (cancelled && cancelled->load()) break;
         auto c = clicks[i];
 
@@ -321,6 +326,7 @@ void consolidateClicks(Level& sim, float end, const SolverConfig& cfg,
     const int before = (int)clicks.size();
     size_t i = 0;
     while (i + 1 < clicks.size()) {
+        waitWhilePaused(cfg, cancelled);
         if (cancelled && cancelled->load()) break;
 
         // Try to absorb the next tap into this one: lengthen this hold by the
@@ -369,6 +375,7 @@ void centerClicks(Level& sim, float end, const SolverConfig& cfg,
     int      centered = 0;
     uint64_t prevRf   = 0; // keep clicks from colliding with the previous one
     for (size_t i = 0; i < clicks.size(); ++i) {
+        waitWhilePaused(cfg, cancelled);
         if (cancelled && cancelled->load()) break;
 
         const SolverClick cur  = clicks[i];
@@ -580,6 +587,7 @@ void robustifyClicks(Level& sim, float end, const SolverConfig& cfg,
     int steps = 0, applied = 0;
 
     while (base.minClear < wantClear && steps < kMaxSteps) {
+        waitWhilePaused(cfg, cancelled);
         if (cancelled && cancelled->load()) break;
         ++steps;
 

@@ -59,6 +59,38 @@ ZeroMarginResult verifyZeroMargin(const std::string& levelStr,
     // retry loop stops at the first attempt THIS check calls ok, so a false "OK"
     // wastes the rest of the adaptive-margin/algorithm cascade on a doomed attempt
     // instead of continuing to search for one that's genuinely zero-margin-safe.
+    // REAL BUG FOUND 2026-08-12 (concrete, deterministic, evidence-backed — not the
+    // path-dependent toggle theory below, which a level with ZERO movable objects
+    // (DeCode, 2997354) disproved for at least this case): g_solveShipBlockClearance
+    // / g_solveRobotBlockClearance (Calib.hpp) are GLOBAL, not per-Level — solveLevel()
+    // sets them live for the whole solveLevelImpl() call and only resets them to 0 in
+    // its own MarginGuard destructor, which fires when solveLevel() itself returns —
+    // i.e. AFTER this function (called from deep inside solveLevelImpl, via
+    // finalizeSolved) has already run. So while this function correctly zeroes
+    // hazardInflate/flightHazardInflate on its own fresh zeroSim, blockDeathHitbox()
+    // (Player.cpp) still reads the SOLVING-TIME block clearance margins (3-7 units by
+    // default) for every frame of this "zero-margin" replay — it was never actually
+    // zero-margin for solid-block collisions. A solve that only survives a tight
+    // block-side/robot-clearance spot BECAUSE of that margin passes this check, then
+    // dies with cause="block-side" on any later, genuinely-zero-margin replay — proven
+    // via three independent standalone replays of a real DeCode solve, 100%
+    // reproducible at the identical frame every time (not flaky/path-dependent at
+    // all, unlike the toggle-group theory this comment block used to solely blame).
+    // Fix: zero these globals too, for the exact duration of this check, then restore
+    // the solving-time values so the rest of solveLevelImpl (post-processing passes
+    // that run AFTER a passing check) keeps using the real margin as intended.
+    struct BlockMarginGuard {
+        float savedShip, savedRobot;
+        BlockMarginGuard() : savedShip(g_solveShipBlockClearance), savedRobot(g_solveRobotBlockClearance) {
+            g_solveShipBlockClearance = 0.f;
+            g_solveRobotBlockClearance = 0.f;
+        }
+        ~BlockMarginGuard() {
+            g_solveShipBlockClearance = savedShip;
+            g_solveRobotBlockClearance = savedRobot;
+        }
+    } blockMarginGuard;
+
     Level zeroSim(levelStr);
     zeroSim.hazardInflate = 0.f;
     zeroSim.flightHazardInflate = 0.f;
@@ -573,6 +605,9 @@ static SolverResult solveLevelImpl(const std::string& levelStr,
             writeProfile("CANCELLED during greedy");
             return result;
         }
+        // Cooperative pause — greedy's restart loop is the other phase that can
+        // visibly run for a long time.
+        waitWhilePaused(cfg, cancelled);
 
         // Forward pass ───────────────────────────────────────────────────────
         sim.rollback(0);

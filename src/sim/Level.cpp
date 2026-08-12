@@ -446,7 +446,7 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
     if (&currSection != &prevSection) secs[1] = currSection;
     if (&nextSection != &currSection) secs[2] = nextSection;
 
-    std::vector<ObjectContainer> blocks, hazards, effects;
+    std::vector<ObjectContainer> blocks, hazards, effects, modifiers;
     blocks.reserve(100);
     hazards.reserve(100);
 
@@ -456,6 +456,7 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
             if (p.dead) break;
             if (o->prio == 1)      blocks.push_back(o);
             else if (o->prio == 2) hazards.push_back(o);
+            else if (o->prio == 3) { if (o->touching(p)) modifiers.push_back(o); }
             else if (o->touching(p)) effects.push_back(o);  // collide in X order below
         }
     }
@@ -539,8 +540,20 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
             o->rotation = rot;
             if (o->prio == 1)      blocks.push_back(oc);
             else if (o->prio == 2) hazards.push_back(oc);
+            else if (o->prio == 3) { if (o->touching(p)) modifiers.push_back(oc); }
             else if (o->touching(p)) effects.push_back(oc);
         }
+    }
+
+    // Special letter blocks (J/S/H/F/Force — see SpecialBlock.hpp): resolve BEFORE
+    // anything else this frame. Real GD reads/writes these as flags/state that the
+    // jump-buffer, dash, block-death, and gravity logic below all consult
+    // synchronously, so they must never depend on where a modifier happens to fall
+    // in the effects bucket's left-to-right X sort (a modifier co-located with the
+    // thing it modifies isn't guaranteed to sort before it).
+    for (auto& m : modifiers) {
+        if (p.dead) break;
+        if (m->touching(p)) m->collide(p);
     }
 
     // Apply effects (portals/orbs/pads) in the order the player ENCOUNTERS them —

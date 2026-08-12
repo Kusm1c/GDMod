@@ -95,6 +95,19 @@ extern std::unordered_map<int, ReplayRuntimeHitboxSnapshot> g_runtimeHitboxSnaps
 void storeRuntimeHitboxSnapshot(ReplayRuntimeHitboxSnapshot snapshot);
 std::optional<ReplayRuntimeHitboxSnapshot> getRuntimeHitboxSnapshot(int levelId);
 
+// The most recently solved replay, kept around purely so the "Export..." button in
+// PathfinderMenuPopup (hooks_menu.cpp) can re-encode it to a user-chosen path at any
+// point after the solve finishes — doSimulate itself no longer launches the level
+// automatically (see that function's own comment), so this is the only way to reach
+// a fresh solve's data afterward.
+struct LastSolvedExport {
+    bool available = false;
+    int levelId = 0;
+    std::string levelName;
+    ReplayLoadResult replay;
+};
+extern LastSolvedExport g_lastSolvedExport;
+
 std::optional<ReplayLoadResult> loadMatchingReplay(int levelId);
 bool saveReplayToLocalJson(int levelId, const ReplayLoadResult& replay, std::filesystem::path preferredPath = {});
 void convertGdr2File(const std::filesystem::path& path);
@@ -103,3 +116,8 @@ std::vector<uint8_t> exportReplayToGdr2(const ReplayLoadResult& replay, int leve
 // Prefers the Eclipse replays folder so it's directly playable in-game; always also
 // writes a copy in the mod save dir. Returns the primary output path, or "" on failure.
 std::string writeSolvedGdr2(int levelId, const std::string& levelName, const ReplayLoadResult& replay);
+// Write a solved replay as a .gdr2 to an EXACT user-chosen path (the "Export..."
+// button's save-file dialog) — same binary encoding as writeSolvedGdr2, just no
+// folder-guessing/fallback logic. Returns true on success.
+bool writeGdr2ToExactPath(const std::filesystem::path& path, int levelId,
+                          const std::string& levelName, const ReplayLoadResult& replay);

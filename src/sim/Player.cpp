@@ -121,6 +121,9 @@ void Player::preCollision(bool pressed) {
     velocityOverride = false;
     gravityPortal = false;
     roundVelocity = true;
+    touchingJBlock = false;
+    touchingSBlock = false;
+    touchingHBlock = false;
 
     if (button != pressed) {
         button = pressed;
@@ -141,24 +144,6 @@ void Player::preCollision(bool pressed) {
     // other modes: their velocity is set in postCollision and is untouched here.
     if (vehicle.type == VehicleType::Wave) {
         velocity = (input * 2 - 1) * player_speeds[speed] * (small ? 2.f : 1.f);
-        // Wave dart-slide state (real: m_stateDartSlide). REVISED 2026-08-06: an
-        // earlier attempt only refreshed this from an active slope/block grip — that
-        // regressed against a real ground-truth replay (Delirium.gdr, level 68839068):
-        // a wave that had NEVER touched a slope still safely rides a block on its
-        // first-ever contact in real GD, which "must earn safety via prior contact"
-        // cannot explain. Revised model: a wave is "sliding-eligible" by default for
-        // every frame it has been in Wave mode for at least one frame — the exceptional
-        // "not sliding, ANY touch is lethal" case (matching the decompiled
-        // collidedWithObjectInternal/collidedWithSlopeInternal `stateDartSlide<1` gate)
-        // is the single transition frame right after entering Wave (portal/spawn),
-        // before it starts at 0 below. Unvalidated against a decompiled SETTER site
-        // (none found) — validated empirically instead: 13/13 regression clean, and
-        // improves (not regresses) the Delirium.gdr cross-check. Treat as an
-        // approximation pending better ground truth, same as blockDeathHitbox's 7×7.
-        if (prevPlayer().vehicle.type == VehicleType::Wave)
-            slopeData.dartSlide = 4;
-        else
-            slopeData.dartSlide = 0;
     }
 
     // Dash orb: sustain the angled glide while the button stays held; releasing

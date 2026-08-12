@@ -17,6 +17,7 @@ ReplayExternalCommands g_replayExternalCommands;
 std::optional<std::filesystem::path> g_lastMatchedLocalReplayPath;
 std::atomic<bool> g_autoRepairRequested{false};
 std::atomic<bool> g_confirmRequested{false};
+LastSolvedExport g_lastSolvedExport;
 std::mutex g_runtimeHitboxSnapshotsMutex;
 std::unordered_map<int, ReplayRuntimeHitboxSnapshot> g_runtimeHitboxSnapshots;
 #ifdef GEODE_IS_WINDOWS
@@ -784,6 +785,17 @@ std::string writeSolvedGdr2(int levelId, const std::string& levelName, const Rep
     if (writeTo(modDir) && primary.empty())
         primary = (modDir / fileName).string();
     return primary;
+}
+
+bool writeGdr2ToExactPath(const std::filesystem::path& path, int levelId,
+                          const std::string& levelName, const ReplayLoadResult& replay) {
+    auto gdr2Data = exportReplayToGdr2(replay, levelId, levelName);
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    std::ofstream ofs(path, std::ios::binary);
+    if (!ofs) return false;
+    ofs.write(reinterpret_cast<const char*>(gdr2Data.data()), gdr2Data.size());
+    return ofs.good();
 }
 
 // ============================================================

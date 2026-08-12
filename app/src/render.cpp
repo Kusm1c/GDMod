@@ -1,4 +1,5 @@
 #include "render.hpp"
+#include "../../src/sim/Slope.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -87,6 +88,49 @@ static bool isSawblade(int typeId) {
     }
 }
 
+// Exact typeId sets gdsim's Object factory (src/sim/Object.cpp) constructs as
+// Slope / SlopeHazard. These inherit Block's prio=1 (Slope) even though their
+// true shape is a right triangle, not the full bounding rect — and their
+// `rotation` field is always reset to 0 in the constructor, using the
+// separate `orientation` (0-3) field instead (not visible on the generic
+// Object interface). Without special-casing these, they render as plain
+// grey/solid rectangles: visually indistinguishable from a flat platform,
+// i.e. "slopes are missing" (found 2026-08-10, real playtest report).
+static bool isSlope(int typeId) {
+    switch (typeId) {
+        case 289: case 294: case 299: case 305: case 309: case 315: case 321: case 326:
+        case 331: case 337: case 343: case 349: case 353: case 363: case 371: case 483:
+        case 492: case 651: case 665: case 673: case 709: case 711: case 726: case 728:
+        case 886: case 1338: case 1341: case 1344: case 1723: case 1743: case 1745:
+        case 1747: case 1749: case 1906:
+        case 291: case 295: case 301: case 307: case 311: case 317: case 323: case 327:
+        case 333: case 339: case 345: case 351: case 355: case 364: case 366: case 367:
+        case 372: case 484: case 493: case 652: case 666: case 674: case 710: case 712:
+        case 727: case 729: case 887: case 1339: case 1342: case 1345: case 1724:
+        case 1744: case 1746: case 1748: case 1750: case 1907:
+            return true;
+        default:
+            return false;
+    }
+}
+static bool isSlopeHazard(int typeId) { return typeId == 1717 || typeId == 1718; }
+
+// Right-triangle vertices (LOCAL box space, box already centred at the
+// object's own pos) for each of gdsim's 4 slope orientations — derived
+// directly from Slope::touching()/expectedY()'s line-test formulas
+// (src/sim/Slope.cpp): orientation 0/2 have the diagonal running
+// bottom-left-to-top-right, 1/3 top-left-to-bottom-right; 0/1 are floor
+// slopes (solid below the line), 2/3 are ceiling slopes (solid above).
+static void slopeTriangle(int orientation, float hw, float hh, Vector2 out[3]) {
+    Vector2 bl{-hw, -hh}, br{hw, -hh}, tl{-hw, hh}, tr{hw, hh};
+    switch (orientation) {
+        case 0: out[0] = bl; out[1] = br; out[2] = tr; break;
+        case 1: out[0] = bl; out[1] = tl; out[2] = br; break;
+        case 2: out[0] = bl; out[1] = tl; out[2] = tr; break;
+        default: out[0] = tl; out[1] = br; out[2] = tr; break; // 3
+    }
+}
+
 static void drawObject(const gdsim::Object* o, float x, float y, float rotDeg,
                         const Camera2DState& cam, int screenW, int screenH) {
     // Cull cheaply in world space before ever touching raylib.
@@ -94,16 +138,78 @@ static void drawObject(const gdsim::Object* o, float x, float y, float rotDeg,
     float viewHalfW = screenW * 0.5f / cam.pixelsPerUnit + halfSpan;
     if (std::fabs(x - cam.x) > viewHalfW) return;
 
+    if (isSlope(o->typeId) || isSlopeHazard(o->typeId)) {
+        // Safe: ObjectContainer's storage genuinely holds a Slope/SlopeHazard
+        // instance whenever typeId matches this table (same type-erasure
+        // pattern ObjectContainer::operator-> itself already relies on).
+        const gdsim::Slope* slope = reinterpret_cast<const gdsim::Slope*>(o);
+        float hw = o->size.x * 0.5f, hh = o->size.y * 0.5f;
+        Vector2 local[3];
+        slopeTriangle(slope->orientation, hw, hh, local);
+        Vector2 s[3];
+        for (int i = 0; i < 3; i++)
+            s[i] = worldToScreen(x + local[i].x, y + local[i].y, cam, screenW, screenH);
+        bool hazard = isSlopeHazard(o->typeId);
+        Color fill = hazard ? Color{200, 60, 60, 220} : Color{90, 90, 100, 255};
+        Color outline = hazard ? Color{255, 140, 140, 255} : Color{160, 160, 175, 255};
+        DrawTriangle(s[0], s[1], s[2], fill);
+        DrawLineEx(s[0], s[1], 1.5f, outline);
+        DrawLineEx(s[1], s[2], 1.5f, outline);
+        DrawLineEx(s[2], s[0], 1.5f, outline);
+        return;
+    }
+
     if (o->prio == 1) {
         // Solid block: the object's full bounding box IS the real hitbox here
         // (Block.cpp collides against it directly, mod a small graze
         // tolerance that isn't worth drawing at this scale).
+        // D block (id 1755, GD Creator School "special letter block" — see
+        // SpecialBlock.hpp): the one block a WAVE can safely touch. Highlighted
+        // distinctly since it's otherwise an invisible-in-game modifier and this
+        // is exactly the thing the user's original wave-through-wall report
+        // needed to see.
+        bool dBlock = (o->typeId == 1755);
+        Color fill    = dBlock ? Color{30, 130, 150, 210} : Color{90, 90, 100, 255};
+        Color outline = dBlock ? Color{90, 220, 235, 255} : Color{160, 160, 175, 255};
         float hw = o->size.x * 0.5f, hh = o->size.y * 0.5f;
         Vector2 wpts[4] = {
             rotateLocal(-hw, -hh, rotDeg, x, y), rotateLocal(hw, -hh, rotDeg, x, y),
             rotateLocal(hw, hh, rotDeg, x, y),   rotateLocal(-hw, hh, rotDeg, x, y),
         };
-        drawWorldQuad(wpts, cam, screenW, screenH, Color{90, 90, 100, 255}, Color{160, 160, 175, 255}, 1.5f);
+        drawWorldQuad(wpts, cam, screenW, screenH, fill, outline, 1.5f);
+        if (dBlock) {
+            Vector2 c = worldToScreen(x, y, cam, screenW, screenH);
+            int fontSize = 12;
+            int tw = MeasureText("D", fontSize);
+            DrawText("D", (int)(c.x - tw * 0.5f), (int)(c.y - fontSize * 0.5f), fontSize, Color{220, 255, 255, 255});
+        }
+    } else if (o->prio == 3) {
+        // Special letter block (J/S/H/F/Force — SpecialBlock.hpp): invisible in
+        // real GD, shown here as a labelled translucent marker since making
+        // invisible-in-game state visible is the whole point of this debug app
+        // (same reasoning as the continuous hitbox trail).
+        const char* label = "?";
+        Color c = RAYWHITE;
+        switch (o->typeId) {
+            case 1813: label = "J";  c = Color{255, 210, 60, 255};  break; // Stop Jump Buffer
+            case 1829: label = "S";  c = Color{255, 120, 60, 255};  break; // Stop Dash
+            case 1859: label = "H";  c = Color{120, 200, 255, 255}; break; // Allow Head Collision
+            case 2866: label = "F";  c = Color{200, 120, 255, 255}; break; // Gravity Flip
+            case 2069: label = "FS"; c = Color{160, 255, 160, 255}; break; // Force (square)
+            case 3645: label = "FC"; c = Color{160, 255, 160, 255}; break; // Force (circle)
+        }
+        float hw = o->size.x * 0.5f, hh = o->size.y * 0.5f;
+        Vector2 wpts[4] = {
+            rotateLocal(-hw, -hh, rotDeg, x, y), rotateLocal(hw, -hh, rotDeg, x, y),
+            rotateLocal(hw, hh, rotDeg, x, y),   rotateLocal(-hw, hh, rotDeg, x, y),
+        };
+        Vector2 s[4];
+        for (int i = 0; i < 4; i++) s[i] = worldToScreen(wpts[i].x, wpts[i].y, cam, screenW, screenH);
+        for (int i = 0; i < 4; i++) DrawLineEx(s[i], s[(i + 1) % 4], 1.5f, Color{c.r, c.g, c.b, 150});
+        Vector2 center = worldToScreen(x, y, cam, screenW, screenH);
+        int fontSize = 12;
+        int tw = MeasureText(label, fontSize);
+        DrawText(label, (int)(center.x - tw * 0.5f), (int)(center.y - fontSize * 0.5f), fontSize, c);
     } else if (o->prio == 2) {
         // Hazard: draw the object's nominal sprite footprint as a faint
         // outline (context only — NOT collision-relevant) and the actual
@@ -152,8 +258,7 @@ static void drawObject(const gdsim::Object* o, float x, float y, float rotDeg,
     }
 }
 
-void drawLevel(const gdsim::Level& level, const gdsim::Player& player,
-               const Camera2DState& cam, int screenW, int screenH) {
+void drawLevelGeometry(const gdsim::Level& level, const Camera2DState& cam, int screenW, int screenH) {
     float viewHalfW = screenW * 0.5f / cam.pixelsPerUnit + 40.f;
     float loX = cam.x - viewHalfW, hiX = cam.x + viewHalfW;
 
@@ -165,6 +270,14 @@ void drawLevel(const gdsim::Level& level, const gdsim::Player& player,
             drawObject(o, o->pos.x, o->pos.y, o->rotation, cam, screenW, screenH);
         }
     }
+}
+
+void drawLevel(const gdsim::Level& level, const gdsim::Player& player,
+               const Camera2DState& cam, int screenW, int screenH) {
+    drawLevelGeometry(level, cam, screenW, screenH);
+
+    float viewHalfW = screenW * 0.5f / cam.pixelsPerUnit + 40.f;
+    float loX = cam.x - viewHalfW, hiX = cam.x + viewHalfW;
 
     if (level.hasTriggers) {
         for (size_t idx = 0; idx < level.movable.size(); idx++) {
@@ -184,19 +297,116 @@ void drawLevel(const gdsim::Level& level, const gdsim::Player& player,
     // comment). Drawing the player rotated would be exactly the same kind
     // of "looks like a hit/miss but isn't" mismatch as the old hazard
     // triangle, so the full box below is deliberately NOT rotated.
+    //
+    // REVISED 2026-08-11: hazard/sawblade death now uses the full "Main"
+    // hitbox (Hazard.cpp, per GD Creator School's Advanced Hitboxes #1) —
+    // hazards are the dominant real-world death cause, so this is the box
+    // that matters most now; drawn filled/bright instead of the small one.
     Vector2 pc = worldToScreen(player.pos.x, player.pos.y, cam, screenW, screenH);
     float pw = player.size.x * cam.pixelsPerUnit;
     float ph = player.size.y * cam.pixelsPerUnit;
-    DrawRectangleLinesEx({pc.x - pw * 0.5f, pc.y - ph * 0.5f, pw, ph}, 1.5f, Color{120, 220, 160, 180});
+    DrawRectangle((int)(pc.x - pw * 0.5f), (int)(pc.y - ph * 0.5f), (int)pw, (int)ph,
+                  Color{80, 220, 120, 70});
+    DrawRectangleLinesEx({pc.x - pw * 0.5f, pc.y - ph * 0.5f, pw, ph}, 1.5f, Color{120, 220, 160, 220});
 
-    // The small 9x9 (mini-scaled) inner hitbox is what actually determines
-    // hazard/ceiling death (Player::innerHitbox) — drawn filled and bright
-    // since it's the part that matters.
+    // The small ~9x9 (mini-scaled) inner "Solid" hitbox — still what determines
+    // BLOCK and CEILING/bounds death (Block.cpp's blockDeathHitbox / innerHitbox
+    // ceiling clamp in Vehicle.cpp), just no longer hazards. Drawn as a plain
+    // outline now (secondary, not primary) so it's still visible without
+    // implying it's the hazard-relevant box.
     float innerSize = 9.f * (player.small ? 0.6f : 1.0f) * cam.pixelsPerUnit;
-    DrawRectangle((int)(pc.x - innerSize * 0.5f), (int)(pc.y - innerSize * 0.5f),
-                  (int)innerSize, (int)innerSize, Color{80, 220, 120, 255});
     DrawRectangleLines((int)(pc.x - innerSize * 0.5f), (int)(pc.y - innerSize * 0.5f),
-                        (int)innerSize, (int)innerSize, Color{20, 90, 40, 255});
+                        (int)innerSize, (int)innerSize, Color{255, 210, 90, 200});
+}
+
+void drawHitboxTrail(const std::vector<TrailPoint>& trail,
+                      const Camera2DState& cam, int screenW, int screenH) {
+    size_t n = trail.size();
+    if (n == 0) return;
+    for (size_t i = 0; i < n; i++) {
+        const TrailPoint& t = trail[i];
+        // Oldest samples are most transparent, newest fade in toward the
+        // current (opaque) hitbox drawn separately by drawLevel.
+        float age = (float)i / (float)n; // 0 = oldest, 1 = newest
+        unsigned char alpha = (unsigned char)(30 + age * 90);
+        // REVISED 2026-08-11: tracks the player's actual full "Main" hitbox
+        // now (hazard/sawblade-relevant, per Hazard.cpp), not the small ~9x9
+        // one — hazards are the dominant real death cause, so this is the box
+        // worth seeing swept out continuously. Uses the real per-vehicle size
+        // (e.g. wave is 10x10/6x6, not the cube's 30x30/18x18).
+        float sizeW = t.size.x * cam.pixelsPerUnit;
+        float sizeH = t.size.y * cam.pixelsPerUnit;
+        Vector2 c = worldToScreen(t.pos.x, t.pos.y, cam, screenW, screenH);
+        DrawRectangleLines((int)(c.x - sizeW * 0.5f), (int)(c.y - sizeH * 0.5f),
+                            (int)sizeW, (int)sizeH, Color{80, 220, 120, alpha});
+    }
+}
+
+gdsim::Vec2D screenToWorld(float sx, float sy, const Camera2DState& cam, int screenW, int screenH) {
+    return {
+        cam.x + (sx - screenW * 0.5f) / cam.pixelsPerUnit,
+        cam.y - (sy - screenH * 0.5f) / cam.pixelsPerUnit
+    };
+}
+
+PickedObject pickObjectNear(const gdsim::Level& level, gdsim::Vec2D worldPos, int frame) {
+    PickedObject best;
+    float bestDist = 1e18f;
+    auto consider = [&](const gdsim::Object* o, gdsim::Vec2D pos) {
+        float dx = pos.x - worldPos.x, dy = pos.y - worldPos.y;
+        float tolX = o->size.x * 0.5f + 3.f, tolY = o->size.y * 0.5f + 3.f;
+        if (std::fabs(dx) > tolX || std::fabs(dy) > tolY) return;
+        float dist = dx * dx + dy * dy;
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = PickedObject{true, o->typeId, o->prio, pos, o->size, o->rotation};
+        }
+    };
+
+    int sec = (int)(worldPos.x / gdsim::Level::sectionSize);
+    int loSec = std::max(0, sec - 1), hiSec = std::min((int)level.sections.size() - 1, sec + 1);
+    for (int s = loSec; s <= hiSec && s >= 0; s++)
+        for (auto& oc : level.sections[s])
+            consider(oc.operator->(), oc.operator->()->pos);
+
+    if (level.hasTriggers) {
+        for (size_t idx = 0; idx < level.movable.size(); idx++) {
+            gdsim::Vec2D pos; float rot; bool active;
+            level.poseMovable((int)idx, frame, pos, rot, active);
+            if (!active) continue;
+            consider(level.movable[idx].operator->(), pos);
+        }
+    }
+    return best;
+}
+
+void drawSolverViz(const gdsim::SolverProgressReport::VizSnapshot& snap,
+                    const Camera2DState& cam, int screenW, int screenH) {
+    // Trajectory: the solver's current best attempt, sampled every few frames
+    // (SolverProgressReport's own contract) — yellow if that attempt ended in
+    // death, green if it's still the live leading edge of the search.
+    if (snap.trajectory.size() >= 2) {
+        Color lineColor = snap.died ? Color{230, 210, 70, 255} : Color{90, 230, 120, 255};
+        for (size_t i = 1; i < snap.trajectory.size(); i++) {
+            Vector2 a = worldToScreen(snap.trajectory[i - 1].first, snap.trajectory[i - 1].second, cam, screenW, screenH);
+            Vector2 b = worldToScreen(snap.trajectory[i].first, snap.trajectory[i].second, cam, screenW, screenH);
+            DrawLineEx(a, b, 2.f, lineColor);
+        }
+    }
+
+    // Click markers: where each current click in the attempt was made.
+    for (auto& c : snap.clicks) {
+        Vector2 p = worldToScreen(c.x, c.y, cam, screenW, screenH);
+        DrawCircleV(p, 4.f, Color{120, 200, 255, 220});
+        DrawCircleLines((int)p.x, (int)p.y, 4.f, Color{20, 20, 30, 200});
+    }
+
+    // Death point: where this attempt's trajectory ended.
+    if (snap.died) {
+        Vector2 dp = worldToScreen(snap.deathPt.first, snap.deathPt.second, cam, screenW, screenH);
+        DrawLineEx({dp.x - 6, dp.y - 6}, {dp.x + 6, dp.y + 6}, 2.5f, Color{255, 70, 70, 255});
+        DrawLineEx({dp.x - 6, dp.y + 6}, {dp.x + 6, dp.y - 6}, 2.5f, Color{255, 70, 70, 255});
+    }
 }
 
 } // namespace gdapp

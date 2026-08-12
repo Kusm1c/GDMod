@@ -52,13 +52,17 @@ double Slope::angle() const {
 // of the query box is on the empty side of the line, there is no real overlap.
 bool Slope::touching(Player const& p) const {
     if (!Object::touching(p)) return false;   // cheap broad-phase AABB reject first
+    return triangleOverlaps(p);
+}
+
+bool Slope::triangleOverlaps(Entity const& box) const {
     double ratio = (double)size.y / (double)size.x;
     auto lineY = [&](float x) -> double {
         double posRelative = ratio * (x - getLeft());
         return (angle() > 0) ? (getBottom() + posRelative) : (getTop() - posRelative);
     };
-    const float xs[2] = {p.getLeft(), p.getRight()};
-    const float ys[2] = {p.getBottom(), p.getTop()};
+    const float xs[2] = {box.getLeft(), box.getRight()};
+    const float ys[2] = {box.getBottom(), box.getTop()};
     const bool up = isFacingUp();
     for (float x : xs) {
         double ly = lineY(x);
@@ -66,6 +70,19 @@ bool Slope::touching(Player const& p) const {
             if (up ? (y <= ly) : (y >= ly)) return true;
     }
     return false;
+}
+
+bool Slope::circleOverlaps(Vec2D center, float radius) const {
+    double ratio = (double)size.y / (double)size.x;
+    double posRelative = ratio * ((double)center.x - getLeft());
+    double ly = (angle() > 0) ? (getBottom() + posRelative) : (getTop() - posRelative);
+    // Signed penetration in the VERTICAL axis (positive = centre already on the
+    // solid side of the diagonal), converted to a true PERPENDICULAR distance by
+    // the line's own slope (ratio) — the same conversion for any diagonal, not
+    // just 45°, since these slopes come in both 45° and ~63.43° (mini) flavours.
+    double vertPen = isFacingUp() ? (ly - (double)center.y) : ((double)center.y - ly);
+    double perpPen = vertPen / std::sqrt(1.0 + ratio * ratio);
+    return perpPen > -(double)radius;
 }
 
 // Matches real GD's GameObject::slopeYPos + the player-radius/clamp step done by
@@ -114,6 +131,11 @@ double Slope::expectedY(Player const& p) const {
 }
 
 void Slope::calc(Player& p) const {
+    if (getenv("GDSIM_SLOPECALC_DEBUG"))
+        std::fprintf(stderr, "SLOPECALC f=%d slopeId=%d slopePos=(%.2f,%.2f) playerXY=(%.2f,%.2f) grounded=%d "
+                     "vel=%.3f veh=%d expectedY=%.3f touching=%d gravOrientPrev=%d\n",
+                     p.frame, typeId, pos.x, pos.y, p.pos.x, p.pos.y, p.grounded, p.velocity,
+                     (int)p.vehicle.type, expectedY(p), touching(p), gravOrient(p.prevPlayer()));
     if (gravOrient(p.prevPlayer()) == 0) {
         if (!touching(p)) {
             p.actions.push_back(+[](Player& p) {
@@ -195,6 +217,40 @@ void Slope::calc(Player& p) const {
                 p.slopeData.snapDown = false;
             });
         }
+    } else if (gravOrient(p.prevPlayer()) == 3) {
+        // FOUND 2026-08-12 (real playtest, DeCode 2997354, user-flagged ship pass-
+        // through via the app's J-flag tool near a slope/shelf junction, x≈22000):
+        // gravOrient(prevPlayer()) can be 0, 1, 2, OR 3 (orientation remapped by
+        // upsideDown — see gravOrient() above), but this function only ever handled
+        // 0/1/2. An upside-down player gripping an orientation-0 slope (this exact
+        // case: floor-facing slope + upsideDown maps to gravOrient 3) fell through
+        // ALL three branches and did NOTHING — no Y-ride tracking, no exit-velocity
+        // handoff, and critically no release-on-!touching() either, since that logic
+        // lives inside the unreached case-0 branch. The grip then never lets go: X
+        // keeps advancing while Y (and velocity, held at 0 by Ship::update's
+        // grounded-zeroing) sits frozen wherever it last was, silently sailing under/
+        // through any solid geometry in its path with no collision response at all —
+        // confirmed via a direct trace (GDSIM_SLOPECALC_DEBUG): touching=1,
+        // gravOrientPrev=3, expectedY climbing 93→105 while pos.y stayed pinned at
+        // 73.5 for 28 straight frames, well past the slope's own physical x-span.
+        //
+        // Deriving the FULL correct ride-Y/exit-velocity formula for this
+        // configuration needs real capture ground truth this project doesn't have
+        // yet (this file's own history — see the two "TRIED ... reverted" notes
+        // below — is exactly why an unverified slope-physics guess isn't shipped
+        // here). Minimal, safe fix: at minimum let the grip RELEASE once the player
+        // genuinely leaves the slope's hitbox, mirroring case 0/1/2's own release
+        // logic, so a stale grip can no longer freeze the player indefinitely and
+        // skip every later collision check. Once released, normal (already-
+        // validated) collision handling — including the ceiling-bonk/side-smash
+        // paths in Block.cpp — resumes engaging immediately.
+        if (!touching(p)) {
+            p.actions.push_back(+[](Player& p) {
+                p.slopeData.slope = {};
+                p.slopeData.elapsed = 0.0;
+                p.slopeData.snapDown = false;
+            });
+        }
     }
 }
 
@@ -210,6 +266,68 @@ void Slope::calc(Player& p) const {
 // doesn't depend on this uncertain flag. Left as an open item in
 // SLOPES_gdsim_vs_decompile.md gap #4 for a future pass with better ground truth.
 void Slope::collide(Player& p) const {
+    // FIXED 2026-08-12 (real playtest report: wave surviving slope touches it
+    // shouldn't). This used to sit BELOW the three expectedY-based early-return
+    // gates further down — those gates are broad-phase reject checks for
+    // RESTING/RIDING physics (grounded vehicles: "has the player actually sunk
+    // past the ride surface yet"), meaningless for the wave's completely
+    // different rule (die on first touch, full stop). Slope::touching() already
+    // did the real triangular hitbox test before collide() was ever called — a
+    // wave reaching here IS genuinely overlapping the slope's triangle — but the
+    // gates below would `return` early whenever the wave's actual Y hadn't yet
+    // crossed the ride-line (e.g. skimming the corner of the triangle from
+    // "outside" the ramp direction), letting it slip through untouched. Checked
+    // first, before any of that grounded-physics gating, so touching() firing is
+    // the only thing that matters, exactly like Block.cpp's wave branch.
+    if (p.vehicle.type == VehicleType::Wave) {
+        // Explicit, repeated, forceful user instruction (see Block.cpp's identical
+        // note): the wave dies on ANY collision, block or slope, no exception
+        // except a D block. Two more nuanced models were tried and reverted the
+        // same day (unconditional-safe, then a dartSlide grace ported loosely from
+        // the decompiled collidedWithSlopeInternal) — both still let a wave survive
+        // touching plain solid geometry under some condition, which doesn't match
+        // real GD: wave difficulty comes specifically from ANY touch being lethal —
+        // corridors are threaded WITHOUT overlapping either surface, not ridden
+        // like a cube resting on a platform.
+        //
+        // FIXED 2026-08-12 (regression caught by test/regress.sh on truth
+        // 85701165, a wave-corridor level: FALSE-DEATH @f210, gdsim killed by
+        // slope id=1339 with dy=dyVel=0.00 — position matched real GD exactly,
+        // so this was a pure logic bug, not drift): this used to be a plain
+        // rectangular intersects(*this) against the slope's BOUNDING BOX. A
+        // slope's real solid shape is only the TRIANGULAR half of that box (the
+        // exact reason touching() has its own diagonal line-crossing test,
+        // see that function's 2026-08-06 fix note above) — the wave's
+        // innerHitbox could sit in the triangle's EMPTY corner, still inside the
+        // bounding rectangle, and this raw AABB test would call it a hit anyway.
+        // Reuses touching()'s own triangleOverlaps() so the death check respects
+        // the same real diagonal every other slope interaction already does.
+        // FIXED 2026-08-12, second pass (test/regress.sh still flagged 85701165
+        // FALSE-DEATH after the triangleOverlaps swap above, dy=dyVel=0.00, so
+        // still a pure logic bug): traced it to a corner of the wave's small
+        // innerHitbox poking ~1 unit past the diagonal at frame 304 while real GD
+        // survives. GD Creator School documents the wave's slope collision as a
+        // CIRCLE test, not a box-corner test (gd_creators_school_physics_spec
+        // memory) — a circle's closest approach to a corner is always less than
+        // the box's own corner distance, so the same geometry that trips a
+        // box-corner test can cleanly miss a circle. Switched to circleOverlaps()
+        // with the innerHitbox's own half-width as the radius (keeps the already-
+        // validated innerHitbox SIZE for wave-vs-solid collision, per this
+        // session's earlier work — only the SHAPE of the test changes, box→circle).
+        Entity hb = p.innerHitbox();
+        bool hit = hb.intersects(*this) && circleOverlaps(hb.pos, hb.size.x * 0.5f);
+        if (getenv("GDSIM_WAVESLOPE_DEBUG"))
+            std::fprintf(stderr, "WAVESLOPE f=%d slopeId=%d slopePos=(%.2f,%.2f) slopeSize=(%.2f,%.2f) orient=%d "
+                         "hbPos=(%.2f,%.2f) hbSize=(%.2f,%.2f) aabbHit=%d circHit=%d\n",
+                         p.frame, typeId, pos.x, pos.y, size.x, size.y, orientation,
+                         hb.pos.x, hb.pos.y, hb.size.x, hb.size.y, hb.intersects(*this), hit);
+        if (hit) {
+            p.dead = true; p.deathCause = "slope";
+            p.deathObjType = typeId; p.deathObjPos = pos;
+        }
+        return;
+    }
+
     p.potentialSlopes.push_back(this);
 #ifdef GDSIM_SLOPE_DEBUG
     fprintf(stderr, "[SLOPE] f=%d x=%.2f pos.y=%.2f expectedY=%.3f orient=%d left=%.1f right=%.1f gravTopP=%.2f gravBotThis=%.2f\n",
@@ -219,36 +337,6 @@ void Slope::collide(Player& p) const {
     if (orientation < 2 && expectedY(p) <= p.pos.y) return;
     else if (orientation >= 2 && expectedY(p) >= p.pos.y) return;
     else if (p.vehicle.type == VehicleType::Cube && p.gravTop(p) - p.gravBottom(*this) < 16) return;
-
-    if (p.vehicle.type == VehicleType::Wave) {
-        // CONSISTENCY FIX 2026-08-06: this branch used to ALWAYS ride, unconditionally
-        // safe — while the same-session rewrite of Block::collide (see
-        // wave_collision_architecture_rewrite memory) correctly gated wave-vs-block on
-        // `dartSlide`, this slope path was left on the old model, an inconsistency the
-        // user caught. Real GD (collidedWithSlopeInternal) kills a wave on slope
-        // contact when `stateHitHead<=0 && (isNewSlope || stateDartSlide<=0)` for a
-        // non-hazard slope — i.e. a wave that isn't already established-sliding CAN
-        // die on a slope too, not just on blocks. Apply the same gate as Block.cpp.
-        if (p.slopeData.dartSlide < 1) {
-            if (p.innerHitbox().intersects(*this)) {
-                p.dead = true; p.deathCause = "slope";
-                p.deathObjType = typeId; p.deathObjPos = pos;
-            }
-            return;
-        }
-        // Sliding: ride the surface (real GD lets an established-sliding wave slide
-        // along a slope like any solid — it does not insta-kill). ORDER-INDEPENDENT
-        // CLAMP (not an unconditional set): a wave corridor is routinely built from
-        // TWO opposing slopes (floor rising to meet a ceiling descending). Both
-        // slopes' broad-phase box can touch the player the same frame; clamping
-        // (floor only pushes UP, ceiling only DOWN) is idempotent regardless of call
-        // order, unlike an unconditional overwrite (which let call order silently
-        // decide the winner).
-        if (orientation < 2) p.pos.y = std::max(p.pos.y, (float)expectedY(p));
-        else                 p.pos.y = std::min(p.pos.y, (float)expectedY(p));
-        p.grounded = true;
-        return;
-    }
 
     // Flight modes (ship/ufo/swing) ride a CEILING slope's underside like the wave
     // rather than passing through it. A rising ship that penetrates the diagonal

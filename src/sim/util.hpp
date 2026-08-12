@@ -179,4 +179,17 @@ struct Entity {
     inline float getBottom() const { return pos.y - size.y / 2; }
 };
 
+// NOTE (2026-08-11): a `subframeCheck` helper (4 discrete interpolated position
+// samples between two frames) briefly lived here, built from GD Creator School's
+// "Advanced Hitboxes" #2 prose ("4 additional checks between every 2 frames of
+// processing"). Removed after reading the actual decompiled
+// PlayerObject::collidedWithObjectInternal (src/gdp-2.2/PlayerObject/
+// PlayerObject_collidedWithObjectInternal.cpp:616-619): real GD's death check is a
+// single discrete test at the CURRENT position only, no sweep/interpolation term at
+// all. The doc's "subframes" are GJBaseGameLayer::update's stepCount loop
+// reconciling variable render FPS with the fixed 240Hz physics tick, which gdsim
+// already has by construction (it simulates purely in 240Hz-tick space, no
+// render-frame coarsening) — there was nothing missing here to begin with. See
+// Block.cpp's collide() for the fuller writeup.
+
 } // namespace gdsim

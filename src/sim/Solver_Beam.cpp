@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <thread>
 
 namespace gdsim {
 
@@ -345,6 +346,13 @@ bool solveLevelBeam(Level& sim, float end, const SolverConfig& cfg,
 
     for (uint64_t t = 0; t < maxF && solveLayer < 0; ++t) {
         if (cancelled && cancelled->load()) { dlog("Beam cancelled"); writeStuck("CANCELLED"); fillBestPartial(); restoreSpawn(); return false; }
+        // Cooperative pause (see SolverConfig::paused): block here — sleeping, not
+        // spinning — until unpaused or cancelled. Deliberately placed BEFORE any
+        // per-frame work so a paused search holds the frontier exactly as it was.
+        while (cfg.paused && cfg.paused->load()) {
+            if (cancelled && cancelled->load()) { dlog("Beam cancelled (while paused)"); writeStuck("CANCELLED"); fillBestPartial(); restoreSpawn(); return false; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
         if (elapsed() > kLimit) {
             int pct = end > 0.f ? (int)(bestX * 100.f / end) : 0;
             dlog("Beam TIMEOUT at X=" + std::to_string((int)bestX) + " (" + std::to_string(pct)

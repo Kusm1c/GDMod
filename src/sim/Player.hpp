@@ -46,11 +46,6 @@ struct Player : public Entity {
         // compute the "am I still close enough to count as on the slope" exit tolerance
         // (playerRadOnPrevSlope) with the PREVIOUS grip's angle, not the new candidate's.
         float rotation = 0.f;
-        // A frame counter: >0 while a Wave (dart) is in an established, safe slide along
-        // a slope surface. Real GD only lets a wave survive slope contact while sliding
-        // (m_stateDartSlide>0); FRESH contact (this at 0) is lethal unless the slope is
-        // approached tangentially. See Slope.cpp Slope::collide's wave branch.
-        int dartSlide = 0;
     } slopeData;
 
     struct {
@@ -96,6 +91,15 @@ struct Player : public Entity {
     bool roundVelocity;
     bool dual;            // dual mode active this frame (set/cleared by DualPortal)
     bool isMirror;        // true for the dual mirror player (reads gameStates2 history)
+
+    // Special letter blocks (SpecialBlock.hpp / GD Creator School gameplay-objects
+    // #3): set every frame the player's hitbox overlaps the matching modifier
+    // object, reset at the top of the NEXT preCollision. Consulted by whichever
+    // mechanic each one modifies (Vehicle.cpp's jump buffer, Orb.cpp's dash,
+    // Block.cpp's underside/side death checks).
+    bool touchingJBlock = false;  // J (1813): suppress buffered auto-jump on landing
+    bool touchingSBlock = false;  // S (1829): neutralize a dash orb
+    bool touchingHBlock = false;  // H (1859): survive a block's underside/side touch
 
     // Dash orb (1704): while held, follow the orb's angle at constant velocity, no
     // gravity. dashTan = tan(angle); velocity = player_speeds[speed]*dashTan each

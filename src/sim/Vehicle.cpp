@@ -153,8 +153,15 @@ static Vehicle cube() {
             //   • fresh buffered press:  buffer rising edge
             //   • held re-jump:          button held AND already grounded last frame
             //                            (never on the landing frame itself)
-            if ((p.buffer && !p.prevPlayer().buffer) ||
-                (p.input && p.prevPlayer().grounded))
+            // J block (SpecialBlock.hpp, id 1813 "Stop Jump Buffer"): a press
+            // queued BEFORE landing must NOT auto-fire on touchdown while
+            // touching a J block over a horizontal block (real GD excludes the
+            // ground/slopes from this — approximated here via the slope check
+            // only, since a J block always co-locates with an actual Block
+            // object, naturally excluding the bare-floor case in practice).
+            bool bufferedJump = p.buffer && !p.prevPlayer().buffer;
+            if (bufferedJump && p.touchingJBlock && !p.slopeData.slope) bufferedJump = false;
+            if (bufferedJump || (p.input && p.prevPlayer().grounded))
                 jump = true;
             else p.setVelocity(0, true);
             p.buffer = false;
@@ -497,7 +504,13 @@ static Vehicle robot() {
             // click"). Match the cube's press discriminator (rising edge OR buffered
             // press); the prevGrounded guard keeps the landing-frame rule (a tap
             // starting on the exact landing frame doesn't jump). See [[jump_on_landing_frame]].
-            if (p.input && (p.prevPlayer().buffer || !p.prevPlayer().input)
+            // J block (see cube()'s identical guard above): a press buffered from
+            // before landing must not count as the trigger while touching a J
+            // block over a horizontal block.
+            bool bufferedFromBeforeLanding = p.prevPlayer().buffer;
+            if (bufferedFromBeforeLanding && p.touchingJBlock && !p.slopeData.slope)
+                bufferedFromBeforeLanding = false;
+            if (p.input && (bufferedFromBeforeLanding || !p.prevPlayer().input)
                 && p.prevPlayer().grounded) jump = true;
             else p.setVelocity(0, true);
             p.buffer = false;

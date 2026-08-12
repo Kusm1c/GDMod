@@ -37,11 +37,16 @@ Hazard::Hazard(Vec2D s, std::unordered_map<int, std::string>&& fields) : Object(
 // there's no reason it would use a 3x-larger player box. Confirmed via a real,
 // human-verified-clearing macro: it clipped a sawblade using the oversized box
 // while the small inner hitbox (checked by hand) does not overlap at all.
+// REVISED 2026-08-11: player box switched from innerHitbox() (~9×9) to
+// unrotatedHitbox() (the full 30×30/mini-18×18 "Main hitbox") — see
+// Hazard::collide's comment for why (GD Creator School "Advanced Hitboxes" #1,
+// trusted per explicit user instruction: the Main hitbox is what kills on
+// hazard/spike contact, not the small Solid hitbox — that one is block-only).
 bool Sawblade::touching(Player const& p) const {
     float radius = size.x / 2.0f;
-    Entity inner = p.innerHitbox();
-    float closestX = std::clamp(pos.x, inner.getLeft(), inner.getRight());
-    float closestY = std::clamp(pos.y, inner.getBottom(), inner.getTop());
+    Entity box = p.unrotatedHitbox();
+    float closestX = std::clamp(pos.x, box.getLeft(), box.getRight());
+    float closestY = std::clamp(pos.y, box.getBottom(), box.getTop());
     float dx = pos.x - closestX;
     float dy = pos.y - closestY;
     return (dx * dx + dy * dy) <= radius * radius;
@@ -121,20 +126,26 @@ static bool hazardRectHit(const Hazard& h, const Entity& box) {
 }
 
 void Hazard::collide(Player& p) const {
-    // gdsim model: a hazard kills when the player's SMALL inner death hitbox —
-    // ~9×9 (mini-scaled) — intersects it, NOT the full 30×30 icon box that the
-    // broad-phase touching() uses. NOTE (2026-08-06): this was previously credited to
-    // PlayerObject::collidedWithObjectInternal, but a full read of that function shows
-    // `objPassable` objects (hazards) hit an early `return 0` — hazards must be
-    // governed by a DIFFERENT, simpler real function this project hasn't decompiled
-    // yet. This innerHitbox model is kept because it's validated (13/13 regression,
-    // and fixed a real false-death: a flying ship's 30-tall hitbox merely swept a
-    // spike's vertical band on level 98414841, false-dying at f299/f1541 — the real
-    // 9×9 box clears both by >9u) — but treat it as an approximation, not a port, and
-    // do NOT add vehicle-specific graze leniency here without decompiled evidence (a
-    // wave-specific exception was tried and reverted this session — no basis found;
-    // waves are well known to always die on hazard contact, no exceptions).
-    if (!hazardRectHit(*this, p.innerHitbox())) return;
+    // REVISED 2026-08-11 (explicit, repeated user instruction: base this ONLY on
+    // GD Creator School's "Advanced Hitboxes" #1 "The Player Hitbox", not on this
+    // project's own prior empirical calibration): a hazard kills when the player's
+    // MAIN hitbox — the full 30×30 (18×18 mini) box, always axis-aligned —
+    // intersects it. Per the doc: the Main hitbox "collides with... spikes if they
+    // are facing upward"; the Solid hitbox (the small one, previously used here)
+    // "will only collide with solid objects and slopes" — it isn't in the hazard
+    // path at all.
+    //
+    // KNOWN, ACCEPTED TRADE-OFF: this reintroduces a previously-fixed false-death
+    // on truth level 98414841 (a ship grazes a spike's vertical band at f299/f1541
+    // with the big box; the small box cleared both by >9u — see test/regress.sh,
+    // now REGRESSED there by design). The hazard's own small rect (hazardRectHit,
+    // hw=0.22*sizeX etc.) is untouched — it comes from a different source (the
+    // "gameplay-objects" page's spike-shape description) and was NOT re-derived
+    // for pairing with this bigger player box; only the PLAYER hitbox choice
+    // changed, per direct instruction to trust the doc over the old capture-based
+    // fix. No decompiled hazard-collision function exists to independently confirm
+    // this (checked 2026-08-11, inconclusive).
+    if (!hazardRectHit(*this, p.unrotatedHitbox())) return;
     p.dead = true; p.deathCause = "hazard";
     p.deathObjType = typeId; p.deathObjPos = pos;
 }

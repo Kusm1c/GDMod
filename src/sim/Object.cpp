@@ -8,6 +8,7 @@
 #include "Pad.hpp"
 #include "Orb.hpp"
 #include "Slope.hpp"
+#include "SpecialBlock.hpp"
 #include <string>
 #include <climits>
 #include <cmath>
@@ -82,6 +83,15 @@ std::optional<ObjectContainer> Object::create(std::unordered_map<int, std::strin
     // 30×30 block; the wave never dies inside it (handled in Block::collide). Hitbox
     // size assumed 30×30 (default block) pending validation from GDMod_hitbox capture.
     objs(({ 1755 }), Block, 30, 30)
+
+    // Special letter blocks (see SpecialBlock.hpp for the full spec + ID sourcing).
+    // Hitbox sizes assumed 30×30 (default block footprint, same assumption as D
+    // above) pending real capture — these are non-solid touch zones, not geometry,
+    // so the exact size mostly affects how forgiving/precise a creator's placement
+    // needs to be, not whether the mechanic works at all.
+    objs(({ 1813, 1829, 1859 }), SpecialBlock, 30, 30)   // J, S, H
+    objs(({ 2866 }), GravityFlipBlock, 30, 30)           // F
+    objs(({ 2069, 3645 }), ForceBlock, 30, 30)           // Force (square, circle)
 
     objs(({ 720,991,1731,1733 }), Hazard, 2.40039063, 3.20001221)
     objs(({ 61,446,1719,1728 }), Hazard, 9, 7.2)

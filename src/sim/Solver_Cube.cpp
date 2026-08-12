@@ -52,7 +52,9 @@ static bool effectTouching(Level& L, const Player& p) {
     for (int s = std::max(0, si - 1); s <= std::min(last, si + 1); ++s)
         for (auto& oc : L.sections[s]) {
             const Object* o = oc.operator->();
-            if (o->prio == 1 || o->prio == 2) continue;   // blocks / hazards aren't effects
+            // blocks / hazards aren't effects; prio 3 (SpecialBlock.hpp J/S/H/F/
+            // Force) never depends on input either, so it's not a decision point.
+            if (o->prio == 1 || o->prio == 2 || o->prio == 3) continue;
             if (o->touching(p)) return true;
         }
     // Trigger-animated (moving) effect objects — pose only the ones near the player,

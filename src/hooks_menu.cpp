@@ -382,6 +382,14 @@ public:
                 // (see solve_realverify_autorepair_flow / this session's plan).
                 std::string gdr2Path = writeSolvedGdr2(levelId, levelName, replay);
 
+                // Kept for the "Export..." button (PathfinderMenuPopup) — lets the user
+                // save a copy to any path they choose, any time after this solve, without
+                // needing to still be looking at a just-closed result popup.
+                g_lastSolvedExport.available = true;
+                g_lastSolvedExport.levelId   = levelId;
+                g_lastSolvedExport.levelName = levelName;
+                g_lastSolvedExport.replay    = replay;
+
                 g_replayPlayer.isActive = true;
                 g_replayPlayer.replay   = replay;
                 g_replayPlayer.levelId  = levelId;
@@ -389,22 +397,24 @@ public:
                     // Opt-in: withhold nothing new (the .gdr2 above already exists, and
                     // stays even if this fails/gets stuck) but ALSO brute-force real-
                     // engine fixes until it clears, overwriting the .gdr2 with the
-                    // repaired result on success (see arOnTrialEnd).
+                    // repaired result on success (see arOnTrialEnd). This genuinely
+                    // needs the real level, so it's the one case that still launches it.
                     g_autoRepairRequested.store(true);
                     Notification::create(
                         fmt::format("Solved ({} clicks) — repairing in-game...", result.clicks.size()),
                         NotificationIcon::Loading, 2.f)->show();
+                    play();
                 } else {
-                    // Default: one non-blocking real-game pass for confirmation +
-                    // telemetry only (see confirmOnlyFinish in hooks_play.cpp) — never
-                    // retries, never blocks on the .gdr2 already written above.
-                    g_confirmRequested.store(true);
+                    // Default (2026-08-11, explicit user request): DON'T auto-launch the
+                    // level — the .gdr2 is already written above, which is the whole
+                    // point; jumping straight into gameplay after every solve was
+                    // unwanted. Use the "Export..." button in the Pathfinder menu to save
+                    // a copy elsewhere, or just play the level normally when you want to.
                     Notification::create(
                         fmt::format("Solved ({} clicks) — {}", result.clicks.size(),
-                            gdr2Path.empty() ? "FAILED to write .gdr2!" : ".gdr2 saved, confirming in-game..."),
+                            gdr2Path.empty() ? "FAILED to write .gdr2!" : ".gdr2 saved."),
                         gdr2Path.empty() ? NotificationIcon::Error : NotificationIcon::Success, 3.f)->show();
                 }
-                play();
             });
         }).detach();
     }
@@ -496,6 +506,11 @@ protected:
             menu->addChild(b);
         }
 
+        // Export the most recent solve's .gdr2 to a user-chosen path (Solve no
+        // longer auto-launches the level — see doSimulate — so this is how you get
+        // a copy anywhere other than the automatic Eclipse/mod-save-dir locations).
+        mkBtn("Export...", "GJ_button_04.png", menu_selector(PathfinderMenuPopup::onExport), cx, ry - 228.f);
+
         return true;
     }
 
@@ -510,6 +525,68 @@ protected:
     void onTogOptimize(CCObject*)    { s_solverOptimize    = !s_solverOptimize; }
     void onTogCenter(CCObject*)      { s_solverCenter      = !s_solverCenter; }
     void onTogAutoRepair(CCObject*)  { s_solverAutoRepair  = !s_solverAutoRepair; }
+
+    // Save-file dialog for the most recently solved replay (g_lastSolvedExport, set
+    // by doSimulate). Native Win32 dialog — same "synchronous, no arc dependency"
+    // choice onConvertGDR2 already makes just above (Geode's own async file-picker
+    // API, geode::utils::file::pick, reliably crashes CL.exe/MSB6006 on this
+    // toolchain when instantiated here — a real, reproducible compiler crash, not
+    // a guess). Always shows the dialog (per request — this isn't a "skip it and
+    // just use the remembered folder" shortcut), but pre-fills the starting folder
+    // with whatever was used last time via Mod::get()'s saved-value store (no
+    // mod.json setting for this — that's for user-facing declared options, not a
+    // silently-updated internal value).
+    void onExport(CCObject*) {
+        if (!g_lastSolvedExport.available) {
+            FLAlertLayer::create("Export", "No solved replay yet - run Solve first.", "OK")->show();
+            return;
+        }
+#ifdef GEODE_IS_WINDOWS
+        std::string safeName = g_lastSolvedExport.levelName;
+        for (auto& c : safeName)
+            if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+                c == '"' || c == '<' || c == '>' || c == '|') c = '_';
+        if (safeName.empty()) safeName = "replay";
+        std::wstring fileNameW = geode::utils::string::utf8ToWide(
+            fmt::format("{}-{}.gdr2", safeName, g_lastSolvedExport.levelId));
+
+        OPENFILENAMEW ofn{};
+        wchar_t szFile[MAX_PATH] = {0};
+        wcsncpy_s(szFile, fileNameW.c_str(), _TRUNCATE);
+
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner   = nullptr;
+        ofn.lpstrFile   = szFile;
+        ofn.nMaxFile    = MAX_PATH;
+        ofn.lpstrFilter = L"GDR2 Replay (*.gdr2)\0*.gdr2\0All Files (*.*)\0*.*\0";
+        ofn.nFilterIndex = 1;
+        ofn.lpstrDefExt  = L"gdr2";
+        ofn.Flags = OFN_PATHMUSTEXIST | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR;
+
+        std::string lastDir = Mod::get()->getSavedValue<std::string>("last-export-folder", std::string());
+        std::wstring lastDirW;
+        if (!lastDir.empty() && std::filesystem::exists(lastDir)) {
+            lastDirW = geode::utils::string::utf8ToWide(lastDir);
+            ofn.lpstrInitialDir = lastDirW.c_str();
+        }
+
+        if (GetSaveFileNameW(&ofn)) {
+            std::filesystem::path path(szFile);
+            bool ok = writeGdr2ToExactPath(path, g_lastSolvedExport.levelId,
+                                            g_lastSolvedExport.levelName, g_lastSolvedExport.replay);
+            if (ok) {
+                Mod::get()->setSavedValue<std::string>(
+                    "last-export-folder", path.parent_path().string());
+            }
+            Notification::create(
+                ok ? fmt::format("Exported to {}", path.filename().string())
+                   : "Export failed",
+                ok ? NotificationIcon::Success : NotificationIcon::Error, 3.f)->show();
+        }
+#else
+        FLAlertLayer::create("Export", "File picker is only available on Windows.", "OK")->show();
+#endif
+    }
 
 public:
     static PathfinderMenuPopup* create(GJGameLevel* level, std::function<void()> play) {

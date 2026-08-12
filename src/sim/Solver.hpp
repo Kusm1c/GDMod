@@ -141,6 +141,14 @@ struct SolverConfig {
     int  minClickGap = 0;
 
     SolverProgressReport* progress = nullptr; // optional live-progress sink (not owned)
+    // Optional cooperative pause switch (not owned): while true, the beam search's
+    // main per-frame loop blocks (sleeping, not spinning) instead of expanding —
+    // checked at the same point as `cancelled`, so a paused search still responds
+    // to cancellation immediately. Only the beam phase (solveLevelBeam) honours
+    // this — it's the dominant, by far longest-running phase for anything worth
+    // visualizing live; the post-processing passes (optimize/center/robustify) are
+    // comparatively short and run to completion once reached.
+    std::atomic<bool>* paused = nullptr;
 
     // User-drawn guide path (world x,y), set by clicking in the View Level window.
     // When non-empty, the beam search keeps only frontier states whose y stays

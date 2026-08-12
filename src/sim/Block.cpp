@@ -57,70 +57,31 @@ static void trySnap(Block const& b, Player& p) {
 }
 
 void Block::collide(Player& p) const {
+    if (getenv("GDSIM_COLLIDE_ENTRY_DEBUG") && pos.x > 21990.f && pos.x < 22150.f)
+        std::fprintf(stderr, "COLLIDE-ENTRY f=%d typeId=%d objPos=(%.2f,%.2f) playerXY=(%.2f,%.2f) veh=%d\n",
+                     p.frame, typeId, pos.x, pos.y, p.pos.x, p.pos.y, (int)p.vehicle.type);
     // D block (id 1755): a wave-safe solid (a special "letter block", handled outside
     // the generic collision function this file otherwise ports — GD Creator School
     // confirms D-blocks are a distinct special case). Real GD lets a WAVE touch a D
     // block without dying. Grounded modes fall through to normal handling below.
     if (typeId == 1755 && p.vehicle.type == VehicleType::Wave) return;
 
-    // WAVE: ported from the real decompile (PlayerObject::collidedWithObjectInternal):
-    //   if (m_isDart && m_stateDartSlide < 1) boolJ = true;
-    //   ...
-    //   if (!boolJ || m_isPlatformer || objPassable) return 0;
-    //   CCRect smallHitbox = getObjectRect(0.3, 0.3);
-    //   if (!objRect.intersectsRect(smallHitbox)) return 0;
-    //   ... destroyPlayer ...
-    // A wave NOT in an established slope-slide state (dartSlide<1) treats EVERY solid
-    // block exactly like a hazard: boolJ is forced true, skipping the entire snap/ride
-    // machinery, straight to a small (0.3-scaled = innerHitbox) death check — no
-    // leniency, no grazing. Only once genuinely SLIDING a slope (dartSlide>=1, set by
-    // Slope::collide's wave grip) does it get the "ride the surface" behaviour. This
-    // is the OPPOSITE of what gdsim modelled before this fix (wave always rides
-    // blocks, needing hand-tuned graze leniency) — found 2026-08-06 via a full read of
-    // the decompiled source after a real, GD-verified-clearing replay (Delirium.gdr,
-    // level 68839068) kept exposing more graze cases that were actually a wrong
-    // architecture, not missing leniency constants.
+    // WAVE: REVERTED 2026-08-11 (explicit, repeated, forceful user instruction: the
+    // wave dies on ANY collision — block or slope — no exception whatsoever except a
+    // D block, full stop). Earlier the same day this went through two more nuanced
+    // models (a dartSlide "established sliding" grace, ported loosely from the
+    // decompiled collidedWithObjectInternal/collidedWithSlopeInternal's
+    // `m_stateDartSlide` gate) — both still let the wave survive touching plain solid
+    // geometry under some condition, which the user directly confirmed does not match
+    // real GD: a wave's difficulty comes specifically from ANY touch being lethal:
+    // real wave corridors are threaded WITHOUT actually overlapping either surface,
+    // not ridden the way a cube rests on a platform. Simplified to the literal rule:
+    // unconditional death on touch, D block (Block::collide's own early return above)
+    // the only exception.
     if (p.vehicle.type == VehicleType::Wave) {
-        if (p.slopeData.dartSlide < 1) {
-            if (p.innerHitbox().intersects(*this)) {
-                p.dead = true; p.deathCause = "block";
-                p.deathObjType = typeId; p.deathObjPos = pos;
-            }
-            return;
-        }
-        // Sliding: ride the surface (top-landing / ceiling-catch), order-independent
-        // (see the comment history in git — a wave corridor built from two opposing
-        // surfaces can have both register "touching" the same frame).
-        double bottomW = p.gravBottom(p);
-        constexpr float kWaveClip = 6.f;
-        if (p.grav(p.velocity) <= 0 && p.gravTop(*this) - bottomW <= kWaveClip) {
-            float target = p.grav(p.gravTop(*this)) + p.grav(p.size.y / 2);
-            p.pos.y = p.grav(std::max(p.grav(p.pos.y), p.grav(target)));
-            p.grounded = true;
-        } else if (p.grav(p.velocity) > 0
-                   && p.gravTop(p) - p.gravBottom(*this) <= kWaveClip) {
-            // OPEN (2026-08-07): this ceiling-catch target rides the wave's FULL
-            // p.size.y (10, from Vehicle.cpp's wave()) below the block's bottom edge.
-            // Cross-checked against Delirium.gdr (level 68839068, a REAL human-
-            // verified-clearing replay, via test/gdrcheck.cpp): gdsim rides flat at
-            // Y=115 under a ceiling panel (block bottom=120) for several frames and
-            // clips a rotated decorative spike (id=217) whose true triangular hazard
-            // gdsim now models correctly (see Hazard.cpp) — proving the corner-clip
-            // theory wrong; even a 60%-shrunk hazard triangle still gets clipped,
-            // just one frame later at nearly the same X. That rules out the hazard
-            // shape and points here instead: the ride height itself is very likely a
-            // few units off from real GD's true wave-ceiling-catch offset. Disabling
-            // ALL id=217 collision made the ENTIRE real clear pass end-to-end, so this
-            // is the last blocker for that level — but I did not find or verify the
-            // correct offset (no decompile coverage for wave's block collision; a
-            // blind numeric guess here is high-blast-radius, since every wave level
-            // uses this path). Next step: a live capture isolating a wave gliding
-            // under a flat ceiling with no other confounders (slopelab-style), or a
-            // live memory read of the real m_yVelocity/position at an equivalent
-            // moment.
-            float target = p.grav(p.gravBottom(*this)) - p.grav(p.size.y / 2);
-            p.pos.y = p.grav(std::min(p.grav(p.pos.y), p.grav(target)));
-            p.grounded = true;
+        if (p.innerHitbox().intersects(*this)) {
+            p.dead = true; p.deathCause = "block";
+            p.deathObjType = typeId; p.deathObjPos = pos;
         }
         return;
     }
@@ -135,6 +96,11 @@ void Block::collide(Player& p) const {
 
     double bottom = p.gravBottom(p);
     if (p.slopeData.slope) {
+        if (getenv("GDSIM_SHIPCEIL_DEBUG"))
+            std::fprintf(stderr, "SHIPCEIL f=%d typeId=%d objPos=(%.2f,%.2f) grippedSlopeAngle=%.3f "
+                         "playerXY=(%.2f,%.2f) gravTopThis=%.2f bottom=%.2f\n",
+                         p.frame, typeId, pos.x, pos.y, p.slopeData.slope->angle(),
+                         p.pos.x, p.pos.y, p.gravTop(*this), bottom);
         if (p.slopeData.slope->angle() > 0) {
             bottom = bottom + sin(p.slopeData.slope->angle()) * p.size.y / 2;
             clip = 7;
@@ -150,8 +116,28 @@ void Block::collide(Player& p) const {
 
     bool padHitBefore = (!p.prevPlayer().grounded && p.prevPlayer().velocity <= 0 && p.velocity > 0);
 
-    bool blockHit = p.blockDeathHitbox().intersects(*this);
-    if (blockHit) {
+    // REVERTED 2026-08-11 (same day): this used to also OR in a swept/subframe
+    // check against last frame's position, built to explain a real playtest
+    // report (level 2997354 "DeCode": passing clean through a 1.5-unit-thin
+    // wall). Reading the actual decompiled PlayerObject::collidedWithObjectInternal
+    // (src/gdp-2.2/PlayerObject/PlayerObject_collidedWithObjectInternal.cpp:
+    // 616-619) shows the real death check is a PURE single discrete test —
+    // `objRect.intersectsRect(getObjectRect(0.3, 0.3))` at the CURRENT position
+    // only, no previous-position/sweep term anywhere in the function (the
+    // `getLastPosition()` reads earlier in it are for a MOVING PLATFORM's own
+    // velocity, not the player's). GD's documented "subframes" (GD Creator
+    // School "Advanced Hitboxes") are GJBaseGameLayer::update's stepCount loop
+    // reconciling variable render FPS with the fixed 240Hz physics tick — gdsim
+    // already simulates purely in 240Hz-tick space with no render-frame
+    // coarsening, so it already has that mechanism by construction and was
+    // never missing it. The thin-wall pass-through is therefore not a gdsim
+    // bug: real GD's own finest-resolution collision check has the identical
+    // gap for a wall thinner than one frame's travel. Restored to the plain
+    // discrete check this decompiled function actually performs.
+    Entity curHb = p.blockDeathHitbox();
+    bool blockHit = curHb.intersects(*this);
+    constexpr float kSolidGraze = 0.75f;
+    {
         // GD edge-graze leniency for solid vehicles (cube/robot/spider/ball): sliding
         // PAST a block edge with a sub-unit overlap in the perpendicular axis is
         // survivable in real GD (the famous corner-clip). Forgive when the overlap is
@@ -161,10 +147,11 @@ void Block::collide(Player& p) const {
         // 1.0 to keep the box maximally strict for the cube's tight-platform calibration.
         // (Mini robot on 13711278 ~f2437: rising past a ledge, its death box grazed the
         // top-left edge by penY≈0.5 — real survives, gdsim's bare AABB false-killed it.)
-        Entity h = p.blockDeathHitbox();
-        float penX = std::min(h.getRight(), getRight()) - std::max(h.getLeft(), getLeft());
-        float penY = std::min(h.getTop(),   getTop())   - std::max(h.getBottom(), getBottom());
-        constexpr float kSolidGraze = 0.75f;
+        float penX = std::min(curHb.getRight(), getRight()) - std::max(curHb.getLeft(), getLeft());
+        float penY = std::min(curHb.getTop(),   getTop())   - std::max(curHb.getBottom(), getBottom());
+        if (getenv("GDSIM_BLOCKDEATH_DEBUG"))
+            std::fprintf(stderr, "BLOCKAPPROACH f=%llu typeId=%d rawHit=%d penX=%.3f penY=%.3f playerXY=(%.2f,%.2f)\n",
+                         (unsigned long long)p.frame, typeId, curHb.intersects(*this), penX, penY, p.pos.x, p.pos.y);
         if (std::min(penX, penY) <= kSolidGraze) blockHit = false;
     }
     // Pre-existing overlap (the player was ALSO deeply inside this exact block on the
@@ -194,13 +181,73 @@ void Block::collide(Player& p) const {
     // "not new, don't kill" verdict this rule just made. The block-side branch's
     // actual job is to catch what the GRAZE tolerance (above) wrongly excused, not
     // to second-guess this rule, so only let it run in that case.
+    //
+    // TRIED 2026-08-11 (same level/report): a "forgive only if penetration isn't
+    // GROWING vs last frame" refinement. Reverted — it broke the ORIGINAL spawn-flush
+    // case this rule exists for: at frame 1, prevPlayer() resolves to the
+    // pre-simulation h[0] state, so even a stationary spawn overlap shows "growth"
+    // from h[0] to frame 1, indistinguishable from genuine tunneling with only a
+    // 1-frame lookback. 28 levels regressed. Superseded 2026-08-12 by gating on
+    // PREVIOUS-frame penetration DEPTH instead of growth direction (see below) —
+    // depth survives the frame-1 case (a real spawn-flush overlap is deep, not a
+    // graze) without needing growth comparison at all.
     bool notNewCollision = false;
-    if (blockHit && p.prevPlayer().blockDeathHitbox().intersects(*this)) {
-        blockHit = false;
-        notNewCollision = true;
-    }
-
     if (blockHit) {
+        Entity prevHb = p.prevPlayer().blockDeathHitbox();
+        if (prevHb.intersects(*this)) {
+            // FIXED 2026-08-12 (real playtest, level 2997354 "DeCode", user flagged the
+            // exact wall via the app's new J-flag tool — typeId 468, a 1.5-unit-thin
+            // solid stacked into a tall wall at x=870.75): this used to forgive ANY
+            // previous-frame intersection as "pre-existing, don't kill" — but a raw
+            // intersects() is true for a shallow EDGE GRAZE too, not just a genuine deep
+            // overlap. A thin/fast wall gets tunnelled in exactly two frames: frame N-1
+            // grazes the near face (forgiven above by kSolidGraze, but intersects() was
+            // still true), frame N is already through to the far side and deep enough to
+            // fail the graze check — and this rule then wrongly read frame N-1's mere
+            // graze as "this block has ALWAYS been touching", forgiving the real hit and
+            // letting the player pass clean through. Gate on the PREVIOUS frame's own
+            // penetration depth instead of the raw boolean: only a previous frame that
+            // was ALREADY a genuine (non-graze) overlap in both axes — the spawn-flush
+            // case this rule exists for, where the player starts deeply embedded in a
+            // decorative block before physics even runs — counts as "not new". A
+            // previous frame that was itself only a graze is the first half of a tunnel,
+            // not a resting state, and must not suppress this frame's real hit.
+            float prevPenX = std::min(prevHb.getRight(), getRight()) - std::max(prevHb.getLeft(), getLeft());
+            float prevPenY = std::min(prevHb.getTop(),   getTop())   - std::max(prevHb.getBottom(), getBottom());
+            if (std::min(prevPenX, prevPenY) > kSolidGraze) {
+                blockHit = false;
+                notNewCollision = true;
+            }
+        }
+    }
+    // KNOWN TRADE-OFF (measured 2026-08-12 against the 157-level real-macro batch,
+    // see local_rerun.sh): this closes the DeCode tunnel above but costs exactly one
+    // real, human-verified clear — 79997992, frame~19203: penX grazes in at 0.607
+    // (forgiven, under kSolidGraze) then deepens to 1.654 one frame later while
+    // p.grounded flips false (a jump is landing/lifting off right at this contact) —
+    // gdsim kills it now where it used to (accidentally) survive via the old
+    // any-previous-touch forgiveness. Read as a DIFFERENT, pre-existing fidelity gap
+    // (jump-liftoff Y not yet reflected when this frame's block collision is
+    // checked, so the horizontal graze is evaluated one frame before the real jump
+    // would have cleared it) that the old rule happened to paper over here, not
+    // something this fix broke on its own terms — but it's open, unresolved, and a
+    // real net loss on this one level. 156/157 net-preserved; DeCode's case (a fully
+    // solid, gapless wall silently walked through) was unambiguously wrong under any
+    // reading, so this trade was taken.
+
+    // H block (SpecialBlock.hpp, id 1859 "Allow Head Collision"): lets Cube/Robot/
+    // Spider survive touching a block's underside/side where they'd normally die.
+    // Global per-frame flag rather than "is this SPECIFIC block H-flagged" (gdsim
+    // has no per-block modifier association) — a safe approximation since an H
+    // block is placed to neutralize exactly one nearby death, and a false-positive
+    // (suppressing a DIFFERENT block's death the same frame) needs two solid blocks
+    // overlapping the player at once, already a rare/degenerate case.
+    if ((blockHit || notNewCollision) && getenv("GDSIM_BLOCKDEATH_DEBUG"))
+        std::fprintf(stderr, "BLOCKDEATH-CHECK f=%llu typeId=%d objPos=(%.2f,%.2f) objSize=(%.2f,%.2f) "
+                     "blockHit=%d notNewCollision=%d playerXY=(%.2f,%.2f) prevXY=(%.2f,%.2f) grounded=%d prevGrounded=%d\n",
+                     (unsigned long long)p.frame, typeId, pos.x, pos.y, size.x, size.y, blockHit, notNewCollision,
+                     p.pos.x, p.pos.y, p.prevPlayer().pos.x, p.prevPlayer().pos.y, p.grounded, p.prevPlayer().grounded);
+    if (blockHit && !p.touchingHBlock) {
         p.dead = true; p.deathCause = "block";
         p.deathObjType = typeId; p.deathObjPos = pos;
     } else if (p.gravTop(*this) - bottom <= clip
@@ -222,12 +269,19 @@ void Block::collide(Player& p) const {
         }
     } else {
         if (p.vehicle.type == VehicleType::Ship || p.vehicle.type == VehicleType::Ufo || p.vehicle.type == VehicleType::Ball) {
+            if (getenv("GDSIM_SHIPCEIL2_DEBUG"))
+                std::fprintf(stderr, "SHIPCEIL2 f=%d typeId=%d objPos=(%.2f,%.2f) objSize=(%.2f,%.2f) "
+                             "playerXY=(%.2f,%.2f) vel=%.3f gravTopP=%.3f gravBottomThis=%.3f gap=%.3f clip=%d willClamp=%d\n",
+                             p.frame, typeId, pos.x, pos.y, size.x, size.y, p.pos.x, p.pos.y, p.velocity,
+                             p.gravTop(p), p.gravBottom(*this), p.gravTop(p) - p.gravBottom(*this), clip,
+                             (p.gravTop(p) - p.gravBottom(*this) <= clip - 1 && p.velocity > 0));
             if (p.gravTop(p) - p.gravBottom(*this) <= clip - 1 && p.velocity > 0) {
                 p.pos.y = p.grav(p.gravBottom(*this)) - p.grav(p.size.y / 2);
                 p.velocity = 0;
             }
         } else if ((p.vehicle.type == VehicleType::Cube || p.vehicle.type == VehicleType::Robot
-                    || p.vehicle.type == VehicleType::Spider) && p.grav(p.velocity) > 0 && !notNewCollision) {
+                    || p.vehicle.type == VehicleType::Spider) && p.grav(p.velocity) > 0 && !notNewCollision
+                   && !p.touchingHBlock) {
             // The 7×7 inner death-box missed and this isn't a top-landing (the player
             // is RISING into a block's side/corner). The 7×7 is only lenient for the
             // top-corner graze you get while LANDING; a deep overlap on the way UP is a

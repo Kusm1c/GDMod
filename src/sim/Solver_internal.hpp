@@ -4,6 +4,8 @@
 #include <fstream>
 #include <vector>
 #include <cstdint>
+#include <thread>
+#include <chrono>
 
 // Internal helpers and cross-file declarations for the solver subsystem.
 // Not part of the public API.
@@ -14,6 +16,22 @@ inline float levelEnd(const Level& lvl) {
     if (lvl.length > 0.f) return lvl.length;
     if (!lvl.sections.empty()) return (float)lvl.sections.size() * 600.f - 300.f;
     return 3000.f;
+}
+
+// Cooperative pause (SolverConfig::paused): blocks — sleeping, not spinning —
+// for as long as `cfg.paused` is set, still responding to cancellation while
+// paused. Every solver phase (beam, path seeker, greedy, GA, the post-
+// processing passes) calls this at its own natural per-iteration checkpoint,
+// right alongside its existing `cancelled` check, so a paused search holds
+// its current state exactly rather than silently ignoring the pause request
+// (only the beam phase originally had this — a real gap: a search that falls
+// through to path/greedy/GA, which can each run for a long time on a hard
+// level, made the pause button a no-op there).
+inline void waitWhilePaused(const SolverConfig& cfg, const std::atomic<bool>* cancelled) {
+    while (cfg.paused && cfg.paused->load()) {
+        if (cancelled && cancelled->load()) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 
 inline bool overlaps(uint64_t pf, uint64_t rf, const std::vector<SolverClick>& clicks) {

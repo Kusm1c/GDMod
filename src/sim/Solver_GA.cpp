@@ -203,6 +203,10 @@ SolverResult solveLevelGA(
 
     for (int gen = 0; totalEvals < MAX_EVALS; ++gen) {
         if (cancelled && cancelled->load(std::memory_order_relaxed)) break;
+        // Cooperative pause — the GA fallback is the OTHER phase slow enough to
+        // need this in practice (a stalled plateau can run thousands of generations).
+        waitWhilePaused(cfg, cancelled);
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) break;
 
         sortPop();
 

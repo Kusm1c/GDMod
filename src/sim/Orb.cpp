@@ -99,6 +99,11 @@ void Orb::collide(Player& p) const {
             p.setVelocity(0, false);
             p.grounded   = true;
             p.input      = false;
+        } else if (type == OrbType::Dash && p.touchingSBlock) {
+            // S block (SpecialBlock.hpp, id 1829 "Stop Dash") neutralizes a dash
+            // orb entirely while touching it — GD Creator School: "S blocks stop
+            // dash orbs." The click is still consumed (EffectObject::collide above
+            // already marked this orb used), it just doesn't launch a dash.
         } else if (type == OrbType::Dash) {
             // Dash orb: glide along the orb's angle at constant velocity (gravity
             // off) for as long as the button is held. velocity = Xspeed*tan(angle)
