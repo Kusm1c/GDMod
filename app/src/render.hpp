@@ -42,6 +42,38 @@ void drawLevelGeometry(const gdsim::Level& level, const Camera2DState& cam,
 void drawHitboxTrail(const std::vector<TrailPoint>& trail,
                       const Camera2DState& cam, int screenW, int screenH);
 
+// Draws a thin line through the CENTRE of each historical TrailPoint (no
+// hitbox boxes) — an "options" toggle for when the full swept-box trail is
+// too visually busy and just the path curve itself is wanted.
+void drawCenterPath(const std::vector<TrailPoint>& trail,
+                     const Camera2DState& cam, int screenW, int screenH);
+
+// One frame of a REAL re-scanner capture (testlevel/GDMod_physics_<id>.txt),
+// already Y-offset-corrected into gdsim world space (real Y is 105 units
+// above gdsim's — see the "physics trail" feature in main.cpp).
+struct RealTrailPoint {
+    gdsim::Vec2D pos;
+    int veh;
+    bool mini;
+    long frame = 0;   // raw frame number from the capture file (its own clock,
+                       // not comparable to a sim frame index — see the
+                       // deviation-file feature's own notes on this)
+    float yVel = 0.f;
+};
+
+// Draws a REAL captured trajectory (the "physics trail") as a static
+// polyline distinct from the live sim trail, so a real playthrough and
+// gdsim's own replay of the same level can be visually compared frame-by-
+// frame divergence at a glance. The whole recorded path is drawn (not just a
+// short rolling window like drawHitboxTrail) since this is a fixed reference
+// line, not something that grows with the current frame.
+// `trail` holds RAW (unconverted) real-capture coordinates; offsetX/offsetY
+// are subtracted at draw time (not baked in at load time) so an in-game live
+// nudge control can re-align it against the sim trail without re-reading the
+// capture file on every adjustment.
+void drawPhysicsTrail(const std::vector<RealTrailPoint>& trail, float offsetX, float offsetY,
+                       const Camera2DState& cam, int screenW, int screenH);
+
 // Draws the beam search's live progress snapshot: the current best trajectory
 // (a connected line, sampled every few frames by the solver), its click
 // positions, and the death point where its latest attempt ended.

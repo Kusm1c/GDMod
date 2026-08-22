@@ -103,7 +103,17 @@ Player const* Player::nextPlayer() const {
 
 double roundVel(double velocity, bool upsideDown) {
     double nVel = velocity / 54.0 * (upsideDown * 2 - 1);
-    double floored = (int)nVel;
+    // FOUND 2026-08-20 (DeCode, level 2997354): `(int)nVel` TRUNCATES toward zero,
+    // not floor — for negative nVel (falling while upside-down, or rising while
+    // upright) that's a ceiling, not the floor this code's own naming/intent
+    // ("floored") expects. A real capture showed a smooth, steadily GROWING Y drift
+    // (0 -> +2.02 over one ~85-unit free-fall arc) specifically during the falling
+    // half of an upside-down flight — the exact signature of a per-frame rounding
+    // bias that only bites on one sign of nVel, not a single discrete event. The
+    // SAME arc while upright showed only a flat, non-growing ~1u offset (ordinary
+    // noise), confirming the asymmetry is orientation-dependent, matching this bug
+    // exactly. std::floor is sign-correct for both cases.
+    double floored = std::floor(nVel);
     if (nVel != floored)
         nVel = (double)std::round((nVel - floored) * 1000.0) / 1000.0 + floored;
     return nVel * 54.0 * (upsideDown * 2 - 1);
@@ -144,6 +154,12 @@ void Player::preCollision(bool pressed) {
     // other modes: their velocity is set in postCollision and is untouched here.
     if (vehicle.type == VehicleType::Wave) {
         velocity = (input * 2 - 1) * player_speeds[speed] * (small ? 2.f : 1.f);
+        // TRIED a DeCode-scoped ×0.9 here, and separately a decompiled-source
+        // "m_playerSpeed*m_speedMultiplier*54" reformulation (see Player.hpp history)
+        // — both looked exact against isolated samples but direct position-delta
+        // math proved player_speeds[] was already correct (the decompiled product
+        // needs a x60 reference, not x54; see Player.hpp note above wave_speedmults'
+        // old location). Reverted; formula matches real as originally written.
     }
 
     // Dash orb: sustain the angled glide while the button stays held; releasing
@@ -158,7 +174,31 @@ void Player::preCollision(bool pressed) {
     }
 
     preFrameVelocity = velocity;
-    pos.y += (float)(grav(velocity) * dt);
+    // FOUND 2026-08-23 (DeCode, rotated gravity portal at x=1905): real GD's
+    // GJBaseGameLayer::update runs updateJump — which does `v += a*dt` AND THEN
+    // `y += v*dt` — BEFORE checkCollisions. So every collision test in the real game
+    // sees the fully semi-implicit position. gdsim integrated Y here with the OLD
+    // velocity and only added the missing `a*dt^2` later, in postCollision's resync —
+    // i.e. AFTER collisions had already been resolved. Every portal/hazard/block test
+    // was therefore run against a position one `a*dt^2` stale (~0.0485u for a cube).
+    // Tiny, but it is a real systematic offset and it is exactly what made the
+    // rotated portal above miss its Y threshold by 0.003u (player top 182.497 vs the
+    // portal's 182.5) and fire a frame late. Fold that step in HERE so collisions see
+    // what real GD sees; postCollision subtracts it back so the final Y is identical.
+    // This frame's own acceleration isn't known yet (vehicle.update runs in
+    // postCollision), so use the previous frame's — identical on every steady frame,
+    // and the frames where it differs are impulse frames, which postCollision's
+    // override branch already handles explicitly.
+    preAppliedGravStep = 0.0;
+    if (!grounded && !prevPlayer().grounded && vehicle.type != VehicleType::Wave) {
+        double est = prevPlayer().acceleration * dt;
+        // Respect terminal velocity, same reasoning as postCollision's override path:
+        // a saturated fall gains nothing from the step, so neither does the position.
+        if (vehicle.type == VehicleType::Cube || vehicle.type == VehicleType::Robot)
+            est = std::max(velocity + est, -810.0) - velocity;
+        preAppliedGravStep = est;
+    }
+    pos.y += (float)(grav(velocity + preAppliedGravStep) * dt);
 
     for (auto& i : actions) i(*this);
     actions.clear();
@@ -247,6 +287,9 @@ void Player::postCollision() {
     float yPreClamp = pos.y;
     vehicle.clamp(*this);
     bool clampSnapped = (pos.y != yPreClamp);
+    if (getenv("GDSIM_WAVE_RESYNC_DEBUG") && vehicle.type == VehicleType::Wave)
+        std::fprintf(stderr, "WAVE-RESYNC f=%d x=%.2f yPreClamp=%.3f yPostClamp=%.3f preFrameVel=%.3f velPostClamp=%.3f resyncPos=%d clampSnapped=%d input=%d\n",
+                     frame, pos.x, yPreClamp, pos.y, preFrameVelocity, velocity, resyncPosition, clampSnapped, input);
 
     // Advance the one-frame X-speed lag: this frame's `speed` only reaches the
     // pos.x integrator next-next frame, matching GD's delayed X speed application.
@@ -268,11 +311,74 @@ void Player::postCollision() {
     // floor), on velocity overrides, and for wave (its Y velocity is set instant in
     // preCollision, so preFrameVelocity already equals the final velocity).
     bool semiImplicit = !velocityOverride && !grounded && vehicle.type != VehicleType::Wave;
+    if (getenv("GDSIM_GRAVFLIP_DEBUG") && frame >= 1930 && frame <= 1935)
+        std::fprintf(stderr, "RESYNC-CHECK f=%d velOverride=%d grounded=%d resyncPos=%d semiImplicit=%d clampSnapped=%d velocity=%.3f preFrameVel=%.3f yBefore=%.3f\n",
+                     frame, velocityOverride, grounded, resyncPosition, semiImplicit, clampSnapped, velocity, preFrameVelocity, pos.y);
+    // Every branch below subtracts `preAppliedGravStep` because preCollision already
+    // moved pos.y by grav(preAppliedGravStep)*dt so that COLLISIONS would see the
+    // real game's semi-implicit position (see its comment). Netting it out here keeps
+    // each frame's final Y exactly what it was before that change.
+    // MUST use the PRE-flip orientation: preCollision applied this step before any
+    // gravity portal/orb in the effects phase could flip `upsideDown`, so grav() here
+    // would pick the post-flip sign on a flip frame and ADD the step instead of
+    // removing it — a clean 2x double-count (measured 0.097 = 2 * 0.0485 at DeCode's
+    // x=816.61 flip). Identical to grav() on every non-flip frame.
+    const double gsignPre = prevPlayer().upsideDown ? -1.0 : 1.0;
+    const double preApplied = gsignPre * preAppliedGravStep * dt;
     if (clampSnapped) {
         resyncPosition = false;   // position was explicitly snapped to the ceiling
     } else if (resyncPosition || semiImplicit) {
-        pos.y += (float)(grav(velocity) * dt - grav(preFrameVelocity) * dt);
+        pos.y += (float)(grav(velocity) * dt - grav(preFrameVelocity) * dt - preApplied);
         resyncPosition = false;
+    } else if (velocityOverride && !grounded && !prevPlayer().grounded
+               && vehicle.type != VehicleType::Wave) {
+        // FOUND 2026-08-22 (DeCode, the level's FIRST divergence — f523/x=679, a
+        // mid-air orb/jump impulse): on an impulse frame real GD still moves the
+        // player by this frame's GRAVITY step, because GJBaseGameLayer::update runs
+        // updateJump (v += a*dt; y += v*dt — semi-implicit) BEFORE checkCollisions
+        // applies the impulse. The impulse therefore only changes velocity for the
+        // NEXT frame's integration; it does NOT retro-apply to this frame's Y.
+        // gdsim's velocityOverride suppressed the resync entirely, so preCollision's
+        // explicit `y += preFrameVelocity*dt` stood alone and the frame lost exactly
+        // one a*dt^2. Measured on the capture: real dY = -1.71261, sim dY = -1.6641,
+        // difference -0.04851; cube accel at this tier is -2794.1082, and
+        // -2794.1082/240/240 = -0.048509 — an exact match. Same ordering principle
+        // as the gravity-flip fix in GravityPortal.cpp.
+        // NOTE both grounded tests are required: an override SKIPS postCollision's
+        // floor snap (its condition includes !velocityOverride), so `grounded` can
+        // still read false for a player that is plainly sitting on the floor —
+        // truth-bank 108166595 flips gravity at f24 on the spawn ground and turned
+        // into a FALSE-DEATH until prevPlayer().grounded was added here.
+        // Excludes: grounded (no free-fall step) and wave (velocity is a pure
+        // function of input, already resolved in preCollision). resyncPosition
+        // frames are the deliberate "impulse lands same-frame" path handled above.
+        // GRAVITY-PORTAL frames are INCLUDED (2026-08-22) — real GD integrates this
+        // frame's Y in the PRE-flip orientation, so the sign must come from the
+        // orientation at the START of the frame, not from p.upsideDown (already
+        // flipped by the portal in the effects phase). Using grav() here would pick
+        // the post-flip sign and double the error instead of removing it. Level.cpp's
+        // old `2*grav(preFrameVelocity)*dt` GRAVFLIP-CORR is zeroed for portal flips
+        // in favour of this (see its comment); measured exact on DeCode's x=1905
+        // portal: real dY = +2.2473 = (527.688 + 11.664)/240.
+
+        // ...and the step must respect TERMINAL VELOCITY. Real GD's updateJump does
+        // `v += a*dt` and then clamps; once v is saturated at the fall cap the clamp
+        // eats the whole step, so the frame's position does NOT move by the extra
+        // a*dt^2 either. Found on DeCode's blue-orb gravity flip at x=884.12, taken
+        // at the cube's terminal 810: real dY = +3.3750 (= 810/240 exactly, pure
+        // pre-flip velocity), sim dY = +3.4235 — a 0.0485 overshoot, exactly
+        // a*dt^2 (2794.1082/240/240). That 0.049 then propagated untouched for 800
+        // frames and made the ROTATED gravity portal at x=1905 miss its Y threshold
+        // by 0.003 (player top 182.497 vs the portal's 182.5), firing a frame late.
+        // Clamp the step the same way the vehicle would, so a saturated fall
+        // contributes nothing. Cube/Robot share the 810 cap (Vehicle.cpp's cube
+        // clamp); other vehicles keep the raw step until a capture shows otherwise.
+        double gravStep = acceleration * dt;
+        if (vehicle.type == VehicleType::Cube || vehicle.type == VehicleType::Robot) {
+            const double capped = std::max(preFrameVelocity + gravStep, -810.0);
+            gravStep = capped - preFrameVelocity;
+        }
+        pos.y += (float)(gsignPre * gravStep * dt - preApplied);
     }
 }
 

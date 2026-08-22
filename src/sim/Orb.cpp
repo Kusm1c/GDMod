@@ -2,6 +2,7 @@
 #include "Player.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 
 namespace gdsim {
 
@@ -170,11 +171,15 @@ void Orb::collide(Player& p) const {
             // up with it and it takes one gravity decay (truth 308 f3316; the old
             // always-defer lagged those orbs by 2.77u / 0.22 dV). So defer ONLY on a
             // fresh touch; let an already-touched orb run the normal semi-implicit path.
-            // EXCEPTION: gravity-flip orbs (blue/green) have an extra flip-vs-velocity
-            // timing interaction (see the flip below / wave_gravity_flip work) that the
-            // same-frame path gets wrong — keep them always-deferred until that's modelled.
-            bool flipOrb = (type == OrbType::Blue || type == OrbType::Green);
-            p.velocityOverride = flipOrb ? true : !touching(p.prevPlayer());
+            // Dropping the Blue/Green always-defer and reusing the generic
+            // `!touching(p.prevPlayer())` discriminator fixed an isolated real touch
+            // almost exactly (DeCode x816: +1.582 -> +0.049 error) — proven correct
+            // for that touch. It IS a net loss across the broader 157-level macro
+            // batch (two levels dropped hard), so treat this as DeCode-scoped tuning,
+            // not a universally-validated fix, until the batch-regression cases are
+            // understood. 2026-08-20: re-enabled per explicit direction to prioritize
+            // DeCode's own fidelity over the broader batch for now.
+            p.velocityOverride = !touching(p.prevPlayer());
         }
         if (type == OrbType::Blue || type == OrbType::Green || type == OrbType::GravityFlip)
             p.upsideDown = !p.upsideDown;

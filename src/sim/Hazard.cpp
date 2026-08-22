@@ -42,8 +42,55 @@ Hazard::Hazard(Vec2D s, std::unordered_map<int, std::string>&& fields) : Object(
 // Hazard::collide's comment for why (GD Creator School "Advanced Hitboxes" #1,
 // trusted per explicit user instruction: the Main hitbox is what kills on
 // hazard/spike contact, not the small Solid hitbox — that one is block-only).
+// FOUND 2026-08-17 (level 2997354 "Decode", real Watch capture via
+// GDMod_truth_2997354.txt): FALSE-SURVIVE at frame 248 — real GD died on the
+// id=675/1734 sawblade (saved as 675, live m_objectID reports 1734 — same
+// placed object; its real-world position matches gdsim's parsed (301,1) exactly
+// once the known +90 real-vs-sim Y offset is applied) while gdsim survived with
+// dy=0.00 (position tracked perfectly; this is a pure hitbox-shape gap, not a
+// physics/timing one). Distance from the real death position to this sawblade's
+// centre was ~30.6u — radius=size.x/2 (16 for this 32×32 class) misses it by a
+// wide margin; radius=size.x (32) clears it with the exact same margin the old,
+// since-reverted universal formula had — but that formula was reverted for GOOD
+// reason (68839068/Delirium, a DIFFERENT sawblade size-class, false-killed at
+// radius=size.x). Rather than re-widen every sawblade and risk that regression,
+// this is scoped to ONLY the class(es) real capture evidence actually covers.
+// If a future capture finds another size-class is also off, extend this the
+// same way (evidence-scoped, not a blanket revert).
+//
+// EXTENDED 2026-08-17 (same level, app's hitbox-flag tool): 677/1736 (12.48×12.48)
+// is the SAME sawblade sprite family as 675/1734, just a smaller scale variant
+// (675/1734=32, 676/1735=17.51, 677/1736=12.48 — one design at 3 editor scales) —
+// user-flagged in-game as visibly bigger than gdsim's modeled hitbox at the exact
+// spot gdsim's own solve was dying on it, consistent with the same
+// bounding-box-not-half-radius property carrying across scale variants of one
+// sprite.
+//
+// EXTENDED again 2026-08-17 (user request: "check sawblade scale issues
+// globally"): 676/1735 is the missing MIDDLE tier of this exact same explicit
+// 3-way family (675/1734=32, 676/1735=17.51, 677/1736=12.48 — one sprite, one
+// GD editor scale slider, 3 saved sizes) — both tiers bracketing it are now
+// directly evidenced, so leaving only the middle one on the old formula would
+// mean gdsim's danger radius NON-MONOTONICALLY jumps big→small→big across one
+// continuous size family, which has no plausible physical explanation. Global
+// per-instance SCALE (kA32/128/129) was also audited across the real macro-
+// batch level cache: scaled sawblades are common, but every instance found
+// was scaled UNIFORMLY (x==y) — size.x already reflects that scale at
+// runtime (Object::Object applies it before Sawblade ever sees `size`), so
+// this radius formula (keyed only on typeId, reading the already-scaled
+// size.x) is correct at any scale without further change. 678/679/680 sit in
+// the same numeric ID block but are NOT part of this explicit legacy-id-pair
+// family (no paired old/new id the way every other entry here has) and have
+// no direct or bracketing evidence yet — left on the standard formula rather
+// than guessed.
+static bool isBigRadiusSawblade(int typeId) {
+    return typeId == 675 || typeId == 1734
+        || typeId == 676 || typeId == 1735
+        || typeId == 677 || typeId == 1736;
+}
+
 bool Sawblade::touching(Player const& p) const {
-    float radius = size.x / 2.0f;
+    float radius = isBigRadiusSawblade(typeId) ? size.x : (size.x / 2.0f);
     Entity box = p.unrotatedHitbox();
     float closestX = std::clamp(pos.x, box.getLeft(), box.getRight());
     float closestY = std::clamp(pos.y, box.getBottom(), box.getTop());
@@ -151,6 +198,11 @@ void Hazard::collide(Player& p) const {
 }
 
 void Sawblade::collide(Player& p) const {
+    // Diagnostic bypass (2026-08-21): when investigating a real-.gdr2-clears-but-
+    // gdsim-dies case, disabling JUST sawblade death lets a replay run PAST one to
+    // see whether the rest of the level is even reachable / where the NEXT problem
+    // is — see test/transtrack.cpp. Never affects a real Solve/Watch/regression run.
+    if (getenv("GDSIM_DIAG_NOSAWBLADE")) return;
     p.dead = true; p.deathCause = "sawblade";
     p.deathObjType = typeId; p.deathObjPos = pos;
 }

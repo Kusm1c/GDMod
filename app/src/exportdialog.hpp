@@ -14,6 +14,10 @@ namespace gdapp {
 std::optional<std::string> pickGdr2SavePath(const std::string& defaultFileName,
                                              const std::string& initialDir);
 
+// Native "Open" dialog for importing a .gdr2 to replay/compare against the
+// physics trail. Returns the chosen full path, or nullopt if cancelled.
+std::optional<std::string> pickGdr2OpenPath(const std::string& initialDir);
+
 // Last-used export folder, persisted as a plain text file in cache/ (mirrors
 // leveldata.cpp's own on-disk cache convention — this app has no Geode
 // Mod::get() saved-value store to reuse).

@@ -235,6 +235,18 @@ SolverResult solveLevel(const std::string& levelStr,
         SolverResult r; r.message = "Invalid level string"; return r;
     }
 
+    // TEMP debug escape hatch (2026-08-18): force PathSeeker-only for one manual
+    // A/B test (DeCode, level 2997354) — PathSeeker found a DIFFERENT 182-click
+    // solve in 31s (vs beam's default 237-click one) that may take a different
+    // line through the Ship section and dodge the known block-corner landing gap
+    // (see Block.cpp's 2026-08-17 TRIED/reverted comment). Gated on a marker file
+    // (not an env var — GD inherits its env at launch, so a var set later wouldn't
+    // apply) so it can be toggled without a rebuild. Absent by default, zero effect
+    // on normal Solve; delete testlevel/config/GDMod_force_pathseeker.txt (or this
+    // whole block) once the real-game test is done.
+    { std::ifstream marker(configPath("GDMod_force_pathseeker.txt"));
+      if (marker.is_open()) cfg.doBeam = false; }
+
     const float start = cfg.hazardInflate;
     const float steps[] = { start, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f };
     SolverResult last;

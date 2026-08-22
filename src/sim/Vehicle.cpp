@@ -161,6 +161,20 @@ static Vehicle cube() {
             // object, naturally excluding the bare-floor case in practice).
             bool bufferedJump = p.buffer && !p.prevPlayer().buffer;
             if (bufferedJump && p.touchingJBlock && !p.slopeData.slope) bufferedJump = false;
+            // FOUND 2026-08-17 (real Watch capture, level 2997354 "DeCode", fresh
+            // 251-click solve): a click landing on the EXACT frame a slope grip is
+            // first acquired fired the slope-boosted jump formula below (vel=632
+            // vs the ~126 real Y at that instant tracking smoothly) — real GD shows
+            // no jump at all on that frame, position continues the ordinary
+            // diagonal ride untouched. A held re-jump is already excluded on a
+            // fresh (flat-ground) landing frame via the prevPlayer().grounded
+            // check above (see the comment there — real GD's own updateJump
+            // doesn't see this frame's landing yet); a freshly-gripped SLOPE
+            // apparently isn't jump-eligible on its own first frame either, so
+            // exclude a bufferedJump the same way: only when the slope grip
+            // already existed last frame too.
+            bool freshSlopeGrip = p.slopeData.slope && !p.prevPlayer().slopeData.slope;
+            if (bufferedJump && freshSlopeGrip) bufferedJump = false;
             if (bufferedJump || (p.input && p.prevPlayer().grounded))
                 jump = true;
             else p.setVelocity(0, true);
@@ -176,14 +190,55 @@ static Vehicle cube() {
             static double jumpHeights[] = {573.481728, 603.7217172, 616.681728, 606.421728, 606.421728};
             if (p.slopeData.slope && p.slopeData.slope->orientation == 0) {
                 auto time = std::clamp(10*(p.timeElapsed - p.slopeData.elapsed), 0.4, 1.0);
-                double vel = 0.9 * std::min(1.12 / p.slopeData.slope->angle(), 1.54)
+                // FOUND 2026-08-17 (real DeCode capture): this shares the exact
+                // core term of Slope.cpp's natural-exit formula (min(1.12/angle,
+                // 1.54) * size.y*player_speeds/size.x) but had its OWN separate,
+                // never-recalibrated hardcoded 0.9 scale — the natural-exit path
+                // USED TO have this same 0.9 too (see that formula's own comment:
+                // "gdsim had an unexplained extra 0.9 multiplier... dropped") but
+                // this mid-ride manual-jump path was apparently never revisited
+                // when that one was replaced. Real yVel at the jump frame pinned
+                // this formula's own scale empirically at 0.588 — see
+                // g_calib.slopeJumpVelScale's own comment for why this couldn't be
+                // solved algebraically (the `+ jumpHeights[speed]` term below is
+                // scale-independent, so the naive "match the ratio" approach that
+                // worked for a moment doesn't actually isolate this constant).
+                double vel = g_calib.slopeJumpVelScale * std::min(1.12 / p.slopeData.slope->angle(), 1.54)
                            * (p.slopeData.slope->size.y * player_speeds[p.speed] / p.slopeData.slope->size.x);
                 if (getenv("GDSIM_JUMP_DEBUG"))
                     std::fprintf(stderr, "JUMP-SLOPE f=%d speed=%d angle=%.4f slopeSize=(%.2f,%.2f) time=%.4f vel=%.4f result=%.4f\n",
                                  p.frame, p.speed, p.slopeData.slope->angle(), p.slopeData.slope->size.x, p.slopeData.slope->size.y,
                                  time, vel, 0.25*time*vel + jumpHeights[p.speed]);
-                p.setVelocity(0.25*time*vel + jumpHeights[p.speed], p.prevPlayer().input);
+                // FOUND 2026-08-17 (real Watch capture, level 2997354 "DeCode",
+                // 246-click solve): a click-jump fired mid-ride (not the fresh-grip
+                // frame excluded above) matched real GD's velocity almost exactly
+                // (11.89 vs 11.813) but jumped position by an extra ~1.3u on this
+                // SAME frame. Two compounding causes, both needed:
+                // (1) the postCollision "semi-implicit resync" (Player.cpp, fires
+                //     whenever !velocityOverride) applied the brand-new jump
+                //     velocity to THIS frame's position immediately — same class
+                //     of bug as the natural slope-exit fix above. The old
+                //     p.prevPlayer().input override flag was incidental here
+                //     (false on a fresh press) rather than a deliberate same-vs-
+                //     next-frame choice for this specific impulse.
+                // (2) Slope::calc() ALSO still runs THIS frame (slopeData.slope
+                //     isn't cleared until the natural-exit path's queued action,
+                //     which for THIS jump-off path never even runs) and its
+                //     ride-tracking clamp (`pos.y = max(pos.y, expectedY(p))`)
+                //     independently re-pulled Y toward the still-live diagonal,
+                //     re-introducing almost the same offset fix (1) had just
+                //     removed. Clearing the grip synchronously, right here, stops
+                //     calc() from re-engaging this same frame — mirroring what the
+                //     natural exit's queued action does, just not deferred, since
+                //     this frame's ride is already over the instant the player
+                //     jumps off.
+                // This residual compounded over the rest of the level into a
+                // fatal ~22u drift by the time it reached the first ship section.
+                p.setVelocity(0.25*time*vel + jumpHeights[p.speed], true);
                 p.grounded = false;
+                p.slopeData.slope = {};
+                p.slopeData.elapsed = 0;
+                p.slopeData.snapDown = false;
             } else {
                 if (getenv("GDSIM_JUMP_DEBUG"))
                     std::fprintf(stderr, "JUMP-FLAT f=%d speed=%d jumpHeight=%.4f small=%d result=%.4f\n",
@@ -395,10 +450,37 @@ static Vehicle ufo() {
             p.velocityOverride = true;
             p.buffer = false;
             p.grounded = false;
+            // FOUND 2026-08-23 (DeCode UFO section, user-reported, proven against the
+            // raw capture): a UFO flap is the VEHICLE'S OWN jump, so real GD applies it
+            // inside updateJump — BEFORE that same function integrates position. The
+            // flap therefore moves this frame's Y with the NEW velocity, unlike an
+            // orb/pad/portal impulse (checkCollisions, i.e. after the integration),
+            // which only affects the NEXT frame. Measured at the flap on x=4141:
+            // real dY = -1.5460 = -371.034/240 exactly (the POST-flap velocity), while
+            // gdsim moved -0.4140 = -106.326/240 (the pre-flap one) — a 1.13u error
+            // injected at EVERY flap, which is why the UFO section's deviation grew in
+            // clean steps (-0.78 -> -4.36 -> -7.36 -> -8.41 -> -9.34) rather than
+            // drifting smoothly. cube() and robot() already set this flag for exactly
+            // the same reason; ufo() was simply missing it.
+            p.resyncPosition = true;
         } else {
-            // See ship() for why velocity_thresholds must NOT be wrapped in grav(): it's a
-            // relative-frame magnitude, same convention as p.velocity itself.
-            if (p.velocity > velocity_thresholds[p.speed])
+            // FIXED 2026-08-22 (DeCode UFO section, x=4003-5024, proven against the raw
+            // capture): this threshold MUST be wrapped in grav(), exactly as ship() does
+            // 120 lines above — the old comment here claimed the opposite ("must NOT be
+            // wrapped"), but ship()'s own code (p.grav(velocity_thresholds[...])) already
+            // contradicted it, and real capture settles it.
+            // Evidence: real GD switches the UFO from the strong accel (6.966/frame) to
+            // the weak one (4.644/frame) exactly when its WORLD velocity crosses
+            // +103.377 (= velocity_thresholds[2] at this level's 1.1x tier) going up.
+            // gdsim compared the PLAYER-RELATIVE velocity to a bare +103.377, which for
+            // an UPSIDE-DOWN ufo is the opposite sign — so the switch fired at world
+            // -99.36 instead of +109.62, a 209 unit/sec early switch. Since both engines
+            // otherwise agree exactly (same jump impulse -371.034, same two accel
+            // constants), that mistimed switch was the ENTIRE source of a ~36u Y drift
+            // accumulating in steps across this level's upside-down UFO section.
+            // grav() leaves normal-gravity ufos completely unchanged (grav(T)==T when
+            // not upsideDown), so this only affects the previously-broken flipped case.
+            if (p.velocity > p.grav(velocity_thresholds[p.speed]))
                 p.acceleration = p.small ? -1969.92 : -1671.84;
             else
                 p.acceleration = p.small ? -1308.96 : -1114.56;
@@ -425,7 +507,8 @@ static Vehicle wave() {
     v.clamp = +[](Player& p) {
         float waveTop    = p.grav(p.pos.y + p.grav(p.size.y));
         float waveBottom = p.grav(p.pos.y - p.grav(p.size.y));
-        p.velocity = (p.input * 2 - 1) * player_speeds[p.speed] * (p.small ? 2.f : 1.f);
+        if (!p.velocityOverride)
+            p.velocity = (p.input * 2 - 1) * player_speeds[p.speed] * (p.small ? 2.f : 1.f);
         if (waveBottom <= p.gravFloor()) {
             p.pos.y = p.grav(p.gravFloor() + p.size.y);
             if (waveBottom == p.gravFloor() && !p.input) p.velocity = 0;

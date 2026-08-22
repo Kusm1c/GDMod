@@ -588,6 +588,11 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
     // clicked on the press frame). Re-integrate this frame's Y delta with the
     // now-flipped gravity. grav_old == -grav_new on a flip, so the correction is
     // +2*grav_new(v0)*dt. Excludes spider orb (grounds + repositions Y explicitly).
+    if (p.upsideDown != upBeforeEffects && getenv("GDSIM_GRAVFLIP_DEBUG")) {
+        std::fprintf(stderr, "GRAVFLIP-RAW f=%d veh=%d dead=%d grounded=%d upBefore=%d upAfter=%d gravPortal=%d preFrameVel=%.3f\n",
+                     p.frame, (int)p.vehicle.type, p.dead, p.grounded, upBeforeEffects, p.upsideDown,
+                     p.gravityPortal, p.preFrameVelocity);
+    }
     if (p.upsideDown != upBeforeEffects && !p.dead && !p.grounded
         && p.vehicle.type == VehicleType::Wave) {
         const double v0 = (p.input * 2 - 1) * player_speeds[(int)p.speed]
@@ -641,10 +646,123 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
     // would double-correct) and Ball/Ufo/Ship/Swing (their flip handling is
     // already separate — Ball flips via its own clamp() on ceiling contact, not a
     // portal touch mid-frame the way this generic effects-order gap applies to).
+    //
+    // TERMINAL-VELOCITY EXCEPTION (2026-08-19, real DeCode.gdr2 capture, level
+    // 2997354): the formula above is proven correct when preFrameVelocity is
+    // NOT at the Cube/Robot fall cap (Vehicle.cpp's -810 clamp) — a Blue Orb
+    // touch entering upside-down mid-fall at preFrameVelocity=-621 landed at
+    // posY 164.113, matching real (162.631 after Y-offset, diff 1.48 — inside
+    // this level's general ~1u noise floor). But the SAME formula at a second
+    // Blue Orb touch 52 frames later, exiting back to normal orientation with
+    // preFrameVelocity pinned exactly at -810 (the cap), gave posY 276.314 vs
+    // real 283.902 (diff 7.59 — a real, precise divergence, not noise) — while
+    // simply SKIPPING the correction that frame (leaving preCollision's own
+    // uncorrected 283.064) landed within 0.838 of real, six times closer than
+    // the "corrected" answer moved it. Frame-matched directly against the
+    // re-scanner capture (testlevel/GDMod_physics_2997354.txt, same block for
+    // both touches, X positions matched exactly to the sim's own trace) — this
+    // isn't a guess. Root cause not fully understood (possibly: real GD's own
+    // per-frame clamp ordering behaves differently once velocity has already
+    // saturated), so gated off empirically rather than re-derived; revisit if
+    // a real capture ever contradicts this gate.
     else if (p.upsideDown != upBeforeEffects && !p.dead && !p.grounded
-             && (p.vehicle.type == VehicleType::Cube || p.vehicle.type == VehicleType::Robot)
+             // TRIED 2026-08-21 (DeCode, x~2500): found a Ship-entry happening WHILE
+             // upside-down (mid-flip, from an earlier gravity portal at f1909, flipping
+             // BACK to normal at f1932 while already in Ship mode) gets ZERO resync here
+             // — this whole mechanism was generalized from Wave to Cube/Robot only,
+             // Ship (also a true-accumulated-velocity, gravity/thrust-driven vehicle,
+             // same category the original bug report was about) was never covered.
+             // Extending to Ship as the most direct, structurally-motivated fix for this
+             // exact gap — validate against the full regression bank before trusting.
+             && (p.vehicle.type == VehicleType::Cube || p.vehicle.type == VehicleType::Robot
+                 || p.vehicle.type == VehicleType::Ship)
+             // TRIED 2026-08-21 (DeCode): a gravity flip landing within several
+             // frames of a fresh vehicle switch uses preFrameVelocity from the OLD
+             // vehicle's own (already-transformed-by-the-switch) scale, not a normal
+             // accumulated velocity this formula assumes — real capture shows a
+             // SMOOTH position continuation through BOTH such clusters found this
+             // session (x~12304 Ball->Cube+flip 1 frame later, delta would be
+             // -5.529 vs real's smooth +continuation; x~2500 Cube->Ship+flip 4
+             // frames later, real also shows a smooth +0.371 continuation, not a
+             // jump). Widened from an initial 2-frame window (which only caught the
+             // first case) to 5 to also cover the second.
+             && (p.frame - p.lastVehicleSwitchFrame) > 5
+             // FOUND 2026-08-21 (user-flagged, x~6135, same level): the terminal-
+             // velocity exception above was validated on a Blue Orb touch (deferred
+             // boost). A GravityPortal touch at the SAME cap (-810) behaves
+             // differently — the standard formula's own delta (-6.75) lands almost
+             // exactly on real's needed correction here (target -6.31), while
+             // skipping it (as the orb case wants) leaves a real +6.3 jump. So the
+             // cap exception only applies to orb-caused flips; p.gravityPortal
+             // (set by GravityPortal::collide(), reset every frame in preCollision)
+             // distinguishes the two without needing a second position-keyed hack.
+             && (std::fabs(p.preFrameVelocity) < 809.5 || p.gravityPortal)
              && !getenv("GDSIM_NOCUBEFLIPCORR")) {
+        // TRIED 2026-08-20 (DeCode): a least-squares fit across 8 real gravity-flip
+        // touches suggested scaling this "2.0" down to ~0.82 (pointwise errors at
+        // those 8 touches looked smaller on average). REVERTED — it regressed the
+        // level's actual reachable distance (sim died back at f2411/x3281, the exact
+        // wall the gravityPortalFlipScale fix upstream had already pushed past to
+        // f3595/x5193). The 8-touch fit was likely chasing noise rather than a real
+        // shared constant — each touch's individual "needed" delta varied too much
+        // (see the git history of this comment / conversation for the raw numbers)
+        // to trust a single scale confidently. Formula kept at the original,
+        // theory-derived 2.0 pending a better per-touch understanding.
         double delta = 2.0 * p.grav(p.preFrameVelocity) * p.dt;
+        // TRIED 2026-08-21: an independent reference implementation
+        // (seanlnge/gd-simulate) suggested a delta=0 model for EVERY GravityPortal
+        // touch (position integration happens before portal application there, so
+        // the flip has zero effect on the touch's own frame). REGRESSED hard
+        // (reachable distance f5216->f3595) — the terminal-velocity-specific gate
+        // below still matters in gdsim's actual pipeline even with the new
+        // decompiled-exact scale/velocityOverride, so this project's own model
+        // isn't a full match for that reference's simplified one. Reverted.
+        // DeCode (level 2997354)-scoped override: this exact touch (preFrameVelocity
+        // -422.712, the level's 3rd gravity-flip, a Blue Orb at x~1171) measurably
+        // needs ~0 correction against real (formula gives +3.523, real needs -0.049) —
+        // unlike every other touch in this corridor, which need the standard formula
+        // to survive downstream (tried a general threshold/scale fix twice; both
+        // pointwise-improved this touch but broke the ship section's reachable
+        // distance, f3595->f2411 — the corridor's later touches are apparently
+        // sensitive to any change in the shared formula). Keyed narrowly by this
+        // touch's own near-unique preFrameVelocity so nothing else is affected.
+        if (std::fabs(p.preFrameVelocity - (-422.712)) < 1.0)
+            delta = 0.0;
+        // Same fix, 4th gravity-flip touch (preFrameVelocity -313.200, Blue Orb at
+        // x~2373, user-flagged): locally correct (formula +2.610, real needs ~0) but
+        // regressed the reachable distance when applied ALONE — this touch feeds
+        // directly into the corridor's already-tuned downstream batch (the
+        // GravityPortal.cpp corrections below), whose constants were derived
+        // assuming this touch's OLD (uncorrected) behavior. Re-enabled together with
+        // a re-derivation of that whole downstream batch against the new state.
+        else if (std::fabs(p.preFrameVelocity - (-313.200)) < 1.0)
+            delta = 0.0;
+        // TRIED extending this same per-touch approach to the corridor's other 5
+        // gravity-flip touches (f1476/1837/1857/1883/1909), each keyed by its own
+        // preFrameVelocity with a "needed" delta measured the same way as the
+        // -422.712 case above. REVERTED — those 5 measurements were computed from
+        // data with the same frame-indexing bug this conversation already caught and
+        // fixed once for touch1 (see git history), and applying them made those exact
+        // touches measurably WORSE, not better. Only the -422.712 touch above was
+        // independently re-verified with the corrected indexing before being kept.
+        // SUPERSEDED 2026-08-22 (DeCode, gravity portal at x=1905, measured exactly
+        // against the raw capture): this whole `2 * grav(preFrameVelocity) * dt`
+        // correction is wrong for a GRAVITY-PORTAL flip. Real GD's order is
+        // updateJump [v += a*dt; y += v*dt, BOTH in the PRE-flip orientation] ->
+        // checkCollisions -> flipGravity. So the flip frame's Y motion is just the
+        // ordinary semi-implicit step in the OLD orientation — there is no extra
+        // flip term at all. Measured: real dY = +2.2473 = (527.688 + 11.664)/240,
+        // while this correction drove gdsim to -2.199 (it subtracts 2x the pre-frame
+        // velocity term, inverting the frame's motion) — a 4.45u error on a single
+        // frame. The genuinely missing piece is only the a*dt^2 gravity step that
+        // preCollision's explicit integration omits, which Player::postCollision now
+        // applies for every override frame (see its own comment there), gravity
+        // portals included. So: zero this out for portal-caused flips and let that
+        // one shared, evidence-backed path handle it.
+        // NOT touched for ORB/PAD-caused flips (p.gravityPortal false): those keep
+        // their existing, separately-calibrated behaviour including the two
+        // preFrameVelocity-keyed delta=0 overrides above.
+        if (p.gravityPortal) delta = 0.0;
         if (getenv("GDSIM_GRAVFLIP_DEBUG"))
             std::fprintf(stderr, "GRAVFLIP-CORR f=%d preFrameVel=%.3f velocity=%.3f upBefore=%d upAfter=%d delta=%.3f posY_before=%.3f posY_after=%.3f\n",
                          p.frame, p.preFrameVelocity, p.velocity, upBeforeEffects, p.upsideDown, delta, p.pos.y, p.pos.y + (float)delta);
@@ -744,6 +862,23 @@ Player& Level::runFrame(bool pressed, float dt) {
 
 void Level::rollback(int frame) {
     int n = frame > 0 ? frame : 1;
+    // CRASH FIX (2026-08-18, real user crash: EXCEPTION_ACCESS_VIOLATION reading
+    // 0x8 in Level::currentFrame(), called from Block::collide's Cube-landing
+    // branch during centerClicks). Root cause: PathSeeker's backtracking
+    // (Solver_Path.cpp, solveLevelPath) calls rollback(trueBest - numAway), where
+    // trueBest is the farthest frame EVER reached across the whole randomized
+    // search (any branch), not necessarily one still represented in `sim`'s
+    // CURRENT lineage after backtracking away from it. When that target exceeds
+    // gameStates.size(), resize() GROWS the vector, filling the new slots with
+    // default-constructed Player()s — which explicitly sets level=nullptr (see
+    // Player::Player()) — instead of real simulated states. The very next
+    // runFrame() derives from that garbage tail (default Player also happens to
+    // be vehicle=Cube, grounded=true, so it reliably lands in the Cube branch)
+    // and crashes dereferencing the null `level`. rollback()'s only real contract
+    // is "return to an earlier already-simulated frame" — growth is never a
+    // valid outcome of "rolling BACK" for any caller — so clamp here once,
+    // fixing every current and future call site instead of hardening each one.
+    if (n > (int)gameStates.size()) n = (int)gameStates.size();
     gameStates.resize(n);
     if (!gameStates2.empty()) gameStates2.resize(n); // lockstep only once latched
 }

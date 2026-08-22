@@ -10,12 +10,14 @@ struct VehiclePortal : public EffectObject {
     VehicleType type;
     VehiclePortal(Vec2D size, std::unordered_map<int, std::string>&& fields);
     void collide(Player&) const override;
+    bool touching(Player const&) const override;
 };
 
 struct GravityPortal : public EffectObject {
     bool upsideDown;
     GravityPortal(Vec2D size, std::unordered_map<int, std::string>&& fields);
     void collide(Player&) const override;
+    bool touching(Player const&) const override;
 };
 
 struct SizePortal : public EffectObject {

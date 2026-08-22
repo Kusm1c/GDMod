@@ -150,17 +150,61 @@ std::optional<ObjectContainer> Object::create(std::unordered_map<int, std::strin
 
     objs(({ 36,84,141,1022,1330,1333,1704 }), Orb, 36, 36)
 
+    // Portal hitboxes — REVERTED 2026-08-23 to the ENGINE-MEASURED sizes.
+    //
+    // The 2026-08-18 pass replaced five per-category sizes with a flat 30x90
+    // (30x75 for gravity), based on a visual hitbox-display reading plus
+    // geometrydash.wiki.gg. That was WRONG. A direct capture of the engine's own
+    // `GameObject::getObjectRect()` for every portal in level 2997354 (see
+    // testlevel/movetest/GDMod_hitbox_2997354.txt — hooks_play.cpp now records
+    // portals, which it previously dropped because they are neither Solid nor
+    // Hazard) gives, consistently across 45 instances:
+    //     gravity  10/11                  -> 25 x 75   (22 instances)
+    //     vehicle  12/13/47/111/660       -> 34 x 86
+    //     size     99/101                 -> 31 x 90
+    //     speed    200                    -> 35 x 44
+    //     speed    202                    -> 51 x 56
+    // which is exactly the set of values the 2026-08-18 comment itself listed as
+    // what gdsim "previously had" — i.e. those older numbers were engine-derived
+    // and correct, and the flat 30x90 was the regression.
+    //
+    // This matters far more than it looks: every portalReach[] constant was
+    // re-tuned in that same 2026-08-18 pass to absorb these wrong sizes, and the
+    // gravity value (-2.5) is exactly the 30->25 half-width difference. Chasing
+    // DeCode's flip timing showed two id=10 portals demanding different reach
+    // values — impossible for a shared constant, and explained entirely by the
+    // width being 5u too wide here. Rotation was never the problem: Object.cpp
+    // already reads field 6 (e.g. the x=1905 portal is rot=-90, matching its
+    // captured 75x25 footprint) and the SAT test honours it.
+    //
+    // Speed portals genuinely differ per sub-id (200 and 202 measured above and
+    // differ from each other). 201/203/1334 had no axis-aligned instance in this
+    // level's capture — only a rotated 203 — so they stay at the old flat value
+    // and are still UNVERIFIED; capture a level containing them upright before
+    // trusting those three.
+    // EXTENDED 2026-08-23 with a second engine capture (level 86407629, 27625
+    // objects) that contained the portal types level 2997354 lacked. Sizes below are
+    // each the dominant UNSCALED footprint across many instances; the same files also
+    // show exact half/double-scale copies (e.g. 17x43 and 68x172 for the 34x86
+    // vehicle portal), which Object::Object's scale fields already handle, and
+    // rotated ones with inflated AABBs, which the SAT test handles.
+    //   vehicle 12/13/47/111/660/745/1331  34 x 86  (19+7+3+6+13+2+3 instances)
+    //   teleport 747                       25 x 90  (33)   <- was 34x86, wrong
+    //   gravity 10/11                      25 x 75  (22+12)
+    //   size    99/101                     31 x 90  (15+19)
+    //   dual    286/287                    41 x 91  (6+5)  <- was 34x86, wrong
+    //   speed   200  35x44 (7) | 201  33x56 (6) | 202  51x56 | 1334  69x56 (5)
     objs(({ 12,13,47,111,660,745,1331,1933,2751 }), VehiclePortal, 34, 86)
-    objs(({ 747 }), TeleportPortal, 34, 86)
+    objs(({ 747 }), TeleportPortal, 25, 90)
     objs(({ 10,11 }), GravityPortal, 25, 75)
     objs(({ 99,101 }), SizePortal, 31, 90)
-    objs(({ 286,287 }), DualPortal, 34, 86)
+    objs(({ 286,287 }), DualPortal, 41, 91)
     objs(({ 143 }), BreakableBlock, 30, 30)
 
     objs(({ 200 }), SpeedPortal, 35, 44)
     objs(({ 201 }), SpeedPortal, 33, 56)
     objs(({ 202 }), SpeedPortal, 51, 56)
-    objs(({ 203 }), SpeedPortal, 65, 56)
+    objs(({ 203 }), SpeedPortal, 30, 90)   // STILL UNVERIFIED — no instance captured yet
     objs(({ 1334 }), SpeedPortal, 69, 56)
 
     objs(({ 289,294,299,305,309,315,321,326,331,337,343,349,353,363,371,483,492,651,665,

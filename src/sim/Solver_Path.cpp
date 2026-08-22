@@ -374,13 +374,25 @@ void centerClicks(Level& sim, float end, const SolverConfig& cfg,
 
     int      centered = 0;
     uint64_t prevRf   = 0; // keep clicks from colliding with the previous one
+    uint64_t prevPf   = 0; // keep clicks from violating minClickGap with the previous one
     for (size_t i = 0; i < clicks.size(); ++i) {
         waitWhilePaused(cfg, cancelled);
         if (cancelled && cancelled->load()) break;
 
         const SolverClick cur  = clicks[i];
         const uint64_t    hold = cur.releaseFrame - cur.pressFrame;
-        const uint64_t    low  = std::max(prevRf,
+        // FOUND 2026-08-17 (level 2997354 "DeCode"): only beam's OWN move-
+        // generation enforced cfg.minClickGap during search — this centering pass
+        // only avoided literal overlap with the previous click (prevRf), not the
+        // requested press-to-press gap. That let a solution beam found FULLY
+        // respecting the human-click-rate cap get re-shifted into a violation
+        // right here, so finalizeSolved's later CLICK-RATE CHECK discarded the
+        // whole (already zero-margin-verified!) solution and forced a restart
+        // from scratch via PathSeeker — which hit the exact same gap here again.
+        // Add the same minClickGap margin already used for the beam search.
+        const uint64_t    gapFloor = (cfg.minClickGap > 0 && prevPf + (uint64_t)cfg.minClickGap > prevRf)
+            ? prevPf + (uint64_t)cfg.minClickGap : prevRf;
+        const uint64_t    low  = std::max(gapFloor,
             cur.pressFrame > kMaxShift ? cur.pressFrame - kMaxShift : 1);
 
         // Prefix caching — moving click i can't affect any frame before `low`, so
@@ -431,8 +443,15 @@ void centerClicks(Level& sim, float end, const SolverConfig& cfg,
         // Cap so this click's release can't run into the next click.
         const uint64_t nextPf = (i + 1 < clicks.size()) ? clicks[i + 1].pressFrame
                                                          : (maxF + 1);
-        const uint64_t latestCap = (nextPf > hold + 1) ? (nextPf - hold - 1)
+        uint64_t latestCap = (nextPf > hold + 1) ? (nextPf - hold - 1)
                                                        : cur.pressFrame;
+        // Same minClickGap margin as `low` above, mirrored toward the NEXT click
+        // (its own centering pass hasn't run yet, so its current pressFrame is
+        // the best available bound — matches the existing overlap-prevention
+        // logic's own assumption just above).
+        if (cfg.minClickGap > 0 && nextPf > (uint64_t)cfg.minClickGap
+            && nextPf - (uint64_t)cfg.minClickGap < latestCap)
+            latestCap = nextPf - (uint64_t)cfg.minClickGap;
         uint64_t llo = cur.pressFrame,
                  lhi = std::min<uint64_t>(cur.pressFrame + kMaxShift, latestCap),
                  latest = cur.pressFrame;
@@ -462,9 +481,15 @@ void centerClicks(Level& sim, float end, const SolverConfig& cfg,
         // clicks so the extra full-run sims are only paid where they matter.
         if (bestWidth <= 4 && hold > 1) {
             auto widest = [&](uint64_t h, uint64_t& center) -> uint64_t {
-                const uint64_t hiCap = (nextPf > h + 1)
+                uint64_t hiCap = (nextPf > h + 1)
                     ? std::min<uint64_t>(cur.pressFrame + kMaxShift, nextPf - h - 1)
                     : cur.pressFrame;
+                // Same minClickGap margin as `latestCap` above — this scan has its
+                // own independent hiCap and would otherwise reintroduce the exact
+                // violation the outer bound was just fixed to prevent.
+                if (cfg.minClickGap > 0 && nextPf > (uint64_t)cfg.minClickGap
+                    && nextPf - (uint64_t)cfg.minClickGap < hiCap)
+                    hiCap = nextPf - (uint64_t)cfg.minClickGap;
                 uint64_t w = 0, c = 0, runStart = 0; bool inRun = false;
                 for (uint64_t pf = low; pf <= hiCap; ++pf) {
                     if (completesFrom({pf, pf + h})) {
@@ -488,6 +513,7 @@ void centerClicks(Level& sim, float end, const SolverConfig& cfg,
             ++centered;
         }
         prevRf = clicks[i].releaseFrame;
+        prevPf = clicks[i].pressFrame;
     }
 
     dlog("CENTER: shifted " + std::to_string(centered) + "/"

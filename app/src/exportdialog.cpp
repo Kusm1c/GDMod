@@ -69,4 +69,26 @@ std::optional<std::string> pickGdr2SavePath(const std::string& defaultFileName,
     return wideToUtf8(szFile);
 }
 
+std::optional<std::string> pickGdr2OpenPath(const std::string& initialDir) {
+    wchar_t szFile[MAX_PATH] = {0};
+
+    std::wstring wInitDir;
+    std::error_code ec;
+    if (!initialDir.empty() && std::filesystem::exists(initialDir, ec))
+        wInitDir = utf8ToWide(initialDir);
+
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize  = sizeof(ofn);
+    ofn.hwndOwner    = nullptr;
+    ofn.lpstrFile    = szFile;
+    ofn.nMaxFile     = MAX_PATH;
+    ofn.lpstrFilter  = L"GDR2 Replay (*.gdr2)\0*.gdr2\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!wInitDir.empty()) ofn.lpstrInitialDir = wInitDir.c_str();
+
+    if (!GetOpenFileNameW(&ofn)) return std::nullopt;
+    return wideToUtf8(szFile);
+}
+
 } // namespace gdapp

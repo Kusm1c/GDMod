@@ -19,6 +19,21 @@ inline double player_speeds[5] = {
 
 inline float player_speedmults[5] = {0.7f, 0.9f, 1.1f, 1.3f, 1.6f};
 
+// INVESTIGATED then REVERTED 2026-08-21 (DeCode): decompiled updateTimeMod.cpp shows
+// wave/dart Y-velocity as `m_playerSpeed * m_speedMultiplier` (player_speedmults[]
+// above * a separate per-tier table: 0.9/else->5.77000189, 0.7->5.980002,
+// 1.1->5.870002, 1.3 or 1.6->6.000002). Initially assumed the real->gdsim scale was
+// the usual x54 (confirmed all session for cube/ship velocities), giving 348.678 for
+// the 1.1x tier — which matched ONE real sample deceptively well. But direct
+// position-delta math (Δy/Δframe*240) on BOTH 85701165 and DeCode's wave sections
+// gives the ACTUAL rate as exactly player_speeds[speed] unmodified (e.g. 387.42 for
+// 1.1x, not 348.678) — and player_speedmults[s]*thatTable[s]*60 (not *54) matches
+// player_speeds[s] to 6 significant figures for every tier checked. So this decompiled
+// formula was never a bug: player_speeds[] already IS this exact product, just at a
+// x60 reference (matching GD's 60fps design-frame m_yVelocity convention, not the x54
+// used for cube/ship's world-space velocity) — gdsim's ORIGINAL plain player_speeds[]
+// lookup was correct the whole time. Keeping this note so the x54 trap isn't re-hit.
+
 double roundVel(double velocity, bool upsideDown);
 
 struct Object;
@@ -75,6 +90,17 @@ struct Player : public Entity {
     int pendingXSpeed;
     int frame;
     int robotHoldFrames; // frames since robot jump (Robot vehicle only)
+    // FOUND 2026-08-21 (DeCode, x~12300 Ball->Cube+gravity-flip cluster): the
+    // one-frame-stale-gravity resync (Level.cpp's GRAVFLIP-CORR) uses
+    // preFrameVelocity from BEFORE this frame's effects — when a vehicle just
+    // switched 0-2 frames ago, that velocity reflects the OLD vehicle's own
+    // scale/model (already transformed once by the switch's own halving logic),
+    // not a clean "this vehicle's normal accumulated velocity" the formula
+    // assumes. Real capture shows a SMOOTH position continuation through such a
+    // cluster where gdsim's formula introduces a sharp, wrong-direction jump.
+    // Default far in the past so a fresh Player never spuriously reads as
+    // "just switched." Set by VehiclePortal::collide().
+    long lastVehicleSwitchFrame = -1000;
 
     bool dead;
     const char* deathCause = nullptr; // set wherever dead is raised (debug)
@@ -92,6 +118,7 @@ struct Player : public Entity {
     bool dual;            // dual mode active this frame (set/cleared by DualPortal)
     bool isMirror;        // true for the dual mirror player (reads gameStates2 history)
 
+    
     // Special letter blocks (SpecialBlock.hpp / GD Creator School gameplay-objects
     // #3): set every frame the player's hitbox overlaps the matching modifier
     // object, reset at the top of the NEXT preCollision. Consulted by whichever
@@ -118,6 +145,11 @@ struct Player : public Entity {
     // impulse (jump/orb/pad), tells postCollision to retroactively correct
     // THIS frame's Y once the final post-impulse velocity is known.
     double preFrameVelocity = 0.0;
+    // Gravity step that preCollision ALREADY folded into pos.y before collisions ran
+    // (see its comment). postCollision subtracts it back out of whatever correction
+    // it applies, so the frame's final Y is unchanged — only what the COLLISION tests
+    // see moves. 0 on frames where no pre-step was applied.
+    double preAppliedGravStep = 0.0;
     bool   resyncPosition = false;
 
     Player();

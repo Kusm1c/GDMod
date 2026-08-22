@@ -17,6 +17,25 @@ Block::Block(Vec2D s, std::unordered_map<int, std::string>&& fields) : Object(s,
     if (fields[1] == "468" && size.y == 5) size.y -= 3.5f;
 }
 
+// TRIED 2026-08-17 (real Watch capture, level 2997354 "DeCode"): a fast-falling
+// Ship's hitbox exits a block's X-range ~0.5u before its Y-descent would have closed
+// a ~3-4u gap to the block's top; real GD lands it there (m_yVelocity snaps to 0 for
+// 3 frames at the position this block's top implies), gdsim's ship sails past because
+// Object::touching()'s plain current-frame AABB test never returns true, so
+// Block::collide()'s own landing threshold (`clip`) never runs to evaluate it. The
+// decompiled PlayerObject::collidedWithObjectInternal (src/gdp-2.2/PlayerObject/
+// PlayerObject_collidedWithObjectInternal.cpp:27-141) shows real GD's own candidate
+// gate isn't a bare AABB either — `maxSnapY = snapUpThreshold + playerBottom`,
+// further extended by the player's per-frame fall distance — evaluated BEFORE the
+// fine test. A Block::touching() override widening the gate by `clip` (matching
+// collide()'s own already-calibrated threshold, so in theory not a new leniency)
+// regressed 6/13 truth levels (146, 174, 21227933, 308, 77236587, 98414841 — several
+// MUCH worse, e.g. 174 sev 1.00->9.37), so real GD's actual gate is doing something
+// more selective than a flat clip-sized pad in every direction — likely genuinely
+// incorporating X-alignment/velocity-direction the way `floatG`/`adjustedYDelta` do,
+// not just a bigger box. Reverted; DeCode's specific corner-miss stays open. Do not
+// retry with a flat symmetric pad — need to actually port the decompile's directional
+// snap math (or get grounded-flag re-scanner truth) before touching this again.
 enum class SnapType { None, BigStair, LittleStair, DownStair };
 
 static float snapThreshold(Vec2D const& diff, Player const& p) {
@@ -108,12 +127,6 @@ void Block::collide(Player& p) const {
         }
     }
 
-    for (auto& entity : p.potentialSlopes) {
-        auto block_comp = entity->orientation < 2 ? getTop()         : getBottom();
-        auto slope_comp = entity->orientation < 2 ? entity->getBottom() : entity->getTop();
-        if (block_comp - slope_comp < 2) return;
-    }
-
     bool padHitBefore = (!p.prevPlayer().grounded && p.prevPlayer().velocity <= 0 && p.velocity > 0);
 
     // REVERTED 2026-08-11 (same day): this used to also OR in a swept/subframe
@@ -137,23 +150,43 @@ void Block::collide(Player& p) const {
     Entity curHb = p.blockDeathHitbox();
     bool blockHit = curHb.intersects(*this);
     constexpr float kSolidGraze = 0.75f;
-    {
-        // GD edge-graze leniency for solid vehicles (cube/robot/spider/ball): sliding
-        // PAST a block edge with a sub-unit overlap in the perpendicular axis is
-        // survivable in real GD (the famous corner-clip). Forgive when the overlap is
-        // tiny in EITHER axis — that's a graze along a face/corner, not a real hit. A
-        // deep overlap in BOTH axes (a true landing or wall-smash) still kills, so the
-        // calibrated 7×7 stays strict on platforms. Tolerance is well under the wave's
-        // 1.0 to keep the box maximally strict for the cube's tight-platform calibration.
-        // (Mini robot on 13711278 ~f2437: rising past a ledge, its death box grazed the
-        // top-left edge by penY≈0.5 — real survives, gdsim's bare AABB false-killed it.)
-        float penX = std::min(curHb.getRight(), getRight()) - std::max(curHb.getLeft(), getLeft());
-        float penY = std::min(curHb.getTop(),   getTop())   - std::max(curHb.getBottom(), getBottom());
-        if (getenv("GDSIM_BLOCKDEATH_DEBUG"))
-            std::fprintf(stderr, "BLOCKAPPROACH f=%llu typeId=%d rawHit=%d penX=%.3f penY=%.3f playerXY=(%.2f,%.2f)\n",
-                         (unsigned long long)p.frame, typeId, curHb.intersects(*this), penX, penY, p.pos.x, p.pos.y);
-        if (std::min(penX, penY) <= kSolidGraze) blockHit = false;
-    }
+    // GD edge-graze leniency for solid vehicles (cube/robot/spider/ball): sliding
+    // PAST a block edge with a sub-unit overlap in the perpendicular axis is
+    // survivable in real GD (the famous corner-clip). Forgive when the overlap is
+    // tiny in EITHER axis — that's a graze along a face/corner, not a real hit. A
+    // deep overlap in BOTH axes (a true landing or wall-smash) still kills, so the
+    // calibrated 7×7 stays strict on platforms. Tolerance is well under the wave's
+    // 1.0 to keep the box maximally strict for the cube's tight-platform calibration.
+    // (Mini robot on 13711278 ~f2437: rising past a ledge, its death box grazed the
+    // top-left edge by penY≈0.5 — real survives, gdsim's bare AABB false-killed it.)
+    float penX = std::min(curHb.getRight(), getRight()) - std::max(curHb.getLeft(), getLeft());
+    float penY = std::min(curHb.getTop(),   getTop())   - std::max(curHb.getBottom(), getBottom());
+    if (getenv("GDSIM_BLOCKDEATH_DEBUG"))
+        std::fprintf(stderr, "BLOCKAPPROACH f=%llu typeId=%d rawHit=%d penX=%.3f penY=%.3f playerXY=(%.2f,%.2f)\n",
+                     (unsigned long long)p.frame, typeId, curHb.intersects(*this), penX, penY, p.pos.x, p.pos.y);
+    if (std::min(penX, penY) <= kSolidGraze) blockHit = false;
+
+    // REMOVED 2026-08-14 (real playtest, level 2997354 "DeCode", user flagged
+    // typeId=468 at (870.75,105) via the app's J-flag tool — the TOP segment of
+    // the same stacked wall fixed on 2026-08-12, this time right where it meets
+    // slope id=665 above it, box bottom=120): a block-to-slope "seam" leniency
+    // used to live here — `for (auto& entity : p.potentialSlopes) { ... if
+    // (block_comp - slope_comp < 2) return; }`, unconditionally skipping this
+    // block's ENTIRE death check whenever some nearby touched slope's edge was
+    // within 2 units of this block's own edge, with NO check on the player's
+    // actual position or penetration depth at all. Intent was presumably to
+    // forgive a technical hit at a clean architectural join (wall leading
+    // straight into a ramp) — but that case is already covered by the graze
+    // check just above (any shallow hit is forgiven regardless of a nearby
+    // slope). This rule's only ADDITIONAL effect beyond the graze check was
+    // forgiving DEEP hits whenever a slope merely happened to be broadly
+    // "potential" (touching()'s own broad-phase reaches roughly ±15 units
+    // around a slope's box, not just its exact seam) — exactly the bug: a
+    // player ramming solidly into the middle of this wall segment near the
+    // slope above it sailed through untouched. No comment here ever cited a
+    // specific truth level or decompiled source for this rule (unlike nearly
+    // everything else in this file), so removed outright rather than guessing
+    // at a narrower gate — the graze check already handles the legitimate case.
     // Pre-existing overlap (the player was ALSO deeply inside this exact block on the
     // PREVIOUS frame) is not a new collision — GD kills on the TRANSITION into contact,
     // not a static "currently overlapping" state (same discriminator already used for
@@ -247,15 +280,42 @@ void Block::collide(Player& p) const {
                      "blockHit=%d notNewCollision=%d playerXY=(%.2f,%.2f) prevXY=(%.2f,%.2f) grounded=%d prevGrounded=%d\n",
                      (unsigned long long)p.frame, typeId, pos.x, pos.y, size.x, size.y, blockHit, notNewCollision,
                      p.pos.x, p.pos.y, p.prevPlayer().pos.x, p.prevPlayer().pos.y, p.grounded, p.prevPlayer().grounded);
+    // FOUND 2026-08-17 (real Watch capture, level 2997354 "DeCode", full
+    // per-frame real data): a KNIFE-THIN object (id 468, 1.5u wide — the same
+    // stacked wall already fixed twice this project for tunnel/seam issues) let
+    // the player's box "land on top" of it and snap Y up, freezing/interrupting
+    // a fall the real capture shows continuing completely uninterrupted at
+    // that exact spot (smooth, unbroken velocity — no grounding at all in
+    // reality). Two separate instances confirmed: one a hairline 0.26u corner
+    // graze, the other the object's FULL 1.5u width genuinely inside the
+    // player's box — so this isn't about graze depth, it's that an object this
+    // thin apparently never registers as a landable "floor" in real GD at all
+    // (it reads as a wall/support you fall past, not a step you catch), no
+    // matter how much of its sliver of width your box currently contains.
+    // FIRST tried gating only a sub-kSolidGraze corner touch — regressed 3
+    // truth levels (legit edge-of-platform landings on NORMAL-width blocks
+    // also start as a small first-contact overlap; that's real, intended
+    // platforming). So this exemption is scoped by WIDTH alone, not by
+    // penetration depth: only objects too thin for any real platform in
+    // Object.cpp's factory table (>=8u everywhere else) are exempt, and for
+    // those, unconditionally — a real player was never meant to land on a
+    // 1.5u knife-edge, full stop.
+    constexpr float kThinObjectMaxWidth = 5.f;
+    bool thinGraze = size.x < kThinObjectMaxWidth;
     if (blockHit && !p.touchingHBlock) {
         p.dead = true; p.deathCause = "block";
         p.deathObjType = typeId; p.deathObjPos = pos;
-    } else if (p.gravTop(*this) - bottom <= clip
+    } else if (p.gravTop(*this) - bottom <= clip && !thinGraze
                && (padHitBefore || p.velocity <= 0 || p.gravityPortal)) {
         p.pos.y = p.grav(p.gravTop(*this)) + p.grav(p.size.y / 2);
         if (!padHitBefore) p.grounded = true;
         if (p.slopeData.slope && p.slopeData.slope->angle() < 0) p.slopeData.slope = {};
-        if (p.vehicle.type == VehicleType::Cube) {
+        // Defensive (2026-08-18, real crash): p.level should always be set (see
+        // Level::rollback's fix, same date), but a null check here is a free,
+        // permanent guard against ANY future path that reaches collide() with an
+        // improperly-linked Player — costs nothing in the normal case, and turns
+        // a hard crash into "this frame's stair-snap cache just doesn't update".
+        if (p.vehicle.type == VehicleType::Cube && p.level) {
             if (!p.prevPlayer().grounded) {
                 // Snap only when ≥1 frame has passed since the tracked landing.
                 // Use the monotonic Player::frame (landingFrame) so the check is

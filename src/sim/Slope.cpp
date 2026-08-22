@@ -1,5 +1,6 @@
 #include "Slope.hpp"
 #include "Player.hpp"
+#include "Calib.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -164,10 +165,23 @@ void Slope::calc(Player& p) const {
             // slopeData.slope — they're intercepted by their own branches above in
             // collide() — so this path is Ball/Cube/Robot/Spider only in gdsim today).
             double vel = std::min(1.12 / p.grav(angle()), 1.54)
-                       * (size.y * player_speeds[p.speed] / size.x);
+                       * (size.y * player_speeds[p.speed] / size.x)
+                       * g_calib.slopeExitVelScale;
             if (p.vehicle.type == VehicleType::Ball) vel *= 0.75;
+            // FOUND 2026-08-17 (real Watch capture, level 2997354 "DeCode", full
+            // per-frame data — not just a sparse sample): real GD's Y barely moves
+            // on the exit frame itself (165.000 -> 164.951, essentially flat) even
+            // though yVel is already reported as the new launch value there — the
+            // NEW velocity's effect on POSITION doesn't land until the FOLLOWING
+            // frame. gdsim was integrating position with the new launch velocity
+            // on the SAME frame it's set (immediate +1.6u jump vs real's ~0u),
+            // exactly the "orb boost on a fresh touch lands next frame" deferral
+            // Orb.cpp already implements via velocityOverride (see its own comment:
+            // "GD applies the boost in checkCollisions — AFTER this step's
+            // updateJump") — same underlying engine-order cause, so the same fix.
             p.actions.push_back([vel](Player& p) {
                 p.velocity = roundVel(vel, p.upsideDown);
+                p.velocityOverride = true;
                 p.slopeData.slope = {};
                 p.slopeData.elapsed = 0;
                 p.slopeData.snapDown = false;
@@ -234,22 +248,39 @@ void Slope::calc(Player& p) const {
         // gravOrientPrev=3, expectedY climbing 93→105 while pos.y stayed pinned at
         // 73.5 for 28 straight frames, well past the slope's own physical x-span.
         //
-        // Deriving the FULL correct ride-Y/exit-velocity formula for this
-        // configuration needs real capture ground truth this project doesn't have
-        // yet (this file's own history — see the two "TRIED ... reverted" notes
-        // below — is exactly why an unverified slope-physics guess isn't shipped
-        // here). Minimal, safe fix: at minimum let the grip RELEASE once the player
-        // genuinely leaves the slope's hitbox, mirroring case 0/1/2's own release
-        // logic, so a stale grip can no longer freeze the player indefinitely and
-        // skip every later collision check. Once released, normal (already-
-        // validated) collision handling — including the ceiling-bonk/side-smash
-        // paths in Block.cpp — resumes engaging immediately.
+        // UPDATED 2026-08-14 (same spot flagged again — release-only wasn't enough:
+        // the player still sat with Y untracked for however long it stayed gripped
+        // before releasing, which is still a visible pass-through, just bounded
+        // instead of infinite). Added active ride-Y tracking, by direct structural
+        // analogy with case 0's own upsideDown split just above: gravOrient 0 is
+        // reached by EITHER (orientation 0, not upside-down) OR (orientation 3,
+        // upside-down), and case 0 already picks max() vs min() purely by testing
+        // `prevPlayer().upsideDown` — the object's raw orientation never enters that
+        // choice directly. gravOrient 3 is reached by the other two combinations
+        // — (orientation 3, not upside-down) or (orientation 0, upside-down, our
+        // case) — so the same upsideDown-keyed split is applied here, with the
+        // clamp direction INVERTED relative to case 0 (this is gravOrient 3, not 0):
+        // case 0 uses max when not-upside-down / min when upside-down; case 3 uses
+        // the opposite pairing. This is the most conservative, structurally-
+        // consistent choice available (reuses the exact test already validated for
+        // case 0) — but it is NOT verified against a real capture of this exact
+        // configuration (unlike almost everything else in this file, which is
+        // capture-checked; this project has twice shipped-then-reverted a wrong
+        // slope-physics sign guess before, see the notes below). If this still
+        // looks wrong in real GD, the fix is to capture a real run through this
+        // exact spot (RE scanner) rather than re-guess the sign again.
         if (!touching(p)) {
             p.actions.push_back(+[](Player& p) {
                 p.slopeData.slope = {};
                 p.slopeData.elapsed = 0.0;
                 p.slopeData.snapDown = false;
             });
+        }
+        if (p.gravBottom(p.prevPlayer()) != getTop()) {
+            if (p.prevPlayer().upsideDown)
+                p.pos.y = std::max((double)p.pos.y, expectedY(p));
+            else
+                p.pos.y = std::min((double)p.pos.y, expectedY(p));
         }
     }
 }

@@ -16,6 +16,31 @@ gdsim collapses (1)+(2) into `Slope::expectedY` + `Slope::collide` + `Slope::cal
 ---
 
 ## FIXED
+### ✅ 2026-08-14 session: #2 exit-velocity magnitude, measured against a REAL capture (first time this gap had actual ground truth)
+The 2026-08-06 pass removed the unexplained `0.9`/time-ramp but never validated the
+REMAINING formula's magnitude against real data (this doc's own gap #2 still listed
+"re-derive against a real slope capture" as outstanding). Got that capture 2026-08-14:
+a real playtest kept reporting "the cube goes further in gdsim than in real GD" near
+DeCode's (2997354) very first slope — captured via the RE scanner
+(`testlevel/GDMod_physics_2997354.txt`, cube, 0.9x speed, 45° climb). Recovered the
+real launch velocity from the captured POSITION deltas right after leaving the ramp
+(world-Y delta ÷ raw `m_yVelocity`, averaged over the first 3 post-launch frames where
+that ratio is cleanest ≈0.2183, i.e. a ≈52.4 world-units/sec-per-raw-m_yVelocity-unit
+conversion factor — confirmed independently via the position/velocity data's OWN
+consistent -0.216/frame linear decay), giving ≈388 units/sec. gdsim's own formula for
+the identical angle/speed computes 444.3 — a clean, consistent **~14.5% overshoot**.
+Since peak arc height scales with the SQUARE of launch velocity, this measurably
+carries the cube higher/further than real GD every time it launches off a slope —
+matching the reported symptom exactly. Fixed via a new calibration knob
+(`CalibParams::slopeExitVelScale`, `src/sim/Calib.hpp`, default 0.873 = 1/1.145),
+applied as a flat overall scale rather than picking one sub-term (1.12, the
+player-speed term, or the angle term) to blame — one capture at one angle/speed can't
+disentangle which sub-term is actually responsible; if a future capture at a DIFFERENT
+angle/speed shows a different overshoot ratio, that's the signal to dig into a specific
+term instead of this flat scale. `test/regress.sh` 13/13 clean; 157-macro batch:
+7 levels' death frame shifted (expected — trajectory-changing fix), CLEAR count
+unchanged (1/157, none lost/gained).
+
 ### ✅ 2026-08-06 session: #1 newSlopeScalar, #2 exit-velocity 0.9/time-ramp, wave multi-slope arbitration
 Triggered by the user's wave level (68839068) repeatedly failing to solve. Findings:
 - **#1 newSlopeScalar**: ported into `Slope::expectedY` — `isNewSlopeTransition()` detects a
@@ -95,7 +120,7 @@ up to 20u → the player pops/sinks, which is exactly the "fragile slope-launch"
 6508283 floor-slope fall-through class. **Fix needs gdsim to know the previous slope's
 id + orientation (it tracks `slopeData.slope` already) and player size.**
 
-### #2 — exit launch velocity: gdsim's formula diverges from `m_slopeVelocity`
+### #2 — exit launch velocity: gdsim's formula diverges from `m_slopeVelocity` — PARTIALLY ADDRESSED 2026-08-14 (see FIXED section above: magnitude now calibrated via `slopeExitVelScale`, but the sub-term breakdown below is still unverified against real data and worth revisiting if a different angle/speed capture shows a different overshoot ratio)
 Real:
 ```
 slopeYVelocity   = (height * m_playerSpeed * m_speedMultiplier) / width;

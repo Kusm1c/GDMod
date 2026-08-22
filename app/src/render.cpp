@@ -36,22 +36,51 @@ static void drawWorldQuad(const Vector2 wpts[4], const Camera2DState& cam, int s
         for (int i = 0; i < 4; i++) DrawLineEx(s[i], s[(i + 1) % 4], outlineThick, outline);
 }
 
-// A handful of recognisable GD colours for common effect objects; anything
-// else falls back to a neutral white so it's still visible without needing a
-// full ID table (this app is meant to look like a schematic, not the game).
+// Real in-game GD colours for transporters (orbs/pads) and portals, so the
+// app's hitbox-only view still reads at a glance which is which — added
+// 2026-08-18 alongside the portal hitbox-size fix (Object.cpp) once real
+// measured hitboxes made it worth actually drawing them instead of a small
+// generic circle. Orb/pad colours are the game's own named colours (exact);
+// vehicle-portal colours match each mode's real GD ring tint from memory —
+// flag any that look wrong against a real capture, they're the least certain
+// entries here.
 static Color effectColor(int typeId) {
     switch (typeId) {
-        case 36:  case 35:  return YELLOW;               // yellow orb / pad
-        case 84:  case 67:  return SKYBLUE;               // blue orb / pad
-        case 141: case 140: return MAGENTA;               // pink orb / pad
-        case 1333: case 1332: return RED;                 // red orb / pad
-        case 1022: return GREEN;                          // green orb
-        case 1704: return ORANGE;                         // dash orb
-        case 1751: return PURPLE;                         // gravity-flip orb
-        case 1330: return BLACK;                          // black orb
-        case 3004: return DARKPURPLE;                      // spider/teleport orb
-        case 10:   return SKYBLUE;                        // gravity portal (normal)
-        case 11:   return SKYBLUE;                        // gravity portal (flipped)
+        // Transporters: orbs / pads (exact — these ARE named by colour in GD)
+        case 36:  case 35:  return YELLOW;                // yellow orb / pad
+        case 84:  case 67:  return SKYBLUE;                // blue orb / pad
+        case 141: case 140: return MAGENTA;                // pink orb / pad
+        case 1333: case 1332: return RED;                  // red orb / pad
+        case 1022: return GREEN;                           // green orb
+        case 1704: return ORANGE;                          // dash orb
+        case 1751: return PURPLE;                           // gravity-flip orb
+        case 1330: return BLACK;                            // black orb
+        case 3004: return DARKPURPLE;                        // spider/teleport orb
+
+        // Vehicle portals (mode entry rings)
+        case 12:   return RAYWHITE;                         // cube
+        case 13:   return SKYBLUE;                          // ship
+        case 47:   return PURPLE;                           // ball
+        case 111:  return ORANGE;                           // ufo
+        case 660:  return LIME;                             // wave
+        case 745:  return GREEN;                            // robot
+        case 1331: return DARKPURPLE;                        // spider
+        case 1933: return GOLD;                              // swing (2.2)
+        case 2751: return RAYWHITE;                          // (rare vehicle-portal id)
+
+        // Gravity / size / dual / teleport
+        case 10:   return SKYBLUE;                          // gravity portal (normal)
+        case 11:   return DARKBLUE;                          // gravity portal (flipped)
+        case 99:   return PINK;                              // mini size portal
+        case 101:  return MAGENTA;                            // big size portal
+        case 286:  case 287: return SKYBLUE;                  // dual portal (both halves)
+        case 747:  return ORANGE;                             // teleport portal
+        case 45:   case 46:  return LIGHTGRAY;                // mirror portal on/off
+
+        // Speed portals (all one teal family, distinguished by hitbox width only
+        // — raylib has no predefined TEAL constant, so this is a literal RGBA).
+        case 200:  case 201: case 202: case 203: case 1334: return Color{0, 180, 180, 255};
+
         default:   return RAYWHITE;
     }
 }
@@ -114,6 +143,19 @@ static bool isSlope(int typeId) {
     }
 }
 static bool isSlopeHazard(int typeId) { return typeId == 1717 || typeId == 1718; }
+
+// Kept in sync by hand with Hazard.cpp's isBigRadiusSawblade: 675/1734 (32),
+// 676/1735 (17.51) and 677/1736 (12.48) are one sawblade sprite at 3 editor
+// scales and all use radius=size.x (not size.x/2 like every other sawblade
+// id). 675/1734 and 677/1736 are directly capture/flag-evidenced; 676/1735 is
+// the bracketed middle tier of the same explicit family. Same reason as
+// isSawblade above: the renderer can't see gdsim's C++ class internals, only
+// typeId.
+static bool isBigRadiusSawblade(int typeId) {
+    return typeId == 675 || typeId == 1734
+        || typeId == 676 || typeId == 1735
+        || typeId == 677 || typeId == 1736;
+}
 
 // Right-triangle vertices (LOCAL box space, box already centred at the
 // object's own pos) for each of gdsim's 4 slope orientations — derived
@@ -211,26 +253,18 @@ static void drawObject(const gdsim::Object* o, float x, float y, float rotDeg,
         int tw = MeasureText(label, fontSize);
         DrawText(label, (int)(center.x - tw * 0.5f), (int)(center.y - fontSize * 0.5f), fontSize, c);
     } else if (o->prio == 2) {
-        // Hazard: draw the object's nominal sprite footprint as a faint
-        // outline (context only — NOT collision-relevant) and the actual
-        // gdsim collision shape filled bright red, so it's obvious which
-        // part of a spike you can safely stand next to.
-        float hw = o->size.x * 0.5f, hh = o->size.y * 0.5f;
-        Vector2 outline[4] = {
-            rotateLocal(-hw, -hh, rotDeg, x, y), rotateLocal(hw, -hh, rotDeg, x, y),
-            rotateLocal(hw, hh, rotDeg, x, y),   rotateLocal(-hw, hh, rotDeg, x, y),
-        };
-        {
-            Vector2 s[4];
-            for (int i = 0; i < 4; i++) s[i] = worldToScreen(outline[i].x, outline[i].y, cam, screenW, screenH);
-            for (int i = 0; i < 4; i++) DrawLineEx(s[i], s[(i + 1) % 4], 1.f, Color{120, 60, 60, 160});
-        }
-
+        // Hazard: draw ONLY the actual gdsim collision shape, filled bright
+        // red. (Used to also draw the nominal sprite footprint as a faint
+        // context-only outline — removed 2026-08-18: not a hitbox, and the
+        // app is meant to show hitboxes only.)
         if (isSawblade(o->typeId)) {
-            // Circle hitbox: radius = size.x/2, centred at pos (Hazard.cpp
-            // Sawblade::touching) — rotation-invariant, no vertex math needed.
+            // Circle hitbox centred at pos (Hazard.cpp Sawblade::touching) —
+            // rotation-invariant, no vertex math needed. Radius is size.x/2
+            // for every sawblade class EXCEPT 675/1734, which uses the full
+            // size.x (see isBigRadiusSawblade).
+            float radius = isBigRadiusSawblade(o->typeId) ? o->size.x : (o->size.x * 0.5f);
             Vector2 c = worldToScreen(x, y, cam, screenW, screenH);
-            DrawCircleV(c, (o->size.x * 0.5f) * cam.pixelsPerUnit, Color{230, 40, 40, 220});
+            DrawCircleV(c, radius * cam.pixelsPerUnit, Color{230, 40, 40, 220});
         } else {
             // Small offset rectangle: hw=0.22*sizeX, hh=0.25*sizeY, centred
             // 0.25*sizeY above the object's own centre (LOCAL +Y, before
@@ -247,14 +281,21 @@ static void drawObject(const gdsim::Object* o, float x, float y, float rotDeg,
             drawWorldQuad(wpts, cam, screenW, screenH, Color{230, 40, 40, 220}, Color{255, 140, 140, 255}, 1.f);
         }
     } else {
-        // Effect object (orb/pad/portal/trigger-ish): small coloured circle.
-        // These aren't rotation-critical to show accurately (touch, not a
-        // solid hitbox), so a plain circle stays honest enough.
-        float w = o->size.x * cam.pixelsPerUnit, h = o->size.y * cam.pixelsPerUnit;
-        Vector2 center = worldToScreen(x, y, cam, screenW, screenH);
-        float r = std::max(w, h) * 0.35f;
-        DrawCircleV(center, r, effectColor(o->typeId));
-        DrawCircleLines((int)center.x, (int)center.y, r, Color{20, 20, 20, 200});
+        // Effect object (orb/pad/portal/trigger-ish): draw the REAL touch
+        // hitbox — o->size, exactly what Object::touching() tests against —
+        // as a rectangle in the object's own GD colour (effectColor above),
+        // not a generic circle. Changed 2026-08-18 alongside the portal
+        // hitbox-size fix: now that Object.cpp's sizes are the real measured
+        // values, showing the actual box (not a stand-in circle) is what
+        // makes this app's "hitboxes only" view actually trustworthy for
+        // portals/transporters.
+        float hw = o->size.x * 0.5f, hh = o->size.y * 0.5f;
+        Color c = effectColor(o->typeId);
+        Vector2 wpts[4] = {
+            rotateLocal(-hw, -hh, rotDeg, x, y), rotateLocal(hw, -hh, rotDeg, x, y),
+            rotateLocal(hw, hh, rotDeg, x, y),   rotateLocal(-hw, hh, rotDeg, x, y),
+        };
+        drawWorldQuad(wpts, cam, screenW, screenH, Color{c.r, c.g, c.b, 130}, c, 1.5f);
     }
 }
 
@@ -339,6 +380,47 @@ void drawHitboxTrail(const std::vector<TrailPoint>& trail,
         Vector2 c = worldToScreen(t.pos.x, t.pos.y, cam, screenW, screenH);
         DrawRectangleLines((int)(c.x - sizeW * 0.5f), (int)(c.y - sizeH * 0.5f),
                             (int)sizeW, (int)sizeH, Color{80, 220, 120, alpha});
+    }
+}
+
+void drawCenterPath(const std::vector<TrailPoint>& trail,
+                     const Camera2DState& cam, int screenW, int screenH) {
+    if (trail.size() < 2) return;
+    // Bright cyan-white, thin — deliberately distinct from both the green
+    // hitbox trail and the orange physics trail.
+    const Color kCenterColor{140, 235, 255, 200};
+    Vector2 prev = worldToScreen(trail[0].pos.x, trail[0].pos.y, cam, screenW, screenH);
+    for (size_t i = 1; i < trail.size(); i++) {
+        Vector2 cur = worldToScreen(trail[i].pos.x, trail[i].pos.y, cam, screenW, screenH);
+        if ((prev.x < -50 && cur.x < -50) || (prev.x > screenW + 50 && cur.x > screenW + 50)) {
+            prev = cur;
+            continue;
+        }
+        DrawLineEx(prev, cur, 1.f, kCenterColor);
+        prev = cur;
+    }
+}
+
+void drawPhysicsTrail(const std::vector<RealTrailPoint>& trail, float offsetX, float offsetY,
+                       const Camera2DState& cam, int screenW, int screenH) {
+    if (trail.size() < 2) return;
+    // Bright orange, thick enough to read clearly against both the level
+    // geometry (greys/reds) and the live sim trail (green) — deliberately a
+    // colour nothing else in this renderer uses.
+    const Color kRealColor{255, 150, 30, 220};
+    auto toScreen = [&](const gdsim::Vec2D& p) {
+        return worldToScreen(p.x - offsetX, p.y - offsetY, cam, screenW, screenH);
+    };
+    Vector2 prev = toScreen(trail[0].pos);
+    for (size_t i = 1; i < trail.size(); i++) {
+        Vector2 cur = toScreen(trail[i].pos);
+        // Cheap off-screen skip: both endpoints far outside the viewport.
+        if ((prev.x < -50 && cur.x < -50) || (prev.x > screenW + 50 && cur.x > screenW + 50)) {
+            prev = cur;
+            continue;
+        }
+        DrawLineEx(prev, cur, 2.f, kRealColor);
+        prev = cur;
     }
 }
 

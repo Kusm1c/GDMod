@@ -424,6 +424,11 @@ class $modify(MyPlayLayer, PlayLayer) {
         // the time this runs; this just confirms + captures telemetry, never retries.
         bool m_confirmOnlyActive = false;
         bool m_confirmDone       = false;
+        // PlayLayer::init() calls resetLevel() once itself, during normal startup,
+        // BEFORE the first postUpdate ever ticks — not a real user retry. Only start
+        // treating resetLevel() as a genuine mid-pass retry (and cancelling the
+        // confirm-only pass) after at least one confirm-only postUpdate tick has run.
+        bool m_confirmTicked     = false;
 
         // ========== Sim-vs-game divergence detector (runs during auto-repair trials) ==========
         // Runs gdsim in lockstep with the live replay and logs the first frame
@@ -542,7 +547,26 @@ class $modify(MyPlayLayer, PlayLayer) {
                 if (obj->m_isPassable) {
                     isSolid = false;
                 }
-                if (!isSolid && !isHazard) {
+                // PORTALS TOO (2026-08-22): portals are neither Solid nor Hazard, so
+                // this filter silently dropped every one of them and the capture files
+                // contain only solids/hazards. But gdsim's portal TRIGGER geometry is
+                // currently guessed (Object.cpp hardcodes gravity portals as 30x75),
+                // and DeCode's flip timing proves that guess is wrong — solving the
+                // Y-gated portal at x=1905 for its implied height gives ~25-29, not 75.
+                // Capture the engine's own rect for portal ids so the real size can be
+                // read instead of tuned around. They record with type "other" (isSolid
+                // and isHazard both false), which no existing consumer treats as
+                // collidable, so nothing downstream changes.
+                static const std::unordered_set<int> kPortalIds = {
+                    10, 11,                              // gravity (down / up)
+                    12, 13, 47, 111, 660, 745, 1331, 1933, 2751,  // vehicle
+                    99, 101,                             // size (big / mini)
+                    200, 201, 202, 203, 1334,            // speed
+                    286, 287,                            // dual
+                    747,                                 // teleport
+                };
+                const bool isPortal = kPortalIds.count(obj->m_objectID) != 0;
+                if (!isSolid && !isHazard && !isPortal) {
                     return;
                 }
 
@@ -796,23 +820,25 @@ class $modify(MyPlayLayer, PlayLayer) {
             } else if (g_confirmRequested.exchange(false)) {
                 // ===== Confirm-only mode: ONE real-game pass, no repair loop =====
                 // The .gdr2 was already written before play() was called (doSimulate).
-                // This just runs the solve once for real, at speed, so a divergence
-                // from gdsim gets logged/captured (updateDivergenceDetector already
-                // writes a full truth capture for ANY active replay) instead of going
-                // undetected — but nothing here can withhold or retry the .gdr2.
+                // This just runs the solve once for real, so a divergence from gdsim
+                // gets logged/captured (updateDivergenceDetector already writes a full
+                // truth capture for ANY active replay) instead of going undetected —
+                // but nothing here can withhold or retry the .gdr2.
+                //
+                // Unlike auto-repair (a real bot loop that needs speed + hidden render
+                // to burn through thousands of trials), this is the user-facing "Watch"
+                // button — the whole point is to actually SEE the replay, at normal
+                // speed, so it stays visible and at 1x (explicit user request).
                 fields->m_confirmOnlyActive = true;
                 fields->m_confirmDone       = false;
+                fields->m_confirmTicked     = false;
                 s_replayStepHold   = false;
                 s_replayStepActive = false;
                 s_replayStepTime   = 0.0;
                 g_replayExternalCommands.liveReplayActive.store(true);
                 g_replayExternalCommands.livePaused.store(false);
                 this->togglePracticeMode(false);
-                if (this->m_objectLayer)            this->m_objectLayer->setVisible(false);
-                if (this->m_inShaderObjectLayer)    this->m_inShaderObjectLayer->setVisible(false);
-                if (this->m_aboveShaderObjectLayer) this->m_aboveShaderObjectLayer->setVisible(false);
-                CCDirector::sharedDirector()->getScheduler()->setTimeScale(s_autoRepairSpeed);
-                log::info("[Confirm] start: level {}, speed {}x", g_replayPlayer.levelId, s_autoRepairSpeed);
+                log::info("[Confirm] start: level {}, visible, 1x speed", g_replayPlayer.levelId);
             }
         }
 
@@ -1439,8 +1465,7 @@ class $modify(MyPlayLayer, PlayLayer) {
 
         // ===== Confirm-only driver: ONE pass, report death/finish, never retry =====
         if (m_fields->m_confirmOnlyActive && !m_fields->m_confirmDone) {
-            auto sched = CCDirector::sharedDirector()->getScheduler();
-            sched->setTimeScale(s_autoRepairSpeed);
+            m_fields->m_confirmTicked = true;
             g_replayExternalCommands.liveReplayActive.store(true);
             g_replayExternalCommands.livePaused.store(false);
             if (g_replayPlayer.replay.has_value() && g_replayPlayer.replay->framerate > 0.0) {
@@ -1716,17 +1741,19 @@ class $modify(MyPlayLayer, PlayLayer) {
         if (!fields->m_active) return;
     }
 
-    // Death-debug: when the player dies during an auto-repair trial, write a full
-    // report of WHAT killed it and WHY (killing object, player state, and the gdsim
-    // comparison — did the sim predict this death?). One report per attempt, to
-    // GDMod_death_debug.txt.
+    // Death-debug: when the player dies during an auto-repair trial OR a confirm-
+    // only watch, write a full report of WHAT killed it and WHY (killing object,
+    // player state, and the gdsim comparison — did the sim predict this death?).
+    // p1 is the REAL GameObject GD itself attributes the kill to — the authoritative
+    // answer, unlike the divergence detector's nearby-hazard proximity guess. One
+    // report per attempt, to GDMod_death_debug.txt.
     void destroyPlayer(PlayerObject* p0, GameObject* p1) {
         auto fields = m_fields.self();
         PlayerObject* pl = p0 ? p0 : m_player1;
         // GD calls destroyPlayer once during level setup (frame ~1, player still at
         // spawn, with a placeholder object) — skip it so it doesn't consume the
         // one-report flag and mask the REAL death. Nothing kills you this early.
-        if (fields->m_autoRepairActive && !fields->m_deathLogged && pl && m_timePlayed > 0.06f) {
+        if ((fields->m_autoRepairActive || fields->m_confirmOnlyActive) && !fields->m_deathLogged && pl && m_timePlayed > 0.06f) {
             fields->m_deathLogged = true;
             uint64_t frame = (uint64_t)std::llround((double)m_timePlayed * fields->m_framerate);
             float px = pl->getPositionX(), py = pl->getPositionY();
@@ -1887,8 +1914,11 @@ class $modify(MyPlayLayer, PlayLayer) {
         }
         // Confirm-only is a single pass, not a retry loop — a manual reset mid-pass
         // (practice mode, user hit retry) just drops out of it quietly instead of
-        // trying to keep going, so speed/render state can't get stuck.
-        if (fields->m_confirmOnlyActive && !fields->m_confirmDone) {
+        // trying to keep going, so speed/render state can't get stuck. But
+        // PlayLayer::init() itself calls resetLevel() once during normal startup —
+        // before any postUpdate tick — so ignore that first, automatic call (see
+        // m_confirmTicked) instead of cancelling the pass before it ever begins.
+        if (fields->m_confirmOnlyActive && !fields->m_confirmDone && fields->m_confirmTicked) {
             fields->m_confirmOnlyActive = false;
             fields->m_confirmDone       = true;
             g_replayExternalCommands.liveReplayActive.store(false);

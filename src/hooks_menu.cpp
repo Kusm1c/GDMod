@@ -506,10 +506,17 @@ protected:
             menu->addChild(b);
         }
 
+        // Watch: launch the most recent solve for REAL, with frame-perfect click
+        // injection (the "Confirm-only" path in hooks_play.cpp — already fully
+        // implemented, just never had a UI trigger). One real pass, no repair loop;
+        // reports clear/diverge and — critically — updateDivergenceDetector writes
+        // a full GDMod_truth_<id>.txt (real per-frame x/y/yVel + the exact presses)
+        // for the fidelity harness (test/regress.sh import / --hunt).
+        mkBtn("Watch",      "GJ_button_01.png", menu_selector(PathfinderMenuPopup::onWatch),  cx - 70.f, ry - 228.f);
         // Export the most recent solve's .gdr2 to a user-chosen path (Solve no
         // longer auto-launches the level — see doSimulate — so this is how you get
         // a copy anywhere other than the automatic Eclipse/mod-save-dir locations).
-        mkBtn("Export...", "GJ_button_04.png", menu_selector(PathfinderMenuPopup::onExport), cx, ry - 228.f);
+        mkBtn("Export...", "GJ_button_04.png", menu_selector(PathfinderMenuPopup::onExport), cx + 70.f, ry - 228.f);
 
         return true;
     }
@@ -536,6 +543,27 @@ protected:
     // with whatever was used last time via Mod::get()'s saved-value store (no
     // mod.json setting for this — that's for user-facing declared options, not a
     // silently-updated internal value).
+    // Arm confirm-only replay mode from the last solve and launch the level for
+    // real. g_confirmRequested is consumed once in PlayLayer::init (hooks_play.cpp)
+    // — it injects the exact click list frame-by-frame (s_perStepReplay) at
+    // s_autoRepairSpeed, no retry/repair loop, and reports pass/fail via
+    // confirmOnlyFinish. updateDivergenceDetector runs unconditionally for any
+    // active replay, so this is also how a real GDMod_truth_<id>.txt gets recorded.
+    void onWatch(CCObject*) {
+        if (!g_lastSolvedExport.available) {
+            FLAlertLayer::create("Watch", "No solved replay yet - run Solve first.", "OK")->show();
+            return;
+        }
+        g_replayPlayer.isActive = true;
+        g_replayPlayer.replay   = g_lastSolvedExport.replay;
+        g_replayPlayer.levelId  = g_lastSolvedExport.levelId;
+        g_confirmRequested.store(true);
+        Notification::create("Watching in real GD...", NotificationIcon::Loading, 2.f)->show();
+        auto p = m_play;
+        this->onClose(nullptr);
+        p();
+    }
+
     void onExport(CCObject*) {
         if (!g_lastSolvedExport.available) {
             FLAlertLayer::create("Export", "No solved replay yet - run Solve first.", "OK")->show();
