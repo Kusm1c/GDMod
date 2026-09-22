@@ -29,15 +29,26 @@ bool Orb::touching(Player const& p) const {
     return EffectObject::touching(p) || EffectObject::touching(p.prevPlayer());
 }
 
-const velocity_map<OrbType, VehicleType, bool> orb_velocities = {
-    {{OrbType::Yellow, VehicleType::Cube,  false}, {573.48,       603.72,       616.68,       606.42}},
-    {{OrbType::Yellow, VehicleType::Cube,  true},  {458.784,      482.976,      481.734,      485.136}},
-    {{OrbType::Yellow, VehicleType::Ship,  false}, {573.48,       603.72,       616.68,       606.42}},
-    {{OrbType::Yellow, VehicleType::Ship,  true},  {458.784,      482.976,      481.734,      485.136}},
+// The yellow rows are now DERIVED, not captured: PlayerObject::ringJump sets
+// `v = flipMod * m_yStart * (mini ? 0.8 : 1.0)` and applies no type multiplier at
+// all for the yellow ring, so yellow == the plain jump impulse == cubeJumpHeight[]
+// (m_yStart * 54, transcribed bit-exact from updateTimeMod).
+//
+// That exposed one real defect. Three of the four mini tiers already matched
+// 0.8*jump to 1e-5; the 2x tier did not, and its shortfall was 0.215026 internal
+// units against a 2x gravity step of 0.215370 - i.e. that one sample had been
+// captured a frame late, after gravity had already decayed it, and 8.92066
+// quantises to exactly the 8.921 that was recorded. 481.734 -> 493.3453824,
+// a 2.4% correction on mini-2x yellow orbs.
+velocity_map<OrbType, VehicleType, bool> orb_velocities = {
+    {{OrbType::Yellow, VehicleType::Cube,  false}, {573.481728,   603.7217159271, 616.681728,   606.421728}},
+    {{OrbType::Yellow, VehicleType::Cube,  true},  {458.7853824,  482.9773727417, 493.3453824,  485.1373824}},
+    {{OrbType::Yellow, VehicleType::Ship,  false}, {573.481728,   603.7217159271, 616.681728,   606.421728}},
+    {{OrbType::Yellow, VehicleType::Ship,  true},  {458.7853824,  482.9773727417, 493.3453824,  485.1373824}},
     {{OrbType::Yellow, VehicleType::Ball,  false}, {401.435993,   422.60399,    431.67599,    424.493993}},
     {{OrbType::Yellow, VehicleType::Ball,  true},  {321.148795,   338.08319,    345.34079,    339.59519}},
-    {{OrbType::Yellow, VehicleType::Ufo,   false}, {573.48,       603.72,       616.68,       606.42}},
-    {{OrbType::Yellow, VehicleType::Ufo,   true},  {458.784,      482.976,      481.734,      485.136}},
+    {{OrbType::Yellow, VehicleType::Ufo,   false}, {573.481728,   603.7217159271, 616.681728,   606.421728}},
+    {{OrbType::Yellow, VehicleType::Ufo,   true},  {458.7853824,  482.9773727417, 493.3453824,  485.1373824}},
     {{OrbType::Blue,   VehicleType::Cube,  false}, {-229.392,     -241.488,     -246.672,     -242.568}},
     {{OrbType::Blue,   VehicleType::Cube,  true},  {-183.519,     -193.185,     -197.343,     -194.049}},
     {{OrbType::Blue,   VehicleType::Ship,  false}, {-229.392,     -241.488,     -246.672,     -242.568}},
@@ -54,29 +65,72 @@ const velocity_map<OrbType, VehicleType, bool> orb_velocities = {
     {{OrbType::Pink,   VehicleType::Ball,  true},  {247.287596,   260.3286,     265.923,      261.5004}},
     {{OrbType::Pink,   VehicleType::Ufo,   false}, {240.84,       253.584,      258.984,      254.718}},
     {{OrbType::Pink,   VehicleType::Ufo,   true},  {192.672,      202.824,      207.198,      203.742}},
-    {{OrbType::Red,    VehicleType::Cube,  false}, {779.976,      821.448,      839.43,       825.174}},
-    {{OrbType::Red,    VehicleType::Cube,  true},  {621.702,      654.858,      669.222,      657.828}},
-    {{OrbType::Red,    VehicleType::Ship,  false}, {569.754,      599.994,      612.954,      602.694}},
-    {{OrbType::Red,    VehicleType::Ship,  true},  {637.902,      671.814,      686.286,      674.838}},
-    {{OrbType::Red,    VehicleType::Ball,  false}, {530.928,      559.278,      571.482,      561.816}},
-    {{OrbType::Red,    VehicleType::Ball,  true},  {423.36,       446.04,       455.76,       448.092}},
-    {{OrbType::Red,    VehicleType::Ufo,   false}, {577.962,      608.85,       622.026,      611.604}},
-    {{OrbType::Red,    VehicleType::Ufo,   true},  {615.762,      648.648,      662.742,      651.564}},
-    {{OrbType::Green,  VehicleType::Cube,  false}, {562.032,      592.056,      605.07,       594.756}},
-    {{OrbType::Green,  VehicleType::Cube,  true},  {447.336,      471.312,      481.734,      485.136}},
-    {{OrbType::Green,  VehicleType::Ship,  false}, {406.08,       427.248,      432,          429.138}},
-    {{OrbType::Green,  VehicleType::Ship,  true},  {326.592,      343.548,      350.784,      345.06}},
-    {{OrbType::Green,  VehicleType::Ball,  false}, {394.47,       415.638,      424.71,       417.528}},
-    {{OrbType::Green,  VehicleType::Ball,  true},  {314.172,      331.074,      331.074,      332.586}},
-    // Green UFO (false) was a flat {432} placeholder = 8.01 yVel, but real-engine
-    // capture (RING 1022 UFO) gives 11.23 == the Green Cube progression. Mirror Cube.
-    {{OrbType::Green,  VehicleType::Ufo,   false}, {562.032,      592.056,      605.07,       594.756}},
-    {{OrbType::Green,  VehicleType::Ufo,   true},  {450.576,      474.768,      485.136,      476.928}},
+    // DERIVED 2026-09-11 = cubeJumpHeight[tier] * typeMult * sizeMult, with
+    // ringJump's red branch giving typeMult = ship 1.0 big / 1.4 mini, UFO 1.02 big
+    // / 1.36 mini, ball 1.34, robot 1.28, spider 1.34, everything else 1.38 — then
+    // the ball/spider 0.7 post-scale.
+    //
+    // All 32 old cells were low by EXACTLY one gravity step of their own vehicle
+    // and band, which is what makes replacing the row wholesale safe rather than
+    // cell by cell:
+    //     cube  0.2116 0.2164 0.2146 0.2164   vs cube step  0.2115 0.2156 0.2154 0.2163
+    //     ball  0.1296 0.1299 0.1290 0.1298   vs ball step  0.6 * cube = 0.1294
+    //     UFO   0.1294 0.1286 0.1294 0.1286   vs UFO strong 0.6 * cube = 0.1294
+    //     ship  0.0690 x4                     vs ship down-weak 0.32 * cube = 0.0690
+    //     ship mini 0.0814 0.0806 ...         vs the same / 0.85 = 0.0812
+    // i.e. the whole row was read one frame after the boost landed, with the
+    // capture FALLING (not holding) in ship mode. Not one cell is unexplained.
+    {{OrbType::Red,    VehicleType::Cube,  false}, {791.4047846,  833.1359680,  851.0207846,  836.8619846}},
+    {{OrbType::Red,    VehicleType::Cube,  true},  {633.1238277,  666.5087744,  680.8166277,  669.4895877}},
+    {{OrbType::Red,    VehicleType::Ship,  false}, {573.4817280,  603.7217159,  616.6817280,  606.4217280}},
+    {{OrbType::Red,    VehicleType::Ship,  true},  {642.2995354,  676.1683218,  690.6835354,  679.1923354}},
+    {{OrbType::Red,    VehicleType::Ball,  false}, {537.9258517,  566.2909599,  578.4474510,  568.8235712}},
+    {{OrbType::Red,    VehicleType::Ball,  true},  {430.3406814,  453.0327679,  462.7579608,  455.0588569}},
+    {{OrbType::Red,    VehicleType::Ufo,   false}, {584.9513626,  615.7961502,  629.0153626,  618.5501626}},
+    {{OrbType::Red,    VehicleType::Ufo,   true},  {623.9481201,  656.8492269,  670.9497201,  659.7868401}},
+    // DERIVED 2026-09-11. ringJump's green branch is `if (m_isShip) v *= 0.7;` and
+    // nothing else — the green ring carries NO multiplier for cube, UFO or ball, so
+    // it equals the yellow ring everywhere except the ship. (Its gravity flip runs
+    // BEFORE setYVelocity, so unlike the blue ring it never picks up the flip's 0.5.)
+    //
+    // Every cell of the old row was captured one frame late, each short by exactly
+    // one gravity step of ITS OWN vehicle: cube -0.212 (cube step 0.2115), ball
+    // -0.129 (ball step 0.1294). The ship row was late in the other direction,
+    // +0.086 = one HELD-thrust step, because the capture was taken with the button
+    // down; its 2x cell had additionally been clipped to a flat 432 by the flight
+    // clamp. That is four independent confirmations of the same mis-timed capture.
+    {{OrbType::Green,  VehicleType::Cube,  false}, {573.481728,   603.7217159271, 616.681728,   606.421728}},
+    {{OrbType::Green,  VehicleType::Cube,  true},  {458.7853824,  482.9773727417, 493.3453824,  485.1373824}},
+    {{OrbType::Green,  VehicleType::Ship,  false}, {401.4372096,  422.6052011490, 431.6772096,  424.4952096}},
+    {{OrbType::Green,  VehicleType::Ship,  true},  {321.1497677,  338.0841609192, 345.3417677,  339.5961677}},
+    {{OrbType::Green,  VehicleType::Ball,  false}, {401.435993,   422.60399,      431.67599,    424.493993}},
+    {{OrbType::Green,  VehicleType::Ball,  true},  {321.148795,   338.08319,      345.34079,    339.59519}},
+    {{OrbType::Green,  VehicleType::Ufo,   false}, {573.481728,   603.7217159271, 616.681728,   606.421728}},
+    {{OrbType::Green,  VehicleType::Ufo,   true},  {458.7853824,  482.9773727417, 493.3453824,  485.1373824}},
 };
+
+// PlayerObject::ringJump's post-scale, applied after setYVelocity:
+//     if (ball || spider) m_yVelocity *= 0.699999988079071f
+//     else if (swing)     m_yVelocity *= 0.6000000238418579f
+// The 0.7 is already folded into every Ball row of the table above (that is where
+// its long-unexplained "ball is 0.7x cube" pattern comes from — it is this line,
+// not a per-orb constant). Spider shares the Ball row correctly. The SWING does
+// not: orbPadVehicle() collapses it onto Ball too, which hands it 0.7 where the
+// engine uses 0.6, making every orb 16.7% too strong in swing mode. Rescale it.
+//
+// Note pads are NOT affected: PlayerObject::propellPlayer scales ball, spider AND
+// swing by the same 0.6, so collapsing swing onto ball is right there.
+static constexpr double kSwingOrbRescale = 0.6000000238418579 / 0.699999988079071;
 
 double orbVelocityValue(OrbType t, VehicleType v, bool mini, int speed) {
     double vel = orb_velocities.get(t, orbPadVehicle(v), mini, std::min(3, speed));
     if (v == VehicleType::Robot && t == OrbType::Yellow) vel *= 0.9;  // see Orb::collide
+    if (v == VehicleType::Swing) vel *= kSwingOrbRescale;
+    // ringJump's red branch gives the ROBOT its own 1.28 where the cube gets 1.38.
+    // orbPadVehicle() collapses robot onto cube, so undo the difference here — the
+    // same shape as the robot's 0.9 yellow rule above. (Spider's red value is 1.34,
+    // which is the ball's, so the Spider->Ball collapse already handles it.)
+    if (v == VehicleType::Robot && t == OrbType::Red) vel *= (1.28 / 1.38);
     return vel;
 }
 
@@ -152,14 +206,20 @@ void Orb::collide(Player& p) const {
                     default:                  p.velocity = -810; break;   // cube -15 (+ unsampled)
                 }
             } else {
-                p.velocity = orb_velocities.get(type, orbPadVehicle(p.vehicle.type), p.small, std::min(3, p.speed));
-                // Robot's YELLOW orb is exactly 0.9x the cube value (capture RING 36
-                // Robot: 10.107 vs cube 11.23, and mini 8.086 vs 8.984 — both = x0.9).
-                // Only yellow is affected; pink/blue/pad on robot match cube 1:1. The
-                // table collapses robot->cube via orbPadVehicle, so scale here.
-                if (p.vehicle.type == VehicleType::Robot && type == OrbType::Yellow)
-                    p.velocity *= 0.9;
+                // Go through orbVelocityValue() rather than the raw table so the
+                // per-vehicle corrections it applies (robot's 0.9 yellow, the
+                // swing's 0.6-vs-0.7 rescale) land on the real gameplay path too.
+                // This used to read the table directly and duplicate only the robot
+                // rule, so any correction added there silently missed live play and
+                // applied only to the solver's own lookups.
+                p.velocity = orbVelocityValue(type, p.vehicle.type, p.small, p.speed);
                 p.grounded = false;
+                // PlayerObject::ringJump sets m_isAccelerating only for the RED
+                // ring (`if (objectType == 0x23) m_isAccelerating = 1`) and on the
+                // dash-ring path. Every other ring leaves the flag alone — it is
+                // not cleared either, unlike the pads. See Player::isAccelerating.
+                if (type == OrbType::Red || type == OrbType::Dash)
+                    p.isAccelerating = true;
             }
             // GD applies the orb boost in checkCollisions — AFTER this step's
             // updateJump (velocity + position). For a NEWLY-touched orb the touch is

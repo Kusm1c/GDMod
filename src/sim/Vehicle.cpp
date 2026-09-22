@@ -4,6 +4,7 @@
 #include "Level.hpp"
 #include "Slope.hpp"
 #include "Calib.hpp"
+#include "Tunables.hpp"
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -12,13 +13,31 @@
 
 namespace gdsim {
 
-constexpr double velocity_thresholds[] = {
-    101.541492,
-    103.485494592,
-    103.377492,
-    103.809492,
-    103.809492
-};
+// Moved into PhysicsTables (Tunables.hpp) so it is editable live. This alias
+// keeps every existing `velocity_thresholds[p.speed]` use site unchanged.
+#define velocity_thresholds (g_phys.velocityThreshold)
+
+// GD's flight velocity clamp, in the order updateJump actually runs it.
+//
+// Two separate things happen, and they are NOT the same test:
+//  1. At the top of the isFlying() branch, m_isAccelerating is cleared whenever
+//     the velocity sits inside `-6.4/sizeDiv .. 8.0/sizeDiv` with sizeDiv the
+//     FLIGHT divisor (0.85 mini, 1.0 big). Those bounds are exactly the ship's
+//     own clamp constants, which is why they are reused for the band here even
+//     when the caller's clamp differs (the swing's does: it forces both the size
+//     divisor and the asymmetry factor to 1.0, giving a symmetric +-432).
+//  2. The clamp itself, guarded by `if (!m_isAccelerating && !m_isDart)`.
+//
+// Net behaviour: a boost that leaves the band is NOT clamped away; it decays
+// under gravity until it re-enters the band, and the clamp resumes from there.
+// gdsim used to clamp unconditionally, so every strong flight boost was cut
+// down on the frame it landed.
+static void flightClamp(Player& p, double lo, double hi) {
+    const double bandLo = p.small ? g_phys.shipClampMinSmall : g_phys.shipClampMinBig;
+    const double bandHi = p.small ? g_phys.shipClampMaxSmall : g_phys.shipClampMaxBig;
+    if (p.velocity > bandLo && p.velocity < bandHi) p.isAccelerating = false;
+    if (!p.isAccelerating) p.velocity = std::clamp(p.velocity, lo, hi);
+}
 
 static float normalizeRotation(Player const& p, float angle) {
     float playerRotation = (int)p.rotation % 360;
@@ -115,7 +134,7 @@ static Vehicle cube() {
         // = EXACTLY 810 — i.e. this was already exactly correct before a prior pass
         // this session "corrected" it to -805.18 from a Desmos-based measurement with
         // ~0.6% error. Reverted to the exact value now that the real source confirms it.
-        if (p.velocity < -810.0) p.velocity = -810.0;
+        if (p.velocity < -g_phys.maxFallVelocity) p.velocity = -g_phys.maxFallVelocity;
         if (p.gravTop(p.innerHitbox()) >= p.gravCeiling()) { p.dead = true; p.deathCause = "ceiling"; }
     };
 
@@ -135,11 +154,11 @@ static Vehicle cube() {
         // (presumably already correctly reverse-engineered/tuned before this
         // session) rather than keep an unverified "fix" — needs redoing with the
         // x54*60 = x3240 factor before touching this again.
-        static double accelerations[] = {-2747.52, -2794.1082, -2786.4, -2799.36, -2799.36};
+        double* accelerations = g_phys.cubeAccel;
         p.acceleration = accelerations[p.speed];
 
         if (p.gravityPortal && p.grav(p.velocity) > 350 && p.speed > 1)
-            p.acceleration -= 6.48;
+            p.acceleration -= g_phys.cubeUpsideExtraAccel;
 
         p.rotation = 0;
         bool jump = false;
@@ -181,13 +200,13 @@ static Vehicle cube() {
             p.buffer = false;
         }
 
-        if (p.upsideDown && p.input && p.coyoteFrames < 10) {
+        if (p.upsideDown && p.input && p.coyoteFrames < (unsigned)g_phys.cubeUpsideCoyoteFrames) {
             jump = true;
             p.buffer = false;
         }
 
         if (jump) {
-            static double jumpHeights[] = {573.481728, 603.7217172, 616.681728, 606.421728, 606.421728};
+            double* jumpHeights = g_phys.cubeJumpHeight;
             if (p.slopeData.slope && p.slopeData.slope->orientation == 0) {
                 auto time = std::clamp(10*(p.timeElapsed - p.slopeData.elapsed), 0.4, 1.0);
                 // FOUND 2026-08-17 (real DeCode capture): this shares the exact
@@ -242,7 +261,7 @@ static Vehicle cube() {
             } else {
                 if (getenv("GDSIM_JUMP_DEBUG"))
                     std::fprintf(stderr, "JUMP-FLAT f=%d speed=%d jumpHeight=%.4f small=%d result=%.4f\n",
-                                 p.frame, p.speed, jumpHeights[p.speed], p.small, jumpHeights[p.speed] * (p.small ? 0.8 : 1.0));
+                                 p.frame, p.speed, jumpHeights[p.speed], p.small, jumpHeights[p.speed] * (p.small ? g_phys.cubeMiniJumpScale : 1.0));
                 p.setVelocity(jumpHeights[p.speed], p.prevPlayer().input);
                 p.grounded = false;
             }
@@ -289,7 +308,8 @@ static Vehicle ship() {
         // false death (gdsim dying on a spike shortly after a Cube->Ship portal
         // where the real captured playthrough survives) that didn't exist before.
         // Reverted to the reference's exact values.
-        p.velocity = std::clamp(p.velocity, p.small ? -406.566 : -345.6, p.small ? 508.248 : 432.0);
+        flightClamp(p, p.small ? g_phys.shipClampMinSmall : g_phys.shipClampMinBig,
+                       p.small ? g_phys.shipClampMaxSmall : g_phys.shipClampMaxBig);
         if (p.gravTop(p) > p.gravCeiling()) {
             if (p.velocity > 0) p.setVelocity(0, false);
             p.pos.y = p.grav(p.gravCeiling()) - p.grav(p.size.y / 2);
@@ -334,14 +354,14 @@ static Vehicle ship() {
         const bool sm = p.prevPlayer().small;
         if (p.input) {
             if (p.velocity <= p.grav(velocity_thresholds[p.speed]))
-                p.acceleration = sm ? 1643.5872 : 1397.0491;
+                p.acceleration = sm ? g_phys.shipAccelUpStrongSmall : g_phys.shipAccelUpStrongBig;
             else
-                p.acceleration = sm ? 1314.86976 : 1117.64328;
+                p.acceleration = sm ? g_phys.shipAccelUpWeakSmall : g_phys.shipAccelUpWeakBig;
         } else {
             if (p.velocity >= p.grav(velocity_thresholds[p.speed]))
-                p.acceleration = sm ? -1577.85408 : -1341.1719;
+                p.acceleration = sm ? g_phys.shipAccelDownStrongSmall : g_phys.shipAccelDownStrongBig;
             else
-                p.acceleration = sm ? -1051.8984 : -894.11464;
+                p.acceleration = sm ? g_phys.shipAccelDownWeakSmall : g_phys.shipAccelDownWeakBig;
         }
         if (p.grav(p.pos.y) >= p.gravCeiling()) p.setVelocity(0, false);
         rotateFly(p, 0.15f);
@@ -357,8 +377,8 @@ static Vehicle ball() {
     v.type = VehicleType::Ball;
 
     v.clamp = +[](Player& p) {
-        if (p.velocity >=  810) p.velocity =  810;
-        if (p.velocity <= -810) p.velocity = -810;
+        if (p.velocity >=  g_phys.shipVelClamp) p.velocity =  g_phys.shipVelClamp;
+        if (p.velocity <= -g_phys.shipVelClamp) p.velocity = -g_phys.shipVelClamp;
         if (p.grav(p.pos.y) >= p.gravCeiling() && p.velocity > 0) {
             p.setVelocity(0, true);
             if (p.input) p.upsideDown = !p.upsideDown;
@@ -378,7 +398,7 @@ static Vehicle ball() {
 
     v.update = +[](Player& p) {
         if (!p.prevPlayer().velocityOverride || p.prevPlayer().slopeData.slope)
-            p.acceleration = -1676.46672;
+            p.acceleration = g_phys.ballAccel;
 
         if (!p.input) p.vehicleBuffer = false;
 
@@ -390,12 +410,12 @@ static Vehicle ball() {
                 p.setVelocity(0, true);
             }
             p.buffer = false;
-        } else if (p.buffer && p.coyoteFrames < (p.upsideDown ? 16u : 1u)) {
+        } else if (p.buffer && p.coyoteFrames < (p.upsideDown ? (unsigned)g_phys.ballCoyoteUpsideFrames : (unsigned)g_phys.ballCoyoteNormalFrames)) {
             jump = true;
         }
 
         if (jump) {
-            static double jumpHeights[] = {-172.044007, -181.11601, -185.00401, -181.92601, -181.92601};
+            double* jumpHeights = g_phys.ballJumpHeight;
             double newVel = jumpHeights[p.speed];
             if (p.slopeData.slope && p.slopeData.slope->orientation == 0) {
                 auto slope = p.slopeData.slope;
@@ -434,9 +454,8 @@ static Vehicle ufo() {
         // old 432 cap clamped BOTH to 432 → identical 56.3u bounces. Flaps (371) and
         // yellow/pink pads (now at their real table values, <432) are unaffected;
         // only above-flap pad boosts (red) change. See [[physlab_spwn_pipeline]].
-        p.velocity = std::clamp(p.velocity,
-            p.small ? -406.56 : -345.6,
-            p.small ?  508.24 :  520.0);
+        flightClamp(p, p.small ? g_phys.ufoClampMinSmall : g_phys.ufoClampMinBig,
+                       p.small ? g_phys.ufoClampMaxSmall : g_phys.ufoClampMaxBig);
         p.input = p.button;
         if (p.gravTop(p) > p.gravCeiling()) {
             if (p.velocity > 0) p.setVelocity(0, false);
@@ -446,7 +465,7 @@ static Vehicle ufo() {
 
     v.update = +[](Player& p) {
         if (p.buffer) {
-            p.velocity = std::max(p.velocity, p.small ? 358.992 : 371.034);
+            p.velocity = std::max(p.velocity, p.small ? g_phys.ufoFlapMinSmall : g_phys.ufoFlapMinBig);
             p.velocityOverride = true;
             p.buffer = false;
             p.grounded = false;
@@ -481,9 +500,9 @@ static Vehicle ufo() {
             // grav() leaves normal-gravity ufos completely unchanged (grav(T)==T when
             // not upsideDown), so this only affects the previously-broken flipped case.
             if (p.velocity > p.grav(velocity_thresholds[p.speed]))
-                p.acceleration = p.small ? -1969.92 : -1671.84;
+                p.acceleration = p.small ? g_phys.ufoAccelStrongSmall : g_phys.ufoAccelStrongBig;
             else
-                p.acceleration = p.small ? -1308.96 : -1114.56;
+                p.acceleration = p.small ? g_phys.ufoAccelWeakSmall : g_phys.ufoAccelWeakBig;
             if (p.grounded) p.setVelocity(0, true);
             if (p.button) p.input = false;
         }
@@ -500,7 +519,7 @@ static Vehicle wave() {
 
     v.enter = +[](Player& p) {
         p.actions.push_back(+[](Player& p) {
-            p.size = p.small ? Vec2D(6, 6) : Vec2D(10, 10);
+            p.size = p.small ? Vec2D(g_phys.waveHalfSizeSmall, g_phys.waveHalfSizeSmall) : Vec2D(g_phys.waveHalfSizeBig, g_phys.waveHalfSizeBig);
         });
     };
 
@@ -508,7 +527,7 @@ static Vehicle wave() {
         float waveTop    = p.grav(p.pos.y + p.grav(p.size.y));
         float waveBottom = p.grav(p.pos.y - p.grav(p.size.y));
         if (!p.velocityOverride)
-            p.velocity = (p.input * 2 - 1) * player_speeds[p.speed] * (p.small ? 2.f : 1.f);
+            p.velocity = (p.input * 2 - 1) * player_speeds[p.speed] * (p.small ? (float)g_phys.waveMiniMult : 1.f);
         if (waveBottom <= p.gravFloor()) {
             p.pos.y = p.grav(p.gravFloor() + p.size.y);
             if (waveBottom == p.gravFloor() && !p.input) p.velocity = 0;
@@ -521,7 +540,7 @@ static Vehicle wave() {
     v.update = +[](Player& p) {
         p.acceleration = 0;
         p.buffer = false;
-        rotateFly(p, p.small ? 0.4f : 0.25f);
+        rotateFly(p, p.small ? g_phys.waveRotSmall : g_phys.waveRotBig);
     };
 
     v.bounds = 300;
@@ -545,7 +564,7 @@ static Vehicle robot() {
     };
 
     v.clamp = +[](Player& p) {
-        if (p.velocity < -810) p.velocity = -810;
+        if (p.velocity < -g_phys.maxFallVelocity) p.velocity = -g_phys.maxFallVelocity;
         if (p.gravTop(p.innerHitbox()) >= p.gravCeiling()) { p.dead = true; p.deathCause = "ceiling"; }
     };
 
@@ -556,8 +575,8 @@ static Vehicle robot() {
         //   held, up to a max-charge cap; then fall ballistically at robot gravity
         //   (cube accel * 0.9). Real: dy=+1.263/frame flat for ~35 frames, then
         //   -0.044/frame. The old "launch full + cut on release" was a parabola (wrong).
-        static double jumpMax[] = {573.481728, 603.7217172, 616.681728, 606.421728, 606.421728};
-        static double accelerations[] = {-2747.52, -2794.1082, -2786.4, -2799.36, -2799.36};
+        double* jumpMax = g_phys.robotJumpMax;
+        double* accelerations = g_phys.robotAccel;
         // Full-jump sustain length. Confirmed 66 by a full-hold truth (144641895:
         // yVel flat 5.59 from the jump frame f68 through f134 = 66 charge frames, then
         // ballistic). The old 35 was from a truth where the button was RELEASED early,
@@ -570,7 +589,7 @@ static Vehicle robot() {
         // A flat 66 left the mini robot 1 frame short EVERY jump, and on a long-hold
         // robot level that per-jump ~1u error accumulated to ~36u, desyncing solutions
         // enough to false-survive in gdsim / die on real-GD replay.
-        const int ROBOT_CHARGE_FRAMES = p.small ? 67 : 66;
+        const int ROBOT_CHARGE_FRAMES = p.small ? g_phys.robotChargeFramesSmall : g_phys.robotChargeFramesBig;
         p.rotation = 0;
 
         bool jump = false;
@@ -598,7 +617,7 @@ static Vehicle robot() {
             else p.setVelocity(0, true);
             p.buffer = false;
         }
-        if (p.upsideDown && p.input && p.coyoteFrames < 10) {
+        if (p.upsideDown && p.input && p.coyoteFrames < (unsigned)g_phys.robotUpsideCoyoteFrames) {
             jump = true;
             p.buffer = false;
         }
@@ -640,9 +659,9 @@ static Vehicle robot() {
             // charge was rechargeable as long as rHF < cap, so any airborne press
             // re-froze the velocity (truth 144641895 f250).
             if (!p.grounded) p.robotHoldFrames = ROBOT_CHARGE_FRAMES;
-            p.acceleration = accelerations[p.speed] * 0.9;   // ballistic fall
+            p.acceleration = accelerations[p.speed] * g_phys.robotFallScale;   // ballistic fall
             if (p.gravityPortal && p.grav(p.velocity) > 350 && p.speed > 1)
-                p.acceleration -= 6.48;
+                p.acceleration -= g_phys.robotUpsideExtraAccel;
         }
     };
 
@@ -659,17 +678,25 @@ static Vehicle spider() {
     v.enter = +[](Player& p) {
         if (p.prevPlayer().vehicle.type != VehicleType::Ball)
             p.velocity = p.velocity / 2;
+        // toggleSpiderMode sets m_width = m_height = 27; the generic 30 that
+        // VehiclePortal::collide installs is the CUBE's. Deferred exactly the
+        // way the wave defers its own 10/6 (see wave()'s enter) so the size
+        // lands on the same frame boundary as every other mode switch.
+        p.actions.push_back(+[](Player& p) {
+            const float s = p.small ? g_phys.spiderSizeSmall : g_phys.spiderSizeBig;
+            p.size = Vec2D(s, s);
+        });
     };
 
     v.clamp = +[](Player& p) {
-        if (p.velocity >=  810) p.velocity =  810;
-        if (p.velocity <= -810) p.velocity = -810;
+        if (p.velocity >=  g_phys.shipVelClamp) p.velocity =  g_phys.shipVelClamp;
+        if (p.velocity <= -g_phys.shipVelClamp) p.velocity = -g_phys.shipVelClamp;
     };
 
     v.update = +[](Player& p) {
         // gdp updateJump: spider is in the 0.9582-gravity group with float_b=0.6 —
         // identical to Ball. The fork wrongly used cube accel (~1.67x too fast).
-        p.acceleration = -1676.46672;  // = ball gravity (0.9582 * 0.6)
+        p.acceleration = g_phys.spiderAccel;  // = ball gravity (0.9582 * 0.6)
         p.rotation = 0;
 
         bool jump = false;
@@ -679,7 +706,7 @@ static Vehicle spider() {
             else
                 p.setVelocity(0, true);
             p.buffer = false;
-        } else if (p.buffer && p.coyoteFrames < (p.upsideDown ? 16u : 1u)) {
+        } else if (p.buffer && p.coyoteFrames < (p.upsideDown ? (unsigned)g_phys.spiderCoyoteUpsideFrames : (unsigned)g_phys.spiderCoyoteNormalFrames)) {
             jump = true;
         }
 
@@ -716,9 +743,8 @@ static Vehicle swing() {
 
     v.clamp = +[](Player& p) {
         p.buffer = false;
-        p.velocity = std::clamp(p.velocity,
-            p.small ? -406.566 : -345.6,
-            p.small ?  508.248 :  432.0);
+        flightClamp(p, p.small ? g_phys.swingClampMinSmall : g_phys.swingClampMinBig,
+                       p.small ? g_phys.swingClampMaxSmall : g_phys.swingClampMaxBig);
         if (p.gravTop(p) > p.gravCeiling()) {
             if (p.velocity > 0) p.setVelocity(0, false);
             p.pos.y = p.grav(p.gravCeiling()) - p.grav(p.size.y / 2);
@@ -728,23 +754,30 @@ static Vehicle swing() {
     v.update = +[](Player& p) {
         p.buffer = false;
         if (p.grounded) p.setVelocity(0, !p.input);
-        // See ship() for why velocity_thresholds must NOT be wrapped in grav(). NOTE:
-        // unlike Ship, real GD's Swing branch in updateJump does NOT read m_isAccelerating
-        // at all (confirmed from the decompiled binary) — it's a much simpler continuous
-        // thrust formula. gdsim's swing() is still a copy of the old ship() threshold model
-        // here, which is a known-separate inaccuracy, not touched in this pass (Swing has
-        // no reported bug; a faithful port needs its own verification).
-        if (p.input) {
-            if (p.velocity <= velocity_thresholds[p.speed])
-                p.acceleration = p.small ? 1643.5872 : 1397.0491;
-            else
-                p.acceleration = p.small ? 1314.86976 : 1117.64328;
-        } else {
-            if (p.velocity >= velocity_thresholds[p.speed])
-                p.acceleration = p.small ? -1577.85408 : -1341.1719;
-            else
-                p.acceleration = p.small ? -1051.8984 : -894.11464;
+
+        // Flat gravity, size-selected, no thrust term — verified against the
+        // disassembly of updateJump's swing block at 0x14038c959 (see the Swing
+        // comment in Tunables.hpp for the instruction listing).
+        //
+        // BASE CORRECTED 2026-09-10: was cubeAccel[p.speed]. The swing is one of
+        // the six modes updateJump overwrites m_gravity for with the flat
+        // 0.958199024f, so it must NOT track the speed portal. Same value at 1x,
+        // which is why a 1x-only capture could not tell the two apart.
+        p.acceleration = -g_phys.flightGravity *
+                         (p.small ? g_phys.swingGravScaleSmall : g_phys.swingGravScaleBig);
+
+        // Gravity flip on a NEW press (not a hold): the same discrete-press rule
+        // the robot needs, so holding cannot flip every frame.
+        // NOT INDEPENDENTLY MEASURED — the capture proves the swing has no
+        // thrust and shows it in both gravity orientations, but says nothing
+        // about what the flip does to velocity. Velocity is carried through
+        // unchanged here, which is the simplest reading; if a swing level
+        // desyncs at a flip, this is the first thing to measure.
+        if (p.input && !p.prevPlayer().input) {
+            p.upsideDown = !p.upsideDown;
+            p.gravityPortal = false;
         }
+
         if (p.grav(p.pos.y) >= p.gravCeiling()) p.setVelocity(0, false);
         rotateFly(p, 0.15f);
     };

@@ -310,55 +310,31 @@ void Slope::collide(Player& p) const {
     // "outside" the ramp direction), letting it slip through untouched. Checked
     // first, before any of that grounded-physics gating, so touching() firing is
     // the only thing that matters, exactly like Block.cpp's wave branch.
-    if (p.vehicle.type == VehicleType::Wave) {
-        // Explicit, repeated, forceful user instruction (see Block.cpp's identical
-        // note): the wave dies on ANY collision, block or slope, no exception
-        // except a D block. Two more nuanced models were tried and reverted the
-        // same day (unconditional-safe, then a dartSlide grace ported loosely from
-        // the decompiled collidedWithSlopeInternal) — both still let a wave survive
-        // touching plain solid geometry under some condition, which doesn't match
-        // real GD: wave difficulty comes specifically from ANY touch being lethal —
-        // corridors are threaded WITHOUT overlapping either surface, not ridden
-        // like a cube resting on a platform.
-        //
-        // FIXED 2026-08-12 (regression caught by test/regress.sh on truth
-        // 85701165, a wave-corridor level: FALSE-DEATH @f210, gdsim killed by
-        // slope id=1339 with dy=dyVel=0.00 — position matched real GD exactly,
-        // so this was a pure logic bug, not drift): this used to be a plain
-        // rectangular intersects(*this) against the slope's BOUNDING BOX. A
-        // slope's real solid shape is only the TRIANGULAR half of that box (the
-        // exact reason touching() has its own diagonal line-crossing test,
-        // see that function's 2026-08-06 fix note above) — the wave's
-        // innerHitbox could sit in the triangle's EMPTY corner, still inside the
-        // bounding rectangle, and this raw AABB test would call it a hit anyway.
-        // Reuses touching()'s own triangleOverlaps() so the death check respects
-        // the same real diagonal every other slope interaction already does.
-        // FIXED 2026-08-12, second pass (test/regress.sh still flagged 85701165
-        // FALSE-DEATH after the triangleOverlaps swap above, dy=dyVel=0.00, so
-        // still a pure logic bug): traced it to a corner of the wave's small
-        // innerHitbox poking ~1 unit past the diagonal at frame 304 while real GD
-        // survives. GD Creator School documents the wave's slope collision as a
-        // CIRCLE test, not a box-corner test (gd_creators_school_physics_spec
-        // memory) — a circle's closest approach to a corner is always less than
-        // the box's own corner distance, so the same geometry that trips a
-        // box-corner test can cleanly miss a circle. Switched to circleOverlaps()
-        // with the innerHitbox's own half-width as the radius (keeps the already-
-        // validated innerHitbox SIZE for wave-vs-solid collision, per this
-        // session's earlier work — only the SHAPE of the test changes, box→circle).
-        Entity hb = p.innerHitbox();
-        bool hit = hb.intersects(*this) && circleOverlaps(hb.pos, hb.size.x * 0.5f);
-        if (getenv("GDSIM_WAVESLOPE_DEBUG"))
-            std::fprintf(stderr, "WAVESLOPE f=%d slopeId=%d slopePos=(%.2f,%.2f) slopeSize=(%.2f,%.2f) orient=%d "
-                         "hbPos=(%.2f,%.2f) hbSize=(%.2f,%.2f) aabbHit=%d circHit=%d\n",
-                         p.frame, typeId, pos.x, pos.y, size.x, size.y, orientation,
-                         hb.pos.x, hb.pos.y, hb.size.x, hb.size.y, hb.intersects(*this), hit);
-        if (hit) {
-            p.dead = true; p.deathCause = "slope";
-            p.deathObjType = typeId; p.deathObjPos = pos;
-        }
-        return;
-    }
-
+    // NOT A DEATH. Re-derived 2026-09-18 from the binary, replacing a
+    // "wave dies on ANY slope touch" rule that had been carried here by analogy
+    // with Block.cpp.
+    //
+    // GJBaseGameLayer::collisionCheckObjects dispatches GameObjectType 25 (Slope)
+    // to PlayerObject::collidedWithSlopeInternal (0x14038f810), and that function
+    // contains NO death path whatsoever - it only positions and rides. Grepped
+    // end to end: no destroyPlayer, no playerDestroyed, no death gameEvent. The
+    // wave (m_isDart) appears in it only inside the ship|bird|dart|swing group,
+    // i.e. the flight family that rides the diagonal.
+    //
+    // Where a wave DOES die on solid geometry is collidedWithObjectInternal, a
+    // different function reached for SOLIDS, via
+    //     if (m_isDart && m_stateDartSlide < 1) goto <no-resolution>;
+    // which is the rule Block.cpp already implements. Lethal slopes are a
+    // separate object type, not this one: id 1718/364 are GameObjectType 2
+    // (Hazard) while 315/289/294/299/1339 are type 25 - SlopeHazard below is the
+    // class for those, and it still kills.
+    //
+    // Measured cost of the old rule on DeCode (2997354): the wave flies its 45
+    // degree ramp at x~6477 y~393 exactly where the real player does - the
+    // recorded deviation is 0.19 units - and gdsim killed it there anyway
+    // (test/waveprobe.exe reproduces the DEAD verdict at that position, and shows
+    // it clearing only from y>=395). Falls through to the shared gates below, so
+    // a wave that has genuinely penetrated the diagonal still gets handled.
     p.potentialSlopes.push_back(this);
 #ifdef GDSIM_SLOPE_DEBUG
     fprintf(stderr, "[SLOPE] f=%d x=%.2f pos.y=%.2f expectedY=%.3f orient=%d left=%.1f right=%.1f gravTopP=%.2f gravBotThis=%.2f\n",
@@ -379,6 +355,19 @@ void Slope::collide(Player& p) const {
     // before falling. Without this the ship flew through and died on the block above.
     // slopeData.slope is left unset (like the wave) so a held button can lift it off the
     // next frame. Ceiling-only (orientation>=2); floor-slope flight handling unchanged.
+    // The wave rides the diagonal it penetrated, on either side. Reaching here
+    // means one of the two gates above already found real penetration, so this
+    // only ever clamps it back onto the surface - it never lifts a wave that was
+    // flying clear. Kept separate from the ship/ufo/swing branch below so that
+    // branch's ceiling-only scope is unchanged.
+    if (p.vehicle.type == VehicleType::Wave) {
+        p.pos.y = (float)expectedY(p);
+        if (orientation < 2) { if (p.grav(p.velocity) < 0) p.velocity = 0; }
+        else                 { if (p.grav(p.velocity) > 0) p.velocity = 0; }
+        p.grounded = true;
+        return;
+    }
+
     if (orientation >= 2 && (p.vehicle.type == VehicleType::Ship
             || p.vehicle.type == VehicleType::Ufo || p.vehicle.type == VehicleType::Swing)) {
         p.pos.y = (float)expectedY(p);

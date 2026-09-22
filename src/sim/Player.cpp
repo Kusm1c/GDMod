@@ -251,6 +251,23 @@ void Player::postCollision() {
 
     vehicle.update(*this);
 
+    // FOUND 2026-08-23 (level 13519 "The Nightmare", user-reported cube->ball
+    // problem, measured straight off the real capture): on the frame a vehicle
+    // PORTAL switches vehicles, real GD has already run updateJump for the OLD
+    // vehicle before checkCollisions performs the switch — so that frame still uses
+    // the OLD vehicle's acceleration, and only the NEXT frame uses the new one.
+    // Evidence at the airborne cube->ball at x=9674 (f7906): the switch frame's
+    // world-velocity step is +11.664 (the CUBE's accel) and only the frame after it
+    // becomes +6.966 (the BALL's). gdsim runs vehicle.update() for the NEW vehicle
+    // here, in postCollision, so it applied the new accel one frame early — a 4.698
+    // velocity error injected at every vehicle transition. prevPlayer().acceleration
+    // is the old vehicle's value for exactly this frame (same orientation, since a
+    // portal switch does not flip gravity), which is what real GD used.
+    // Same ordering principle as the gravity-flip, impulse and collision-position
+    // fixes above; this is the vehicle-switch instance of it.
+    if (frame == lastVehicleSwitchFrame)
+        acceleration = prevPlayer().acceleration;
+
     if (!velocityOverride) {
         double newVel = velocity + acceleration * dt;
 

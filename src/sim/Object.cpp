@@ -1,3 +1,4 @@
+#include "Tunables.hpp"
 #include "Object.hpp"
 #include "Player.hpp"
 #include "Level.hpp"
@@ -146,9 +147,19 @@ std::optional<ObjectContainer> Object::create(std::unordered_map<int, std::strin
     objs(({ 35 }), Pad, 25, 4)
     objs(({ 140 }), Pad, 25, 5)
     objs(({ 67 }), Pad, 25, 6)
-    objs(({ 1332 }), Pad, 25, 6)   // red pad — Pad.cpp handled it but the factory never built it (red pads were invisible to the sim). Hitbox approx; verify.
+    // Red pad: 29 x 7, read out of GameObject::setupSpriteSize (case 0x534 stores
+    // 0x41e80000 / 0x40e00000) — it carries no sprite-hitbox scale, so m_width x
+    // m_height IS the hitbox. Was 25 x 6, copied from the pink pad when the red
+    // one was first added with the note "Hitbox approx; verify"; now verified.
+    // The other three are exact as they stand: 35 = 25x4, 140 = 25x5, 67 = 25x6.
+    objs(({ 1332 }), Pad, 29, 7)
 
-    objs(({ 36,84,141,1022,1330,1333,1704 }), Orb, 36, 36)
+    // 1751 and 3004 ADDED 2026-09-11. Orb.cpp's orbTypeFromId() has mapped them
+    // (GravityFlip and Spider) and Orb::collide has implemented both for a long
+    // time, but this factory line never listed them, so Object::create() returned
+    // nothing and the objects did not exist in the sim at all — not a wrong value,
+    // a missing object. Same defect the red pad (1332) had on the line above.
+    objs(({ 36,84,141,1022,1330,1333,1704,1751,3004 }), Orb, 36, 36)
 
     // Portal hitboxes — REVERTED 2026-08-23 to the ENGINE-MEASURED sizes.
     //
@@ -194,18 +205,18 @@ std::optional<ObjectContainer> Object::create(std::unordered_map<int, std::strin
     //   size    99/101                     31 x 90  (15+19)
     //   dual    286/287                    41 x 91  (6+5)  <- was 34x86, wrong
     //   speed   200  35x44 (7) | 201  33x56 (6) | 202  51x56 | 1334  69x56 (5)
-    objs(({ 12,13,47,111,660,745,1331,1933,2751 }), VehiclePortal, 34, 86)
-    objs(({ 747 }), TeleportPortal, 25, 90)
-    objs(({ 10,11 }), GravityPortal, 25, 75)
-    objs(({ 99,101 }), SizePortal, 31, 90)
-    objs(({ 286,287 }), DualPortal, 41, 91)
+    objs(({ 12,13,47,111,660,745,1331,1933,2751 }), VehiclePortal, g_phys.portalVehicleW, g_phys.portalVehicleH)
+    objs(({ 747 }), TeleportPortal, g_phys.portalTeleportW, g_phys.portalTeleportH)
+    objs(({ 10,11 }), GravityPortal, g_phys.portalGravityW, g_phys.portalGravityH)
+    objs(({ 99,101 }), SizePortal, g_phys.portalSizeW, g_phys.portalSizeH)
+    objs(({ 286,287 }), DualPortal, g_phys.portalDualW, g_phys.portalDualH)
     objs(({ 143 }), BreakableBlock, 30, 30)
 
-    objs(({ 200 }), SpeedPortal, 35, 44)
-    objs(({ 201 }), SpeedPortal, 33, 56)
-    objs(({ 202 }), SpeedPortal, 51, 56)
-    objs(({ 203 }), SpeedPortal, 30, 90)   // STILL UNVERIFIED — no instance captured yet
-    objs(({ 1334 }), SpeedPortal, 69, 56)
+    objs(({ 200 }), SpeedPortal, g_phys.portalSpeed200W, g_phys.portalSpeed200H)
+    objs(({ 201 }), SpeedPortal, g_phys.portalSpeed201W, g_phys.portalSpeed201H)
+    objs(({ 202 }), SpeedPortal, g_phys.portalSpeed202W, g_phys.portalSpeed202H)
+    objs(({ 203 }), SpeedPortal, g_phys.portalSpeed203W, g_phys.portalSpeed203H)   // STILL UNVERIFIED — no instance captured yet
+    objs(({ 1334 }), SpeedPortal, g_phys.portalSpeed1334W, g_phys.portalSpeed1334H)
 
     objs(({ 289,294,299,305,309,315,321,326,331,337,343,349,353,363,371,483,492,651,665,
              673,709,711,726,728,886,1338,1341,1344,1723,1743,1745,1747,1749,1906 }), Slope, 30, 30)

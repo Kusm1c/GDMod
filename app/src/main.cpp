@@ -8,10 +8,15 @@
 #include "macroentry.hpp"
 #include "macrocache.hpp"
 #include "gdr2import.hpp"
+#include "tunerui.hpp"
+#include "transport.hpp"
+#include "fitui.hpp"
+#include "uifont.hpp"
 #include "../../src/sim/Level.hpp"
 #include "../../src/sim/Solver.hpp"
 #include "../../src/sim/Gdr2Export.hpp"
 #include "../../src/sim/DebugPaths.hpp"
+#include "../../src/sim/Tunables.hpp"
 #include <memory>
 #include <string>
 #include <cmath>
@@ -35,6 +40,7 @@ int main() {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1280, 720, "GD Level Player");
     SetTargetFPS(144);
+    gdapp::LoadUIFont();   // must come after InitWindow (needs a GL context for the atlas texture)
 
     AppState state = AppState::Menu;
     std::string idInput;
@@ -54,6 +60,25 @@ int main() {
     int pendingLevelId = 0; // set by both the ID-entry menu and the cache picker
 
     std::deque<gdapp::TrailPoint> trailDeque;
+
+    // ========== Physics Lab + replay transport ==========
+    // The Lab (TAB) edits any gdsim constant live; the transport owns replay
+    // playback rate, pause, frame-stepping and seeking. Both are pure UI - the
+    // resim they imply is done here, because only this loop owns the Level and
+    // the input track.
+    gdapp::TunerUI tuner;
+    gdapp::TransportUI transport;
+    // Keyboard-half transport actions, collected during the input pass and merged
+    // with the bar's own (click) actions after it is drawn — the bar has to be on
+    // screen before it can be clicked, so its half necessarily runs later.
+    gdapp::TransportResult pendingTransport;
+    // Trajectory correction: pin a trail point, drag it (or snap it onto the real
+    // capture), then ask which physics constant explains the difference.
+    gdapp::FitUIState fitUI;
+    // Set briefly after a resim, so the HUD can say what just happened instead of
+    // the trail silently jumping under the user.
+    double resimFlashUntil = 0.0;
+    int    resimFrames = 0;
 
     // ========== Physics trail (real capture overlay) ==========
     // Overlays a REAL re-scanner capture (testlevel/GDMod_physics_<id>.txt)
@@ -241,7 +266,6 @@ int main() {
                                         // frame numbering exactly (see test/gdrcheck.cpp)
     float replayAccumulator = 0.f;
     bool replayAlive = true;
-    bool replayPaused = false;
     std::deque<gdapp::TrailPoint> replayTrail;
     gdapp::Camera2DState replayCam;
     std::string exportStatusMsg;
@@ -404,11 +428,38 @@ int main() {
         replayFrameCounter = 0;
         replayAccumulator = 0.f;
         replayAlive = true;
-        replayPaused = false;
+        transport.paused = false;
         replayTrail.clear();
         replayCam.x = 0.f; replayCam.y = 105.f; replayCam.pixelsPerUnit = 3.f;
         loadPhysicsTrail(pendingLevelId);
         state = AppState::Replaying;
+    };
+
+    // Deterministic seek: gdsim has no reverse step, so "go to frame N" means
+    // rebuild the Level and replay the recorded input track up to N. That is also
+    // exactly what a physics-constant edit needs (a changed constant only shows
+    // its true effect from frame 0), so both paths share this one function.
+    // Fast enough to run every frame while scrubbing or dragging a value: the
+    // step loop is the same code the solver runs at ~1M frames/sec.
+    auto rebuildReplayTo = [&](int targetFrame) {
+        if (decodedLevelString.empty()) return;
+        replayLevel = std::make_unique<Level>(decodedLevelString);
+        replayTrail.clear();
+        replayFrameCounter = 0;
+        replayAccumulator = 0.f;
+        replayAlive = true;
+        for (int f = 0; f < targetFrame; f++) {
+            replayFrameCounter++;
+            bool press = replayFrameCounter < replayInputAt.size() && replayInputAt[replayFrameCounter];
+            Player& p = replayLevel->runFrame(press, FIXED_DT);
+            replayTrail.push_back({p.pos, p.size, p.small});
+            // Stop at the run's real end rather than pretending to seek past it -
+            // seeking beyond a death would otherwise silently keep stepping a dead
+            // player and draw a trail the run never had.
+            if (p.dead || p.pos.x >= replayLevel->length - 5.f) { replayAlive = false; break; }
+        }
+        resimFrames = (int)replayFrameCounter;
+        resimFlashUntil = GetTime() + 0.35;
     };
 
     // Shared by the Solving-done Export button and the Macro List's Export
@@ -498,6 +549,16 @@ int main() {
     while (!WindowShouldClose() && !exitRequested) {
         int screenW = GetScreenWidth(), screenH = GetScreenHeight();
 
+        // TAB opens the Physics Lab from any in-level state. Excluded from the
+        // menu states, where TAB already means "browse the level cache", and
+        // suppressed while one of the Lab's own text fields has focus.
+        if (state != AppState::Menu && state != AppState::LevelSelect &&
+            state != AppState::MacroList && state != AppState::Options &&
+            !gdapp::tunerWantsKeyboard(tuner) && IsKeyPressed(KEY_TAB)) {
+            tuner.open = !tuner.open;
+            if (tuner.open) gdapp::refreshTunerPresets(tuner);
+        }
+
         if (state == AppState::Menu) {
             int ch;
             while ((ch = GetCharPressed()) != 0) {
@@ -558,7 +619,7 @@ int main() {
             // (or is instant if this ID is already cached on disk).
             BeginDrawing();
             ClearBackground(Color{18, 18, 24, 255});
-            DrawText("Loading...", screenW / 2 - 60, screenH / 2 - 10, 24, RAYWHITE);
+            gdapp::UIText("Loading...", screenW / 2 - 60, screenH / 2 - 10, 24, RAYWHITE);
             EndDrawing();
 
             gdapp::LevelFetchResult fetched = gdapp::fetchLevel(pendingLevelId);
@@ -606,15 +667,21 @@ int main() {
                 writeDeviationFile(simVec);
             }
 
-            bool pressed = !solveBtnHover && !humanLimitHover && !deviationHover &&
+            // While a Physics Lab field has focus, typing must not also drive the
+            // player — SPACE is both "jump" here and "space" in a text field.
+            const bool labKeys = gdapp::tunerWantsKeyboard(tuner);
+            const bool labMouse = gdapp::tunerWantsMouse(tuner, screenW);
+
+            bool pressed = !labKeys && !labMouse &&
+                           !solveBtnHover && !humanLimitHover && !deviationHover &&
                            (IsKeyDown(KEY_SPACE) || IsKeyDown(KEY_UP) ||
                            IsMouseButtonDown(MOUSE_BUTTON_LEFT));
 
-            if (IsKeyPressed(KEY_R)) { resetPlayback(); }
-            if (IsKeyPressed(KEY_A)) { state = AppState::Paused; }
+            if (!labKeys && IsKeyPressed(KEY_R)) { resetPlayback(); }
+            if (!labKeys && IsKeyPressed(KEY_A)) { state = AppState::Paused; }
             // Flagging works at any moment now, not just after death/clear — hover
             // an object mid-run and press J the instant something looks wrong.
-            if (IsKeyPressed(KEY_J) && level)
+            if (!labKeys && IsKeyPressed(KEY_J) && level)
                 flagHitboxAt(level.get(), level->latestState(), cam, "Playing");
 
             if (level && state == AppState::Playing) {
@@ -671,11 +738,11 @@ int main() {
                 if (IsKeyPressed(KEY_P)) solverPaused.store(!solverPaused.load());
                 if (IsKeyPressed(KEY_O)) solverCancelled.store(true);
             } else {
-                if (IsKeyPressed(KEY_R)) startSolve();
+                if (!gdapp::tunerWantsKeyboard(tuner) && IsKeyPressed(KEY_R)) startSolve();
                 // BACKSPACE, not A: this state's free camera already uses A for
                 // "pan left" (WASD-style) — see below — so A would double as an
                 // unwanted "back to menu" every time the camera is panned left.
-                if (IsKeyPressed(KEY_BACKSPACE)) state = AppState::Menu;
+                if (!gdapp::tunerWantsKeyboard(tuner) && IsKeyPressed(KEY_BACKSPACE)) state = AppState::Menu;
 
                 if (solverResult.solved) {
                     Rectangle replayBtn{(float)(screenW - 190), 84.f, 170.f, 30.f};
@@ -696,17 +763,44 @@ int main() {
             if (IsKeyDown(KEY_UP)    || IsKeyDown(KEY_W)) solverCam.y += panSpeed;
             if (IsKeyDown(KEY_DOWN)  || IsKeyDown(KEY_S)) solverCam.y -= panSpeed;
             float wheel = GetMouseWheelMove();
-            if (wheel != 0.f) solverCam.pixelsPerUnit = std::clamp(solverCam.pixelsPerUnit * (1.f + wheel * 0.1f), 0.3f, 14.f);
-            if (IsKeyDown(KEY_EQUAL) || IsKeyDown(KEY_KP_ADD))      solverCam.pixelsPerUnit = std::min(14.f, solverCam.pixelsPerUnit * 1.02f);
-            if (IsKeyDown(KEY_MINUS) || IsKeyDown(KEY_KP_SUBTRACT)) solverCam.pixelsPerUnit = std::max(0.3f, solverCam.pixelsPerUnit / 1.02f);
+            // Same zoom model as the replay view (see render.hpp for the limits).
+            if (wheel != 0.f) gdapp::zoomAt(solverCam, 1.f + wheel * 0.12f, GetMousePosition(), screenW, screenH);
+            if (IsKeyDown(KEY_EQUAL) || IsKeyDown(KEY_KP_ADD))      solverCam.pixelsPerUnit = std::min(gdapp::kMaxZoom, solverCam.pixelsPerUnit * 1.02f);
+            if (IsKeyDown(KEY_MINUS) || IsKeyDown(KEY_KP_SUBTRACT)) solverCam.pixelsPerUnit = std::max(gdapp::kMinZoom, solverCam.pixelsPerUnit / 1.02f);
         } else if (state == AppState::Replaying) {
-            nudgePhysicsTrailOffset();
-            if (IsKeyPressed(KEY_SPACE)) replayPaused = !replayPaused;
-            if (IsKeyPressed(KEY_R)) startReplay();
-            // BACKSPACE, not A: same WASD-pan conflict as Solving above.
-            if (IsKeyPressed(KEY_BACKSPACE)) state = AppState::Solving;
+            // The Physics Lab owns the keyboard whenever one of its fields has
+            // focus, and owns the mouse whenever the cursor is over the panel —
+            // otherwise typing "2" into a value would also fire a level shortcut,
+            // and the wheel would zoom the world behind an open panel.
+            const bool labKeys  = gdapp::tunerWantsKeyboard(tuner);
+            // Correction mode owns the cursor while a pin is being dragged or the
+            // cursor is over its panel, so the camera must not also pan/zoom.
+            const bool labMouse = gdapp::tunerWantsMouse(tuner, screenW) ||
+                                  gdapp::fitWantsMouse(fitUI, [&]{
+                                      gdapp::FitUIHost h; h.screenW = screenW; h.screenH = screenH; return h; }());
 
-            {
+            if (!labKeys && IsKeyPressed(KEY_C)) {
+                fitUI.enabled = !fitUI.enabled;
+                if (!fitUI.enabled) { gdapp::cancelFit(fitUI); fitUI.selectedIdx = -1; }
+                // A pinned point is only meaningful against a still frame, and the
+                // fit itself must be the only thing simulating while it runs.
+                if (fitUI.enabled) transport.paused = true;
+            }
+
+            if (!labKeys) nudgePhysicsTrailOffset();
+            // BACKSPACE, not A: same WASD-pan conflict as Solving above.
+            if (!labKeys && IsKeyPressed(KEY_BACKSPACE)) state = AppState::Solving;
+
+            // ── transport: keyboard half (the bar's own half runs at draw time,
+            //    since it needs to be drawn to be clicked) ─────────────────────
+            const int replayTotalFrames =
+                std::max<int>(1, (int)std::max<size_t>(replayInputAt.size(),
+                                                        (size_t)solverResult.levelEndEstimate));
+            gdapp::TransportResult act;
+            if (!labKeys) act = gdapp::transportKeys(transport, (int)replayFrameCounter, replayTotalFrames);
+            pendingTransport = act;   // merged with the bar's result after drawing
+
+            if (!labMouse) {
                 Rectangle deviationBtn{(float)(screenW - 190), 10.f, 170.f, 30.f};
                 if (CheckCollisionPointRec(GetMousePosition(), deviationBtn) && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                     std::vector<gdapp::TrailPoint> simVec(replayTrail.begin(), replayTrail.end());
@@ -716,7 +810,7 @@ int main() {
             // Works at any moment now (not just once the replay has ended) —
             // hover an object mid-playback and press J the instant something
             // looks wrong, no need to wait for death/clear or pause first.
-            if (IsKeyPressed(KEY_J) && replayLevel) {
+            if (!labKeys && IsKeyPressed(KEY_J) && replayLevel) {
                 const char* src = !replayAlive ? (replayLevel->latestState().dead ? "Replay-Died" : "Replay-Cleared")
                                                 : "Replay-Live";
                 flagHitboxAt(replayLevel.get(), replayLevel->latestState(), replayCam, src);
@@ -728,7 +822,7 @@ int main() {
             // so the two controls can't both fire off the same keypress.
             bool ctrlHeld = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
             float dt = GetFrameTime();
-            float panSpeed = 400.f / replayCam.pixelsPerUnit * dt;
+            float panSpeed = labKeys ? 0.f : 400.f / replayCam.pixelsPerUnit * dt;
             if (IsKeyDown(KEY_A)) replayCam.x -= panSpeed;
             if (IsKeyDown(KEY_D)) replayCam.x += panSpeed;
             if (IsKeyDown(KEY_W)) replayCam.y += panSpeed;
@@ -739,14 +833,40 @@ int main() {
                 if (IsKeyDown(KEY_UP))    replayCam.y += panSpeed;
                 if (IsKeyDown(KEY_DOWN))  replayCam.y -= panSpeed;
             }
-            float wheel = GetMouseWheelMove();
-            if (wheel != 0.f) replayCam.pixelsPerUnit = std::clamp(replayCam.pixelsPerUnit * (1.f + wheel * 0.1f), 0.3f, 14.f);
-            if (IsKeyDown(KEY_EQUAL) || IsKeyDown(KEY_KP_ADD))      replayCam.pixelsPerUnit = std::min(14.f, replayCam.pixelsPerUnit * 1.02f);
-            if (IsKeyDown(KEY_MINUS) || IsKeyDown(KEY_KP_SUBTRACT)) replayCam.pixelsPerUnit = std::max(0.3f, replayCam.pixelsPerUnit / 1.02f);
+            float wheel = labMouse ? 0.f : GetMouseWheelMove();
+            // ── REPLAY ZOOM (this is the one that matters for trajectory work) ──
+            // Cursor-anchored: at high zoom, keeping what you point at in place is
+            // the difference between inspecting a point and chasing it off screen.
+            // Hold SHIFT for fine steps when lining a pin up on a single frame.
+            // Limits live in render.hpp (kMinZoom / kMaxZoom).
+            if (wheel != 0.f) {
+                float rate = (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) ? 0.03f : 0.12f;
+                gdapp::zoomAt(replayCam, 1.f + wheel * rate, GetMousePosition(), screenW, screenH);
+            }
+            if (!labKeys && (IsKeyDown(KEY_EQUAL) || IsKeyDown(KEY_KP_ADD)))      replayCam.pixelsPerUnit = std::min(gdapp::kMaxZoom, replayCam.pixelsPerUnit * 1.02f);
+            if (!labKeys && (IsKeyDown(KEY_MINUS) || IsKeyDown(KEY_KP_SUBTRACT))) replayCam.pixelsPerUnit = std::max(gdapp::kMinZoom, replayCam.pixelsPerUnit / 1.02f);
 
-            if (replayLevel && replayAlive && !replayPaused) {
-                replayAccumulator += GetFrameTime();
-                if (replayAccumulator > 0.25f) replayAccumulator = 0.25f;
+            // Optional camera follow (transport bar toggle / F). Off by default so
+            // the long-standing "camera stays where I put it" behaviour is intact.
+            if (transport.followCam && replayLevel) {
+                const auto& lp = replayLevel->latestState();
+                replayCam.x = lp.pos.x;
+                replayCam.y = lp.pos.y;
+            }
+
+            // speed 0 = frozen (frame-stepping only); scrubbing owns the frame
+            // cursor while the user drags, so the sim must not also advance.
+            // A running fit is stepping its OWN Level on a worker thread while
+            // mutating the shared physics globals — simulating here at the same
+            // time would be a data race and would also corrupt the fit's own
+            // measurements, so playback stops for its duration.
+            if (replayLevel && replayAlive && !transport.paused && !transport.scrubbing
+                && !fitUI.running && transport.speed > 0.f) {
+                replayAccumulator += GetFrameTime() * transport.speed;
+                // Cap scales with the rate so a 32x pass is not silently throttled
+                // back to real time, while a stall still cannot spiral.
+                const float accCap = 0.25f * std::max(1.f, transport.speed);
+                if (replayAccumulator > accCap) replayAccumulator = accCap;
                 while (replayAccumulator >= FIXED_DT) {
                     replayFrameCounter++;
                     bool press = replayFrameCounter < replayInputAt.size() && replayInputAt[replayFrameCounter];
@@ -821,39 +941,39 @@ int main() {
         ClearBackground(Color{18, 18, 24, 255});
 
         if (state == AppState::Menu) {
-            DrawText("GD Level Player", screenW / 2 - 140, 80, 28, RAYWHITE);
-            DrawText("Enter a level ID and press Enter:", screenW / 2 - 160, 160, 18, GRAY);
+            gdapp::UIText("GD Level Player", screenW / 2 - 140, 80, 28, RAYWHITE);
+            gdapp::UIText("Enter a level ID and press Enter:", screenW / 2 - 160, 160, 18, GRAY);
             std::string display = idInput + "_";
-            DrawText(display.c_str(), screenW / 2 - 60, 200, 30, YELLOW);
-            DrawText("TAB - browse already-downloaded levels", screenW / 2 - 150, 320, 16, Color{140,140,150,255});
-            DrawText("M - macro list (cleared replays kept this session)", screenW / 2 - 190, 344, 16, Color{140,140,150,255});
-            DrawText("O - options", screenW / 2 - 150, 368, 16, Color{140,140,150,255});
-            DrawText("I - import a .gdr2 and replay it (compare vs the physics trail)",
+            gdapp::UIText(display.c_str(), screenW / 2 - 60, 200, 30, YELLOW);
+            gdapp::UIText("TAB - browse already-downloaded levels", screenW / 2 - 150, 320, 16, Color{140,140,150,255});
+            gdapp::UIText("M - macro list (cleared replays kept this session)", screenW / 2 - 190, 344, 16, Color{140,140,150,255});
+            gdapp::UIText("O - options", screenW / 2 - 150, 368, 16, Color{140,140,150,255});
+            gdapp::UIText("I - import a .gdr2 and replay it (compare vs the physics trail)",
                      screenW / 2 - 260, 392, 16, Color{140,140,150,255});
             if (!statusMsg.empty())
-                DrawText(statusMsg.c_str(), screenW / 2 - (int)statusMsg.size() * 4, 250, 16, RED);
+                gdapp::UIText(statusMsg.c_str(), screenW / 2 - (int)statusMsg.size() * 4, 250, 16, RED);
             if (GetTime() < importStatusUntil && !importStatusMsg.empty())
-                DrawText(importStatusMsg.c_str(), screenW / 2 - (int)importStatusMsg.size() * 3, 420, 15,
+                gdapp::UIText(importStatusMsg.c_str(), screenW / 2 - (int)importStatusMsg.size() * 3, 420, 15,
                          Color{255, 170, 90, 255});
             double remaining = cooldownUntil - GetTime();
             if (remaining > 0.0) {
                 const char* txt = TextFormat("Rate limited - retry available in %.0fs", remaining);
-                DrawText(txt, screenW / 2 - MeasureText(txt, 16) / 2, 280, 16, ORANGE);
+                gdapp::UIText(txt, screenW / 2 - gdapp::UITextWidth(txt, 16) / 2, 280, 16, ORANGE);
             }
         } else if (state == AppState::Options) {
-            DrawText("Options", screenW / 2 - 60, 90, 28, RAYWHITE);
+            gdapp::UIText("Options", screenW / 2 - 60, 90, 28, RAYWHITE);
 
             Rectangle trailToggleRect{(float)(screenW / 2 - 160), 160.f, 320.f, 34.f};
             bool trailHover = CheckCollisionPointRec(GetMousePosition(), trailToggleRect);
             DrawRectangleRec(trailToggleRect, trailHover ? Color{70, 110, 150, 230} : Color{45, 55, 70, 210});
             DrawRectangleLinesEx(trailToggleRect, 1.5f, Color{130, 190, 230, 255});
             std::string trailLabel = std::string("Physics trail: ") + (showPhysicsTrail ? "ON" : "OFF");
-            int tw = MeasureText(trailLabel.c_str(), 16);
-            DrawText(trailLabel.c_str(), (int)(trailToggleRect.x + (trailToggleRect.width - tw) * 0.5f),
+            int tw = gdapp::UITextWidth(trailLabel.c_str(), 16);
+            gdapp::UIText(trailLabel.c_str(), (int)(trailToggleRect.x + (trailToggleRect.width - tw) * 0.5f),
                      (int)(trailToggleRect.y + 9), 16, RAYWHITE);
-            DrawText("Overlays a real GDMod_physics_<id>.txt capture (orange line) next to",
+            gdapp::UIText("Overlays a real GDMod_physics_<id>.txt capture (orange line) next to",
                      screenW / 2 - 260, 210, 14, Color{140, 140, 150, 255});
-            DrawText("the live gdsim trail, when one exists for the loaded level.",
+            gdapp::UIText("the live gdsim trail, when one exists for the loaded level.",
                      screenW / 2 - 260, 228, 14, Color{140, 140, 150, 255});
 
             Rectangle centerPathToggleRect{(float)(screenW / 2 - 160), 250.f, 320.f, 34.f};
@@ -861,19 +981,19 @@ int main() {
             DrawRectangleRec(centerPathToggleRect, centerPathHover ? Color{70, 110, 150, 230} : Color{45, 55, 70, 210});
             DrawRectangleLinesEx(centerPathToggleRect, 1.5f, Color{130, 190, 230, 255});
             std::string centerPathLabel = std::string("Show middle of player path: ") + (showCenterPath ? "ON" : "OFF");
-            int cptw = MeasureText(centerPathLabel.c_str(), 16);
-            DrawText(centerPathLabel.c_str(), (int)(centerPathToggleRect.x + (centerPathToggleRect.width - cptw) * 0.5f),
+            int cptw = gdapp::UITextWidth(centerPathLabel.c_str(), 16);
+            gdapp::UIText(centerPathLabel.c_str(), (int)(centerPathToggleRect.x + (centerPathToggleRect.width - cptw) * 0.5f),
                      (int)(centerPathToggleRect.y + 9), 16, RAYWHITE);
-            DrawText("A thin cyan line through the player's centre, instead of/alongside",
+            gdapp::UIText("A thin cyan line through the player's centre, instead of/alongside",
                      screenW / 2 - 260, 300, 14, Color{140, 140, 150, 255});
-            DrawText("the full swept-hitbox trail — easier to read as a pure path curve.",
+            gdapp::UIText("the full swept-hitbox trail — easier to read as a pure path curve.",
                      screenW / 2 - 260, 318, 14, Color{140, 140, 150, 255});
 
-            DrawText("A back", screenW / 2 - 40, screenH - 40, 14, Color{140,140,150,255});
+            gdapp::UIText("A back", screenW / 2 - 40, screenH - 40, 14, Color{140,140,150,255});
         } else if (state == AppState::LevelSelect) {
-            DrawText("Downloaded levels", screenW / 2 - 100, 90, 24, RAYWHITE);
+            gdapp::UIText("Downloaded levels", screenW / 2 - 100, 90, 24, RAYWHITE);
             if (cachedLevels.empty()) {
-                DrawText("(nothing cached yet - load a level by ID first)", screenW / 2 - 190, 160, 16, GRAY);
+                gdapp::UIText("(nothing cached yet - load a level by ID first)", screenW / 2 - 190, 160, 16, GRAY);
             } else {
                 int rowH = 28, listTop = 140;
                 for (int i = 0; i < (int)cachedLevels.size(); i++) {
@@ -881,14 +1001,14 @@ int main() {
                     Rectangle row{ (float)(screenW / 2 - 260), (float)(listTop + i * rowH), 520.f, (float)(rowH - 4) };
                     if (sel) DrawRectangleRec(row, Color{50, 50, 65, 255});
                     std::string line = cachedLevels[i].name + "  (" + std::to_string(cachedLevels[i].id) + ")";
-                    DrawText(line.c_str(), (int)row.x + 10, (int)row.y + 5, 16, sel ? YELLOW : RAYWHITE);
+                    gdapp::UIText(line.c_str(), (int)row.x + 10, (int)row.y + 5, 16, sel ? YELLOW : RAYWHITE);
                 }
             }
-            DrawText("UP/DOWN + Enter, or click - A back", screenW / 2 - 140, screenH - 40, 14, Color{140,140,150,255});
+            gdapp::UIText("UP/DOWN + Enter, or click - A back", screenW / 2 - 140, screenH - 40, 14, Color{140,140,150,255});
         } else if (state == AppState::MacroList) {
-            DrawText("Macro list (this session)", screenW / 2 - 130, 90, 24, RAYWHITE);
+            gdapp::UIText("Macro list (this session)", screenW / 2 - 130, 90, 24, RAYWHITE);
             if (macroList.empty()) {
-                DrawText("(nothing yet - a Replay that reaches the end gets kept here)",
+                gdapp::UIText("(nothing yet - a Replay that reaches the end gets kept here)",
                          screenW / 2 - 230, 160, 16, GRAY);
             } else {
                 int rowH = 28, listTop = 140;
@@ -899,7 +1019,7 @@ int main() {
                     const MacroEntry& m = macroList[i];
                     std::string line = m.levelName + "  (" + std::to_string(m.levelId) + ")  "
                                       + std::to_string(m.clicks.size()) + " clicks  " + m.recordedAt;
-                    DrawText(line.c_str(), (int)row.x + 10, (int)row.y + 5, 16, sel ? YELLOW : RAYWHITE);
+                    gdapp::UIText(line.c_str(), (int)row.x + 10, (int)row.y + 5, 16, sel ? YELLOW : RAYWHITE);
                 }
 
                 Rectangle replayBtn{(float)(screenW / 2 + 310), (float)(listTop), 90.f, 26.f};
@@ -908,17 +1028,17 @@ int main() {
                     bool hover = CheckCollisionPointRec(GetMousePosition(), r);
                     DrawRectangleRec(r, hover ? Color{70, 110, 150, 230} : Color{45, 55, 70, 210});
                     DrawRectangleLinesEx(r, 1.5f, Color{130, 190, 230, 255});
-                    int tw = MeasureText(txt, 13);
-                    DrawText(txt, (int)(r.x + (r.width - tw) * 0.5f), (int)(r.y + 7), 13, RAYWHITE);
+                    int tw = gdapp::UITextWidth(txt, 13);
+                    gdapp::UIText(txt, (int)(r.x + (r.width - tw) * 0.5f), (int)(r.y + 7), 13, RAYWHITE);
                 };
                 drawBtn(replayBtn, "Replay");
                 drawBtn(exportBtn, "Export");
 
                 if (GetTime() < exportStatusUntil && !exportStatusMsg.empty())
-                    DrawText(exportStatusMsg.c_str(), (int)replayBtn.x, (int)(listTop + 66), 13,
+                    gdapp::UIText(exportStatusMsg.c_str(), (int)replayBtn.x, (int)(listTop + 66), 13,
                              Color{170, 230, 170, 255});
             }
-            DrawText("UP/DOWN select - ENTER/click replay - E export - A back",
+            gdapp::UIText("UP/DOWN select - ENTER/click replay - E export - A back",
                      screenW / 2 - 200, screenH - 40, 14, Color{140,140,150,255});
         } else if (state == AppState::Solving) {
             if (solveDrawLevel) gdapp::drawLevelGeometry(*solveDrawLevel, solverCam, screenW, screenH);
@@ -940,9 +1060,9 @@ int main() {
                                        : (solverResult.solved ? "SOLVED" : "STOPPED");
                 Color statusColor = !solverThreadDone ? (paused ? YELLOW : Color{130, 210, 255, 255})
                                   : (solverResult.solved ? GREEN : ORANGE);
-                DrawText(levelName.c_str(), 12, 10, 20, RAYWHITE);
-                DrawText(TextFormat("Beam search: %s", statusTxt), 12, 34, 18, statusColor);
-                DrawText(TextFormat("X = %.0f / %.0f  (%.1f%%)   clicks = %d",
+                gdapp::UIText(levelName.c_str(), 12, 10, 20, RAYWHITE);
+                gdapp::UIText(TextFormat("Beam search: %s", statusTxt), 12, 34, 18, statusColor);
+                gdapp::UIText(TextFormat("X = %.0f / %.0f  (%.1f%%)   clicks = %d",
                                      bestX, endX, endX > 0.f ? bestX * 100.f / endX : 0.f, clicksFound),
                          12, 58, 16, GRAY);
 
@@ -951,20 +1071,20 @@ int main() {
                     int y = 84;
                     int startIdx = std::max(0, (int)solverProgress->log.size() - 14);
                     for (int i = startIdx; i < (int)solverProgress->log.size(); i++) {
-                        DrawText(solverProgress->log[i].c_str(), 12, y, 13, Color{170, 170, 180, 220});
+                        gdapp::UIText(solverProgress->log[i].c_str(), 12, y, 13, Color{170, 170, 180, 220});
                         y += 16;
                     }
                 }
 
                 if (!solverThreadDone) {
-                    DrawText("P pause/resume  -  O stop  -  WASD/arrows pan  -  wheel zoom",
+                    gdapp::UIText("P pause/resume  -  O stop  -  WASD/arrows pan  -  wheel zoom",
                              12, screenH - 26, 14, Color{140, 140, 150, 255});
                 } else {
-                    DrawText("R re-solve  -  Backspace menu  -  WASD/arrows pan  -  wheel zoom",
+                    gdapp::UIText("R re-solve  -  Backspace menu  -  WASD/arrows pan  -  wheel zoom",
                              12, screenH - 26, 14, Color{140, 140, 150, 255});
                     if (solverResult.solved) {
                         const char* txt = "SOLVED!";
-                        DrawText(txt, screenW / 2 - MeasureText(txt, 34) / 2, 20, 34, GREEN);
+                        gdapp::UIText(txt, screenW / 2 - gdapp::UITextWidth(txt, 34) / 2, 20, 34, GREEN);
 
                         Rectangle replayBtn{(float)(screenW - 190), 84.f, 170.f, 30.f};
                         Rectangle exportBtn{(float)(screenW - 190), 118.f, 170.f, 30.f};
@@ -972,15 +1092,15 @@ int main() {
                             bool hover = CheckCollisionPointRec(GetMousePosition(), r);
                             DrawRectangleRec(r, hover ? Color{70, 110, 150, 230} : Color{45, 55, 70, 210});
                             DrawRectangleLinesEx(r, 1.5f, Color{130, 190, 230, 255});
-                            int tw = MeasureText(txt2, 13);
-                            DrawText(txt2, (int)(r.x + (r.width - tw) * 0.5f), (int)(r.y + 8), 13, RAYWHITE);
+                            int tw = gdapp::UITextWidth(txt2, 13);
+                            gdapp::UIText(txt2, (int)(r.x + (r.width - tw) * 0.5f), (int)(r.y + 8), 13, RAYWHITE);
                         };
                         drawBtn(replayBtn, "Replay");
                         drawBtn(exportBtn, "Export .gdr2");
 
                         if (GetTime() < exportStatusUntil && !exportStatusMsg.empty()) {
-                            int tw = MeasureText(exportStatusMsg.c_str(), 14);
-                            DrawText(exportStatusMsg.c_str(), screenW - 190 + (170 - tw) / 2, 152, 14,
+                            int tw = gdapp::UITextWidth(exportStatusMsg.c_str(), 14);
+                            gdapp::UIText(exportStatusMsg.c_str(), screenW - 190 + (170 - tw) / 2, 152, 14,
                                      Color{170, 230, 170, 255});
                         }
                     }
@@ -994,17 +1114,48 @@ int main() {
                 if (showCenterPath) gdapp::drawCenterPath(trailVec, replayCam, screenW, screenH);
                 gdapp::drawLevel(*replayLevel, replayLevel->latestState(), replayCam, screenW, screenH);
 
+                // ── trajectory correction (C) ─────────────────────────────────
+                // Drawn over the world so its pin sits on top of the trail, and
+                // before the HUD so the panel does not cover the status text.
+                {
+                    gdapp::FitUIHost fh;
+                    fh.trail       = &trailVec;
+                    fh.realTrail   = &physicsTrail;
+                    fh.realOffsetX = physicsTrailOffsetX;
+                    fh.realOffsetY = physicsTrailOffsetY;
+                    fh.levelString = &decodedLevelString;
+                    fh.inputAt     = &replayInputAt;
+                    fh.cam         = replayCam;
+                    fh.screenW     = screenW;
+                    fh.screenH     = screenH;
+                    fh.blockMouse  = gdapp::tunerWantsMouse(tuner, screenW);
+                    fh.blockKeys   = gdapp::tunerWantsKeyboard(tuner);
+                    if (gdapp::updateFitUI(fitUI, fh)) {
+                        // A candidate was applied — re-run to the same frame so the
+                        // trail immediately shows whether it actually landed on the
+                        // target, which is the only honest confirmation.
+                        rebuildReplayTo((int)replayFrameCounter);
+                    }
+                }
+
                 float pct = 100.f * replayLevel->latestState().pos.x / replayLevel->length;
                 bool died = replayLevel->latestState().dead;
-                DrawText(levelName.c_str(), 12, 10, 20, RAYWHITE);
-                DrawText(TextFormat("Replay: %.1f%%", pct), 12, 34, 18, GRAY);
-                const char* status = replayAlive ? (replayPaused ? "PAUSED" : "PLAYING")
+                gdapp::UIText(levelName.c_str(), 12, 10, 20, RAYWHITE);
+                gdapp::UIText(TextFormat("Replay: %.1f%%", pct), 12, 34, 18, GRAY);
+                const char* status = replayAlive ? (transport.paused ? "PAUSED" : "PLAYING")
                                     : (died ? "DIED (unexpected!)" : "CLEARED");
-                Color statusColor = replayAlive ? (replayPaused ? YELLOW : Color{130, 210, 255, 255})
+                Color statusColor = replayAlive ? (transport.paused ? YELLOW : Color{130, 210, 255, 255})
                                   : (died ? RED : GREEN);
-                DrawText(status, 12, 58, 16, statusColor);
-                DrawText("SPACE pause/resume  -  R restart  -  Backspace back  -  WASD/arrows pan  -  wheel zoom",
-                         12, screenH - 26, 14, Color{140, 140, 150, 255});
+                gdapp::UIText(status, 12, 58, 16, statusColor);
+                // Zoom readout: at 400 px/unit it is easy to lose track of scale,
+                // and "how many pixels is one world unit" is the number that
+                // actually matters when judging a sub-unit deviation.
+                gdapp::UIText(TextFormat("zoom %.2f px/unit   (wheel, shift=fine)", replayCam.pixelsPerUnit),
+                         12, 76, 13, Color{140, 140, 150, 255});
+                // Lifted clear of the transport bar (56px tall, drawn at the very
+                // bottom) so the two never overlap.
+                gdapp::UIText("TAB physics lab  -  C correct trajectory  -  SPACE pause  -  , . step  -  [ ] speed  -  R restart  -  F follow",
+                         12, screenH - 78, 14, Color{140, 140, 150, 255});
 
                 {
                     Rectangle deviationBtn{(float)(screenW - 190), 10.f, 170.f, 30.f};
@@ -1012,25 +1163,27 @@ int main() {
                     DrawRectangleRec(deviationBtn, hover ? Color{70, 110, 150, 230} : Color{45, 55, 70, 210});
                     DrawRectangleLinesEx(deviationBtn, 1.5f, Color{130, 190, 230, 255});
                     const char* btnTxt = "Export deviation";
-                    int tw = MeasureText(btnTxt, 14);
-                    DrawText(btnTxt, (int)(deviationBtn.x + (deviationBtn.width - tw) * 0.5f),
+                    int tw = gdapp::UITextWidth(btnTxt, 14);
+                    gdapp::UIText(btnTxt, (int)(deviationBtn.x + (deviationBtn.width - tw) * 0.5f),
                              (int)(deviationBtn.y + 8), 14, RAYWHITE);
                     if (GetTime() < deviationStatusUntil && !deviationStatusMsg.empty())
-                        DrawText(deviationStatusMsg.c_str(), (int)deviationBtn.x, (int)(deviationBtn.y + 36), 13,
+                        gdapp::UIText(deviationStatusMsg.c_str(), (int)deviationBtn.x, (int)(deviationBtn.y + 36), 13,
                                  Color{170, 230, 170, 255});
                 }
                 if (GetTime() < importStatusUntil && !importStatusMsg.empty())
-                    DrawText(importStatusMsg.c_str(), 12, 128, 15, Color{255, 170, 90, 255});
+                    gdapp::UIText(importStatusMsg.c_str(), 12, 128, 15, Color{255, 170, 90, 255});
                 if (showPhysicsTrail) {
-                    DrawText(TextFormat("Physics trail offset: X=%.1f Y=%.1f  (ctrl+arrows, shift=fast)",
+                    gdapp::UIText(TextFormat("Physics trail offset: X=%.1f Y=%.1f  (ctrl+arrows, shift=fast)",
                                         physicsTrailOffsetX, physicsTrailOffsetY),
-                             12, screenH - 46, 14, Color{255, 170, 90, 255});
+                             12, screenH - 98, 14, Color{255, 170, 90, 255});
                 }
 
+                // Suppressed in correction mode: both tools highlight whatever is
+                // under the cursor, and two overlapping highlights read as a bug.
                 // Hitbox-mismatch flagging: available at any moment (live or
                 // ended). Live preview highlight (before J is pressed) plus the
                 // confirmation message after.
-                {
+                if (!fitUI.enabled) {
                     Vector2 mouse = GetMousePosition();
                     Vec2D worldPos = gdapp::screenToWorld(mouse.x, mouse.y, replayCam, screenW, screenH);
                     auto picked = gdapp::pickObjectNear(*replayLevel, worldPos, replayLevel->latestState().frame);
@@ -1040,13 +1193,13 @@ int main() {
                         float hw = picked.size.x * 0.5f * replayCam.pixelsPerUnit + 3.f;
                         float hh = picked.size.y * 0.5f * replayCam.pixelsPerUnit + 3.f;
                         DrawRectangleLinesEx({c.x - hw, c.y - hh, hw * 2, hh * 2}, 2.5f, Color{255, 255, 90, 230});
-                        DrawText(TextFormat("typeId=%d - press J to flag", picked.typeId),
+                        gdapp::UIText(TextFormat("typeId=%d - press J to flag", picked.typeId),
                                  (int)(c.x - hw), (int)(c.y - hh - 18), 14, Color{255, 255, 140, 255});
                     }
-                    DrawText("Hover an object + press J to flag its hitbox as wrong",
+                    gdapp::UIText("Hover an object + press J to flag its hitbox as wrong",
                              12, 84, 14, Color{160, 200, 255, 255});
                     if (GetTime() < flagStatusUntil && !flagStatusMsg.empty())
-                        DrawText(flagStatusMsg.c_str(), 12, 104, 15, Color{170, 230, 170, 255});
+                        gdapp::UIText(flagStatusMsg.c_str(), 12, 104, 15, Color{170, 230, 170, 255});
                 }
             }
         } else if (level) {
@@ -1057,11 +1210,11 @@ int main() {
             gdapp::drawLevel(*level, level->latestState(), cam, screenW, screenH);
 
             float pct = 100.f * level->latestState().pos.x / level->length;
-            DrawText(levelName.c_str(), 12, 10, 20, RAYWHITE);
-            DrawText(TextFormat("%.1f%%", pct), 12, 34, 18, GRAY);
-            DrawText("SPACE/click to jump  -  R restart  -  A pause", 12, screenH - 26, 14, Color{140,140,150,255});
+            gdapp::UIText(levelName.c_str(), 12, 10, 20, RAYWHITE);
+            gdapp::UIText(TextFormat("%.1f%%", pct), 12, 34, 18, GRAY);
+            gdapp::UIText("SPACE/click to jump  -  R restart  -  A pause  -  TAB physics lab", 12, screenH - 26, 14, Color{140,140,150,255});
             if (showPhysicsTrail) {
-                DrawText(TextFormat("Physics trail offset: X=%.1f Y=%.1f  (ctrl+arrows, shift=fast)",
+                gdapp::UIText(TextFormat("Physics trail offset: X=%.1f Y=%.1f  (ctrl+arrows, shift=fast)",
                                     physicsTrailOffsetX, physicsTrailOffsetY),
                          12, screenH - 46, 14, Color{255, 170, 90, 255});
             }
@@ -1072,8 +1225,8 @@ int main() {
                 DrawRectangleRec(solveBtnRect, hover ? Color{70, 110, 150, 230} : Color{45, 55, 70, 210});
                 DrawRectangleLinesEx(solveBtnRect, 1.5f, Color{130, 190, 230, 255});
                 const char* btnTxt = "SOLVE (Beam Search)";
-                int tw = MeasureText(btnTxt, 14);
-                DrawText(btnTxt, (int)(solveBtnRect.x + (solveBtnRect.width - tw) * 0.5f),
+                int tw = gdapp::UITextWidth(btnTxt, 14);
+                gdapp::UIText(btnTxt, (int)(solveBtnRect.x + (solveBtnRect.width - tw) * 0.5f),
                          (int)(solveBtnRect.y + 9), 14, RAYWHITE);
 
                 // Toggle: OFF by default (see solverHumanClickLimit's declaration) —
@@ -1089,7 +1242,7 @@ int main() {
                 DrawRectangleLinesEx(checkBox, 1.5f, Color{170, 170, 190, 255});
                 if (solverHumanClickLimit)
                     DrawRectangle((int)checkBox.x + 3, (int)checkBox.y + 3, 8, 8, Color{130, 200, 255, 255});
-                DrawText("Human click limit (14/s)", (int)(checkBox.x + 20), (int)(humanLimitRect.y + 6), 12,
+                gdapp::UIText("Human click limit (14/s)", (int)(checkBox.x + 20), (int)(humanLimitRect.y + 6), 12,
                          Color{200, 200, 210, 255});
 
                 Rectangle deviationBtn{(float)(screenW - 190), 76.f, 170.f, 28.f};
@@ -1097,24 +1250,24 @@ int main() {
                 DrawRectangleRec(deviationBtn, devHover ? Color{70, 110, 150, 230} : Color{45, 55, 70, 210});
                 DrawRectangleLinesEx(deviationBtn, 1.5f, Color{130, 190, 230, 255});
                 const char* devTxt = "Export deviation";
-                int devTw = MeasureText(devTxt, 13);
-                DrawText(devTxt, (int)(deviationBtn.x + (deviationBtn.width - devTw) * 0.5f),
+                int devTw = gdapp::UITextWidth(devTxt, 13);
+                gdapp::UIText(devTxt, (int)(deviationBtn.x + (deviationBtn.width - devTw) * 0.5f),
                          (int)(deviationBtn.y + 7), 13, RAYWHITE);
                 if (GetTime() < deviationStatusUntil && !deviationStatusMsg.empty())
-                    DrawText(deviationStatusMsg.c_str(), (int)deviationBtn.x, (int)(deviationBtn.y + 34), 12,
+                    gdapp::UIText(deviationStatusMsg.c_str(), (int)deviationBtn.x, (int)(deviationBtn.y + 34), 12,
                              Color{170, 230, 170, 255});
             }
 
             if (state == AppState::Paused) {
-                DrawText("PAUSED", screenW / 2 - 70, screenH / 2 - 40, 40, YELLOW);
-                DrawText("SPACE to resume  -  A to quit  -  O options", screenW / 2 - 150, screenH / 2 + 10, 16, GRAY);
+                gdapp::UIText("PAUSED", screenW / 2 - 70, screenH / 2 - 40, 40, YELLOW);
+                gdapp::UIText("SPACE to resume  -  A to quit  -  O options", screenW / 2 - 150, screenH / 2 + 10, 16, GRAY);
             } else if (state == AppState::Dead) {
-                DrawText("DIED", screenW / 2 - 40, screenH / 2 - 40, 40, RED);
-                DrawText(TextFormat("%.2f%% of the level", finalPercent), screenW / 2 - 90, screenH / 2 + 10, 18, RAYWHITE);
-                DrawText("R to retry  -  A for menu", screenW / 2 - 110, screenH / 2 + 40, 16, GRAY);
+                gdapp::UIText("DIED", screenW / 2 - 40, screenH / 2 - 40, 40, RED);
+                gdapp::UIText(TextFormat("%.2f%% of the level", finalPercent), screenW / 2 - 90, screenH / 2 + 10, 18, RAYWHITE);
+                gdapp::UIText("R to retry  -  A for menu", screenW / 2 - 110, screenH / 2 + 40, 16, GRAY);
             } else if (state == AppState::Cleared) {
-                DrawText("CLEARED!", screenW / 2 - 80, screenH / 2 - 40, 40, GREEN);
-                DrawText("R to replay  -  A for menu", screenW / 2 - 110, screenH / 2 + 10, 16, GRAY);
+                gdapp::UIText("CLEARED!", screenW / 2 - 80, screenH / 2 - 40, 40, GREEN);
+                gdapp::UIText("R to replay  -  A for menu", screenW / 2 - 110, screenH / 2 + 10, 16, GRAY);
             }
 
             // Hitbox-mismatch flagging: available at any moment (Playing,
@@ -1131,17 +1284,87 @@ int main() {
                     float hw = picked.size.x * 0.5f * cam.pixelsPerUnit + 3.f;
                     float hh = picked.size.y * 0.5f * cam.pixelsPerUnit + 3.f;
                     DrawRectangleLinesEx({c.x - hw, c.y - hh, hw * 2, hh * 2}, 2.5f, Color{255, 255, 90, 230});
-                    DrawText(TextFormat("typeId=%d - press J to flag", picked.typeId),
+                    gdapp::UIText(TextFormat("typeId=%d - press J to flag", picked.typeId),
                              (int)(c.x - hw), (int)(c.y - hh - 18), 14, Color{255, 255, 140, 255});
                 }
-                DrawText("Hover an object + press J to flag its hitbox as wrong",
+                gdapp::UIText("Hover an object + press J to flag its hitbox as wrong",
                          screenW / 2 - 190, screenH / 2 + 64, 14, Color{160, 200, 255, 255});
                 if (GetTime() < flagStatusUntil && !flagStatusMsg.empty()) {
-                    int tw = MeasureText(flagStatusMsg.c_str(), 15);
-                    DrawText(flagStatusMsg.c_str(), screenW / 2 - tw / 2, screenH / 2 + 84, 15,
+                    int tw = gdapp::UITextWidth(flagStatusMsg.c_str(), 15);
+                    gdapp::UIText(flagStatusMsg.c_str(), screenW / 2 - tw / 2, screenH / 2 + 84, 15,
                              Color{170, 230, 170, 255});
                 }
             }
+        }
+
+        // ── Replay transport bar ─────────────────────────────────────────────
+        // Drawn after the world so it sits on top, and before the Lab panel so
+        // the panel overlaps it rather than the other way round.
+        if (state == AppState::Replaying && replayLevel) {
+            const auto& lp = replayLevel->latestState();
+            const int total = std::max<int>(1, (int)std::max<size_t>(
+                replayInputAt.size(), (size_t)solverResult.levelEndEstimate));
+            std::string status = TextFormat("x=%.2f  y=%.2f  vel=%.2f  %s%s",
+                                            lp.pos.x, lp.pos.y, lp.velocity,
+                                            lp.small ? "mini " : "",
+                                            lp.upsideDown ? "flipped" : "");
+            auto barAct = gdapp::drawTransport(transport, (int)replayFrameCounter, total,
+                                                status, replayAlive, screenW, screenH,
+                                                gdapp::tunerWantsMouse(tuner, screenW));
+
+            // Merge the keyboard half collected during the input pass.
+            gdapp::TransportResult a = pendingTransport;
+            a.restart    |= barAct.restart;
+            a.stepFrames += barAct.stepFrames;
+            if (barAct.seek) { a.seek = true; a.seekFrame = barAct.seekFrame; }
+
+            if (a.restart) {
+                startReplay();
+            } else if (a.seek) {
+                rebuildReplayTo(std::max(0, a.seekFrame));
+            } else if (a.stepFrames != 0) {
+                if (a.stepFrames > 0 && replayAlive) {
+                    // Forward is just more simulation — no rebuild needed.
+                    for (int i = 0; i < a.stepFrames && replayAlive; i++) {
+                        replayFrameCounter++;
+                        bool press = replayFrameCounter < replayInputAt.size()
+                                  && replayInputAt[replayFrameCounter];
+                        Player& p = replayLevel->runFrame(press, FIXED_DT);
+                        replayTrail.push_back({p.pos, p.size, p.small});
+                        if (p.dead || p.pos.x >= replayLevel->length - 5.f) { replayAlive = false; break; }
+                    }
+                } else if (a.stepFrames < 0) {
+                    // Backward needs a rebuild: gdsim integrates forward only.
+                    rebuildReplayTo(std::max(0, (int)replayFrameCounter + a.stepFrames));
+                }
+                // Stepping implies "I want to look at this frame", so stop rolling.
+                transport.paused = true;
+            }
+            pendingTransport = {};
+        }
+
+        // ── Physics Lab ──────────────────────────────────────────────────────
+        // Available from every state that has a world on screen. Drawn last so it
+        // is always on top of whatever HUD that state put up.
+        if (state == AppState::Replaying || state == AppState::Playing ||
+            state == AppState::Paused    || state == AppState::Dead    ||
+            state == AppState::Cleared   || state == AppState::Solving) {
+            const bool physChanged = gdapp::updateTunerPanel(tuner, screenW, screenH);
+            // Same reason as the playback guard: never simulate on this thread
+            // while the fitter is probing the shared physics globals.
+            if (physChanged && tuner.resimOnChange && !fitUI.running) {
+                // Re-run to the SAME frame so the effect of the edit is visible at
+                // the point being studied, not from the level start. This is the
+                // whole point of the panel: change a constant, watch the trail
+                // move under the same input track.
+                if (state == AppState::Replaying && replayLevel)
+                    rebuildReplayTo((int)replayFrameCounter);
+                else if (state == AppState::Playing && level)
+                    resetPlayback();   // live input can't be replayed; start over
+            }
+            if (GetTime() < resimFlashUntil)
+                gdapp::UIText(TextFormat("re-simulated %d frames", resimFrames), 12, 128, 14,
+                         Color{130, 210, 255, 255});
         }
 
         EndDrawing();

@@ -1,5 +1,7 @@
 #pragma once
 #include "EffectObject.hpp"
+#include "util.hpp"
+#include "Vehicle.hpp"
 
 namespace gdsim {
 
@@ -16,8 +18,10 @@ struct Pad : public EffectObject {
     void collide(Player&) const override;
 };
 
-enum class VehicleType;
 PadType padTypeFromId(int id);
 double  padVelocityValue(PadType t, VehicleType v, bool mini, int speed);
+
+// Exposed (and non-const) for the live-tunables registry — see Orb.hpp.
+extern velocity_map<PadType, VehicleType, bool> pad_velocities;
 
 } // namespace gdsim

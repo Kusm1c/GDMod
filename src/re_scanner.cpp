@@ -15,9 +15,11 @@
 // touches gdsim or the solver, so it cannot affect gameplay or solving.
 
 #include "re_scanner.hpp"
+#include "sim/Gmb.hpp"
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/binding/PlayerObject.hpp>
 #include <Geode/binding/GameObject.hpp>
 #include <Geode/binding/LevelSettingsObject.hpp>
@@ -27,6 +29,7 @@
 #include <fstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <filesystem>
 #include <cmath>
@@ -38,6 +41,8 @@ using namespace geode::prelude;
 namespace {
     std::atomic<bool> s_enabled{false};
     bool              s_listenerInstalled = false;
+    std::atomic<bool> s_jumpProbe{false};
+    bool              s_jumpListenerInstalled = false;
 }
 
 bool rescan::enabled() {
@@ -50,6 +55,18 @@ bool rescan::enabled() {
         });
     }
     return s_enabled.load();
+}
+
+bool rescan::jumpProbeEnabled() {
+    if (!s_jumpListenerInstalled) {
+        s_jumpListenerInstalled = true;
+        s_jumpProbe.store(Mod::get()->getSettingValue<bool>("jump-probe"));
+        listenForSettingChanges<bool>("jump-probe", [](bool v) {
+            s_jumpProbe.store(v);
+            log::info("[REScan] jump probe {}", v ? "ENABLED" : "disabled");
+        });
+    }
+    return s_jumpProbe.load();
 }
 
 // ---- capture state (single PlayLayer at a time) --------------------------
@@ -68,8 +85,45 @@ int           g_frame      = 0;
 bool          g_needParams = false;   // dump level params + build the track on frame 1
 std::string   g_outDir;               // resolved (create+writable-checked) level-capture dir
 std::string   g_trigDir;              // resolved trigger-debug dir
-std::ofstream g_moveOut;
+// Move-trigger capture is BINARY (see sim/Gmb.hpp): as text it reached 17 GB for
+// a single level. The physics/jump captures stay text — they have many readers
+// (the app, a dozen tools) and are nowhere near the same size.
+gdsim::gmb::Writer g_moveBin;
+std::unordered_set<long long> g_dedup;              // per-frame (group,delta) key set
+std::unordered_map<int,int>   g_groupRep;           // group -> its STABLE representative m_uniqueID
 std::ofstream g_physOut;
+
+// Sub-pixel per-physics-step capture (see the JUMP PROBE section at the bottom).
+// Its own stream and its own step counter: g_frame counts RENDERED frames, this
+// counts updateJump calls, and conflating the two is exactly the mistake the
+// probe exists to remove.
+std::ofstream g_jumpOut;
+long long     g_jumpStep = 0;
+
+// ── velocity write trace ─────────────────────────────────────────────────────
+// WINDOWS 2.2081: THE TAG IS NOT USABLE. Measured on a real capture it takes
+// 1210 distinct values in the range 0..1212 - a counter or an uninitialised
+// register, not the decompiled source's small call-site id set (2,3,4,7..16,
+// 61..66). The `int type` parameter is evidently unused in the release build, so
+// callers leave garbage in it. The WRITTEN VALUE is still exact and useful (it
+// tells you a velocity write happened this step and what it wrote); only the tag
+// must be ignored. Left in the file rather than removed so nobody re-derives the
+// same dead end.
+//
+// Originally added because setYVelocity's SECOND parameter looked like the
+// decompiled source's own call-site tag — `setYVelocity(v46, 14)`, `setYVelocity(v37, 7)` and so on. It
+// is not data the game uses; it is a label identifying WHICH branch of
+// updateJump wrote the velocity. Capturing it turns "guess which branch gdsim
+// should mirror" into "read the branch the engine actually took".
+//
+// Its sibling addToYVelocity is `win inline`, so it cannot be hooked — but its
+// contribution is still recoverable by arithmetic:
+//     dv_addTo = (vAfter - vBefore) - sum(setYVelocity writes this step)
+// so no information is lost, it just arrives as a residual instead of an event.
+struct YWrite { double value; int tag; };
+std::vector<YWrite> g_yWrites;      // writes seen during the current updateJump
+bool                g_inUpdateJump = false;
+PlayerObject*       g_probeTarget  = nullptr;   // the player being captured
 
 // A grouped object we watch for trigger-driven motion. We diff its live pose
 // against the previous frame — mechanism-independent, so it captures move,
@@ -94,9 +148,12 @@ std::string ensureDir(const char* preferred) {
 }
 
 void closeScan() {
-    if (g_moveOut.is_open()) g_moveOut.close();
+    g_moveBin.close();
     if (g_physOut.is_open()) g_physOut.close();
+    if (g_jumpOut.is_open()) g_jumpOut.close();
+    g_jumpStep = 0;
     g_track.clear();
+    g_groupRep.clear();
     g_trackBuilt = false;
     g_frame = 0;
 }
@@ -121,6 +178,14 @@ void buildTrack(PlayLayer* pl) {
     }
     g_trackBuilt = true;
     log::info("[REScan] tracking {} grouped gameplay objects for trigger motion", g_track.size());
+}
+
+// First group id, or -1. The binary capture stores one number instead of the old
+// "1.7.12" string: a move trigger targets a single group, and the full membership
+// list is recoverable from the level itself if it is ever needed.
+int firstGroupOf(GameObject* obj) {
+    if (!obj->m_groups || obj->m_groupCount <= 0) return -1;
+    return (*obj->m_groups)[0];
 }
 
 std::string groupsOf(GameObject* obj) {
@@ -179,29 +244,86 @@ class $modify(ReScanPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         closeScan();
-        if (rescan::enabled() && level) {
+        // Either capture can run alone: the jump probe is a focused, high-volume
+        // tool you switch on for one run, while the scanner is meant to sit in the
+        // background — requiring both to be on would make the probe awkward to use.
+        if ((rescan::enabled() || rescan::jumpProbeEnabled()) && level) {
             g_levelId = level->m_levelID;
             g_needParams = true;
             g_outDir  = ensureDir(kOutDir);    // resolves + creates; falls back to Documents
             g_trigDir = ensureDir(kTrigDir);
+          if (rescan::enabled()) {
             // APPEND, not truncate: a hard level gets many attempts, and truncating on
             // every retry would leave only the last (often aborted, empty) run. Each
             // attempt is delimited by an ATTEMPT marker; frame counter resets per attempt.
-            const bool moveNew = !std::ifstream(fmt::format("{}GDMod_movetriggers_{}.txt", g_trigDir, g_levelId)).good();
-            g_moveOut = std::ofstream(fmt::format("{}GDMod_movetriggers_{}.txt", g_trigDir, g_levelId), std::ios::app);
-            if (g_moveOut.is_open()) {
-                if (moveNew) g_moveOut << "# frame objId groups x y dx dy rot drot  — objects moved this frame (move/rotate/follow/physics), pose-diffed\n";
-                g_moveOut << "# --- ATTEMPT ---\n";
+            // Binary (.gmb) — the TEXT form of this one capture reached 17 GB on a
+            // single level, and 36 GB across the folder. Positions are stored to
+            // 1/1024 of a unit, finer than the 3-decimal quantisation the engine
+            // itself applies, so nothing measurable is lost. dx/dy/drot are no
+            // longer stored at all: they are exactly the difference between
+            // consecutive rows for the same object, so the reader recomputes them.
+            using gdsim::gmb::Column;
+            // Column 2 is "uid" (GameObject::m_uniqueID), NOT m_objectID. It used
+            // to be m_objectID, which is a TYPE id shared by every instance of the
+            // same block — so "the group's representative object" matched several
+            // physically distinct objects at once and their rows interleaved. A
+            // reader following one representative then saw it teleporting between
+            // two real objects: on level 123617195 group 61 that produced a fake
+            // 47-unit travel for an object whose real motion is 12, and it was
+            // nearly mistaken for a gdsim trigger-engine bug. The header carries
+            // the column name, so an old capture is self-identifying.
+            const std::vector<Column> moveCols = {
+                {"frame", 1.0}, {"uid", 1.0}, {"group", 1.0},
+                {"x", 1024.0}, {"y", 1024.0}, {"rot", 64.0},
+                {"dx", 1024.0}, {"dy", 1024.0}, {"drot", 64.0},
+            };
+            if (g_moveBin.open(fmt::format("{}GDMod_movetriggers_{}.gmb", g_trigDir, g_levelId),
+                               gdsim::gmb::KIND_MOVETRIGGERS, (uint32_t)g_levelId, moveCols)) {
+                g_moveBin.attempt();
             } else {
                 log::error("[REScan] could not open movetriggers file in '{}'", g_trigDir);
             }
             const bool physNew = !std::ifstream(fmt::format("{}GDMod_physics_{}.txt", g_outDir, g_levelId)).good();
             g_physOut = std::ofstream(fmt::format("{}GDMod_physics_{}.txt", g_outDir, g_levelId), std::ios::app);
             if (g_physOut.is_open()) {
+                // Default ostream precision is 6 SIGNIFICANT digits, which at
+                // x=22625 leaves 0.1-unit resolution and at x>100000 loses the
+                // fractional part entirely — fatal for sub-unit comparison, and
+                // the reason position deltas read as suspiciously quantised.
+                // 17 digits round-trips a double exactly.
+                g_physOut.precision(17);
                 if (physNew) g_physOut << "# frame x y yVel speed veh up mini grounded  — real per-frame player physics\n";
                 g_physOut << "# --- ATTEMPT ---\n";
             } else {
                 log::error("[REScan] could not open physics file in '{}'", g_outDir);
+            }
+          } // rescan::enabled()
+
+            // Sub-pixel per-physics-step capture. Opened only when its own setting
+            // is on, because it writes ~10 MB per minute of play.
+            if (rescan::jumpProbeEnabled()) {
+                const bool jumpNew = !std::ifstream(fmt::format("{}GDMod_jump_{}.txt", g_outDir, g_levelId)).good();
+                g_jumpOut = std::ofstream(fmt::format("{}GDMod_jump_{}.txt", g_outDir, g_levelId), std::ios::app);
+                if (g_jumpOut.is_open()) {
+                    g_jumpOut.precision(17);   // exact double round-trip
+                    if (jumpNew)
+                        g_jumpOut << "# ONE ROW PER 240Hz PHYSICS STEP, captured around PlayerObject::updateJump.\n"
+                                     "# (vAfter-vBefore)/dt is the acceleration the real engine applied on that\n"
+                                     "# step - no averaging, nothing inferred. 17 digits = exact double.\n"
+                                     "# step dt x0 x1 y0 y1 vBefore vAfter gravity gravityMod yStart speedMult\n"
+                                     "#   playerSpeed vehicleSize veh upsideDown onGround onSlope slopeAngle\n"
+                                     "#   slopeVelocity slopeAngleRad dashing sliding jumpBuffered sideways | tag:value ...\n"
+                                     "# After the | is the setYVelocity BRANCH TRACE: the decompiled source's\n"
+                                     "# own call-site tags (setYVelocity(v,14) -> tag 14), in call order. An\n"
+                                     "# empty trace means the whole dv came from the inlined addToYVelocity,\n"
+                                     "# i.e. plain gravity. Recover that part as dv - sum(trace values).\n"
+                                     "# Lines starting with Y are velocity writes OUTSIDE updateJump (orbs,\n"
+                                     "# pads, portals):  Y step tag writtenValue resultingYVel\n";
+                    g_jumpOut << "# --- ATTEMPT ---\n";
+                    log::info("[REScan] jump probe capturing to GDMod_jump_{}.txt", g_levelId);
+                } else {
+                    log::error("[REScan] could not open jump-probe file in '{}'", g_outDir);
+                }
             }
         }
         return true;
@@ -224,13 +346,34 @@ class $modify(ReScanPlayLayer, PlayLayer) {
         // Move/rotate/follow effects: diff every grouped object's live pose against
         // last frame. Independent of m_objectsToMove (which is empty here), so it
         // reliably captures the exact motion any trigger — or physics — produces.
-        if (g_moveOut.is_open() && g_trackBuilt) {
+        if (g_moveBin.isOpen() && g_trackBuilt) {
             // Only log objects near the player: gdsim only poses objects within ~220u
             // of the player anyway, so off-screen motion is noise for RE and unbounded
             // in size. Baselines still advance every frame so a re-entering object
             // reports its true per-frame delta, not an accumulated jump.
             const float px = m_player1 ? m_player1->getPositionX() : 0.f;
             const float kWindow = 1500.f;      // ~2 screens of context around the player
+
+            // Per-frame dedup. Objects sharing a group are moved by one trigger and
+            // therefore by the SAME delta, so a 40-object group wrote 40
+            // identical-motion rows every frame — that redundancy, not the per-row
+            // cost, is what made these files reach 17 GB.
+            //
+            // The representative is STABLE across frames (the first object ever
+            // seen for a group), not "whichever object happened to be logged
+            // first this frame". An unstable representative silently breaks the
+            // reader: positions are stored absolutely and per-frame deltas are
+            // reconstructed as the change since that OBJECT's previous row, so a
+            // representative that changes frame to frame produces deltas spanning
+            // dozens of frames. That bug made a 44-unit platform read as 128869
+            // units of travel before this was fixed.
+            //
+            // Objects that move DIFFERENTLY from their group's representative — a
+            // rotate about a centre moves each member differently — still have a
+            // different delta and are still logged, so no motion is lost.
+            struct Moved { GameObject* obj; int g; float x, y, r, dx, dy, dr; };
+            static std::vector<Moved> moved;   // reused; this runs every frame
+            moved.clear();
             for (auto& t : g_track) {
                 if (!t.obj) continue;
                 float x = t.obj->getPositionX(), y = t.obj->getPositionY(), r = t.obj->getRotation();
@@ -239,12 +382,43 @@ class $modify(ReScanPlayLayer, PlayLayer) {
                 if (std::abs(dx) < 1e-4f && std::abs(dy) < 1e-4f && std::abs(dr) < 1e-4f)
                     continue;                  // only rows with real motion
                 if (std::abs(x - px) > kWindow) continue;   // off-screen → skip logging
-                g_moveOut << g_frame << ' ' << t.obj->m_objectID << ' ' << groupsOf(t.obj) << ' '
-                          << x << ' ' << y << ' ' << dx << ' ' << dy << ' ' << r << ' ' << dr << '\n';
+                moved.push_back({t.obj, firstGroupOf(t.obj), x, y, r, dx, dy, dr});
+            }
+
+            // Claim a stable representative for any group seen for the first time.
+            // Keyed on m_uniqueID (per-instance), never m_objectID (per-type).
+            for (auto& m : moved)
+                if (m.g >= 0) g_groupRep.emplace(m.g, m.obj->m_uniqueID);
+
+            // Quantised so float noise cannot defeat the "same motion" match.
+            auto deltaKey = [](const Moved& m) {
+                return ((long long)std::llround(m.dx * 64.0) << 42)
+                     ^ ((long long)std::llround(m.dy * 64.0) << 21)
+                     ^  (long long)std::llround(m.dr * 4.0);
+            };
+            g_dedup.clear();
+            for (auto& m : moved) {
+                auto rep = g_groupRep.find(m.g);
+                const bool isRep = (rep != g_groupRep.end() && rep->second == m.obj->m_uniqueID);
+                if (isRep) g_dedup.insert(((long long)m.g << 21) ^ deltaKey(m));
+            }
+            for (auto& m : moved) {
+                auto rep = g_groupRep.find(m.g);
+                const bool isRep = (rep != g_groupRep.end() && rep->second == m.obj->m_uniqueID);
+                if (!isRep && m.g >= 0 &&
+                    g_dedup.count(((long long)m.g << 21) ^ deltaKey(m)))
+                    continue;                  // moves exactly like its representative
+                const double row[9] = { (double)g_frame, (double)m.obj->m_uniqueID,
+                                        (double)m.g, m.x, m.y, m.r, m.dx, m.dy, m.dr };
+                g_moveBin.row(row);
             }
         }
 
         // Per-frame physics of whatever you're playing (not gated on a replay).
+        // NOTE: this is a per-VISUAL-frame sample, so it necessarily misses physics
+        // steps (GD runs 240 of those a second regardless of the render rate) —
+        // that is the long-known "dropped frames" property of this file. For
+        // per-STEP ground truth use the jump probe below instead.
         if (g_physOut.is_open() && m_player1) {
             auto* p = m_player1;
             g_physOut << g_frame << ' ' << p->getPositionX() << ' ' << p->getPositionY() << ' '
@@ -254,8 +428,103 @@ class $modify(ReScanPlayLayer, PlayLayer) {
         }
 
         if ((g_frame % 30) == 0) {
-            if (g_moveOut.is_open()) g_moveOut.flush();
+            g_moveBin.flush();
             if (g_physOut.is_open()) g_physOut.flush();
         }
+    }
+};
+
+// ============================================================
+// JUMP PROBE — sub-pixel, per-physics-step capture
+// ============================================================
+// The per-frame file above samples once per RENDERED frame, so at 60 fps it sees
+// one row for every four 240Hz physics steps. Any constant derived from it is
+// therefore averaged over an unknown number of steps, which is exactly the wrong
+// tool for questions like "is this acceleration 0.958199024 or 0.96?".
+//
+// This hooks PlayerObject::updateJump — the function the decompiled source calls
+// once per physics step — and records the engine's own variables immediately
+// BEFORE and AFTER it runs, at 17 significant digits (an exact double
+// round-trip). That turns a derivation into arithmetic: one row IS one
+// integration step, so
+//     (vAfter - vBefore) / dt
+// is the acceleration the real engine actually applied on that step, with no
+// averaging and nothing inferred.
+//
+// It logs the same quantities updateJump reads, so the model can be checked term
+// by term rather than only at the position it eventually produces:
+//   m_gravity, m_gravityMod  -> `float_c = usedGravity * m_gravityMod`
+//   m_yStart                 -> the jump impulse for this speed tier
+//   m_speedMultiplier        -> the wave/dart rate term
+//   size / ground / slope / dash / upside-down -> which branch was taken
+//
+// Gated behind its OWN setting because it writes ~10 MB per minute of play.
+class $modify(JumpProbePlayer, PlayerObject) {
+    void updateJump(float dt) {
+        // Only the level's real player 1, and only while a capture is active.
+        // Menus, icon-kit previews and the dual mirror all run updateJump too and
+        // would interleave unrelated rows into the same file.
+        PlayLayer* pl = PlayLayer::get();
+        const bool capture = rescan::jumpProbeEnabled() && g_jumpOut.is_open()
+                          && pl && pl->m_player1 == this;
+        if (!capture) { PlayerObject::updateJump(dt); return; }
+
+        const double y0 = this->getPositionY();
+        const double x0 = this->getPositionX();
+        const double v0 = this->m_yVelocity;
+
+        // Collect the branch tags this step's updateJump writes (see YWrite).
+        g_probeTarget = this;
+        g_yWrites.clear();
+        g_inUpdateJump = true;
+        PlayerObject::updateJump(dt);
+        g_inUpdateJump = false;
+
+        ++g_jumpStep;
+        g_jumpOut
+            << g_jumpStep << ' ' << dt << ' '
+            << x0 << ' ' << this->getPositionX() << ' '
+            << y0 << ' ' << this->getPositionY() << ' '
+            << v0 << ' ' << this->m_yVelocity << ' '
+            << this->m_gravity << ' ' << this->m_gravityMod << ' '
+            << this->m_yStart << ' ' << this->m_speedMultiplier << ' '
+            << this->m_playerSpeed << ' ' << this->m_vehicleSize << ' '
+            << encodeVehicle(this) << ' '
+            << (this->m_isUpsideDown ? 1 : 0) << ' '
+            << (this->m_isOnGround   ? 1 : 0) << ' '
+            << (this->m_isOnSlope    ? 1 : 0) << ' '
+            << this->m_slopeAngle    << ' '
+            << this->m_slopeVelocity << ' '
+            << this->m_slopeAngleRadians << ' '
+            << (this->m_isDashing    ? 1 : 0) << ' '
+            << (this->m_isSliding    ? 1 : 0) << ' '
+            << (this->m_jumpBuffered ? 1 : 0) << ' '
+            << (this->m_isSideways   ? 1 : 0);
+
+        // Branch trace: every setYVelocity this step, as tag:value, in call order.
+        // An empty list means the step's whole velocity change came from the
+        // inlined addToYVelocity — i.e. plain gravity.
+        g_jumpOut << " |";
+        for (auto& w : g_yWrites) g_jumpOut << ' ' << w.tag << ':' << w.value;
+        g_jumpOut << '\n';
+
+        // Flushed rarely: this runs 240x a second and a flush per step would cost
+        // more than the capture itself.
+        if ((g_jumpStep % 240) == 0) g_jumpOut.flush();
+    }
+
+    // Records the call-site tag of every velocity write. Writes that happen
+    // OUTSIDE updateJump (orbs, pads, portals, the collision phase) are just as
+    // interesting — they are the impulse tables — so they get their own `Y` line
+    // rather than being dropped.
+    void setYVelocity(double velocity, int type) {
+        const bool capture = rescan::jumpProbeEnabled() && g_jumpOut.is_open()
+                          && g_probeTarget == this;
+        if (capture) {
+            if (g_inUpdateJump) g_yWrites.push_back({velocity, type});
+            else g_jumpOut << "Y " << g_jumpStep << ' ' << type << ' ' << velocity
+                           << ' ' << this->m_yVelocity << '\n';
+        }
+        PlayerObject::setYVelocity(velocity, type);
     }
 };

@@ -1,5 +1,7 @@
 #pragma once
 #include "EffectObject.hpp"
+#include "util.hpp"
+#include "Vehicle.hpp"
 
 namespace gdsim {
 
@@ -22,12 +24,15 @@ struct Orb : public EffectObject {
     void collide(Player&) const override;
 };
 
-enum class VehicleType;
 // Map a level orb object-id to its gdsim OrbType (same switch as the Orb ctor),
 // and read the raw table velocity gdsim would apply. Used by the offline
 // mechanic-database comparator (test/compare_mechanics.cpp) to validate gdsim
 // against real-engine capture without constructing a full collision.
 OrbType orbTypeFromId(int id);
 double  orbVelocityValue(OrbType t, VehicleType v, bool mini, int speed);
+
+// Exposed (and non-const) so the live-tunables registry can point straight at
+// each stored velocity — see Tunables.hpp. Nothing in the sim itself mutates it.
+extern velocity_map<OrbType, VehicleType, bool> orb_velocities;
 
 } // namespace gdsim

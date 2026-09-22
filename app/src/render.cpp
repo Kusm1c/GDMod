@@ -1,3 +1,4 @@
+#include "uifont.hpp"
 #include "render.hpp"
 #include "../../src/sim/Slope.hpp"
 #include <cmath>
@@ -222,8 +223,8 @@ static void drawObject(const gdsim::Object* o, float x, float y, float rotDeg,
         if (dBlock) {
             Vector2 c = worldToScreen(x, y, cam, screenW, screenH);
             int fontSize = 12;
-            int tw = MeasureText("D", fontSize);
-            DrawText("D", (int)(c.x - tw * 0.5f), (int)(c.y - fontSize * 0.5f), fontSize, Color{220, 255, 255, 255});
+            int tw = UITextWidth("D", fontSize);
+            UIText("D", (int)(c.x - tw * 0.5f), (int)(c.y - fontSize * 0.5f), fontSize, Color{220, 255, 255, 255});
         }
     } else if (o->prio == 3) {
         // Special letter block (J/S/H/F/Force — SpecialBlock.hpp): invisible in
@@ -250,8 +251,8 @@ static void drawObject(const gdsim::Object* o, float x, float y, float rotDeg,
         for (int i = 0; i < 4; i++) DrawLineEx(s[i], s[(i + 1) % 4], 1.5f, Color{c.r, c.g, c.b, 150});
         Vector2 center = worldToScreen(x, y, cam, screenW, screenH);
         int fontSize = 12;
-        int tw = MeasureText(label, fontSize);
-        DrawText(label, (int)(center.x - tw * 0.5f), (int)(center.y - fontSize * 0.5f), fontSize, c);
+        int tw = UITextWidth(label, fontSize);
+        UIText(label, (int)(center.x - tw * 0.5f), (int)(center.y - fontSize * 0.5f), fontSize, c);
     } else if (o->prio == 2) {
         // Hazard: draw ONLY the actual gdsim collision shape, filled bright
         // red. (Used to also draw the nominal sprite footprint as a faint
@@ -422,6 +423,19 @@ void drawPhysicsTrail(const std::vector<RealTrailPoint>& trail, float offsetX, f
         DrawLineEx(prev, cur, 2.f, kRealColor);
         prev = cur;
     }
+}
+
+void zoomAt(Camera2DState& cam, float factor, Vector2 anchor, int screenW, int screenH) {
+    const float before = cam.pixelsPerUnit;
+    const float after = std::clamp(before * factor, kMinZoom, kMaxZoom);
+    if (after == before) return;   // already at a limit — don't drift the centre
+    // screenToWorld is  wx = cam.x + (sx - W/2)/ppu ,  wy = cam.y - (sy - H/2)/ppu.
+    // Holding wx/wy fixed while ppu changes gives exactly this shift of the centre.
+    const float dx = anchor.x - screenW * 0.5f;
+    const float dy = anchor.y - screenH * 0.5f;
+    cam.x += dx * (1.f / before - 1.f / after);
+    cam.y -= dy * (1.f / before - 1.f / after);
+    cam.pixelsPerUnit = after;
 }
 
 gdsim::Vec2D screenToWorld(float sx, float sy, const Camera2DState& cam, int screenW, int screenH) {

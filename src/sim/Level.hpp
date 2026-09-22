@@ -79,7 +79,17 @@ public:
     // whole level to be posed every frame (the trigger-heavy-level solver killer).
     std::vector<float> movableExtent;
 
-    void buildTriggerTimeline();      // Phase 2: precompute trigger fire-frames from X(frame)
+    // Player X per frame, filled by buildTriggerTimeline from the same walk it
+    // already does. Needed by poseMovable for "Lock to Player X" move triggers,
+    // which advance an object by the player's own per-step X delta rather than by
+    // an eased offset. Empty when the timeline has not been built.
+    std::vector<float> playerXAtFrame;
+
+    void buildTriggerTimeline();
+    // Player X per frame (0..maxFrames), the same input-independent walk the
+    // trigger timeline uses. Lets tooling align a real capture (whose frame
+    // counter runs at the fluctuating RENDER rate) onto sim frames via X.
+    void buildXTable(std::vector<float>& out, int maxFrames) const;      // Phase 2: precompute trigger fire-frames from X(frame)
     // Phase 3: pose movable object `idx` for frame `f` from its own triggers only.
     // Pure function of f (no shared/mutated state) → identical across search
     // branches and correct after rollback.
@@ -107,6 +117,22 @@ public:
 
     Player& runFrame(bool pressed, float dt = 1.f/240.f);
     void rollback(int frame);
+
+    // Return this Level to its just-constructed state so it can be replayed from
+    // frame 0 WITHOUT re-parsing the level string. Parsing dominates everything:
+    // measured on DeCode (305 KB, ~9k objects) construction is 104 ms while the
+    // whole 240Hz step loop is under a millisecond — i.e. ~100% of a naive
+    // "rebuild and re-run" is the parse. The trajectory fitter runs hundreds of
+    // re-simulations to estimate how each physics constant moves a point, so
+    // reusing one parsed Level is the difference between ~33 s and well under a
+    // second.
+    //
+    // CAVEAT — object HITBOX SIZES are baked into the objects at construction
+    // (Object::create reads g_phys.portal*W/H), so a caller that changes one of
+    // those MUST build a fresh Level instead; this reset cannot pick them up.
+    // Everything else in PhysicsTables/CalibParams is read per-frame and is
+    // correctly re-applied by a reset+replay.
+    void resetToStart();
     int currentFrame() const;
     Player const& getState(int frame) const;
     Player& latestState();

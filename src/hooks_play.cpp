@@ -12,6 +12,7 @@
 #include <Geode/binding/Slider.hpp>
 #include <fstream>
 #include <map>
+#include <sstream>
 #include <cstdio>
 #include <filesystem>
 #include <algorithm>
@@ -533,6 +534,8 @@ class $modify(MyPlayLayer, PlayLayer) {
         snapshot.maxX = -std::numeric_limits<float>::max();
         snapshot.maxY = -std::numeric_limits<float>::max();
 
+        struct RegRow { int id; int type; float w, h; };
+        std::vector<RegRow> regRows;
         std::unordered_set<GameObject*> seen;
         size_t reserveGuess = static_cast<size_t>(m_solidCollisionObjects.size() + m_hazardCollisionObjects.size());
         if (m_objects) reserveGuess += static_cast<size_t>(m_objects->count());
@@ -557,16 +560,23 @@ class $modify(MyPlayLayer, PlayLayer) {
                 // read instead of tuned around. They record with type "other" (isSolid
                 // and isHazard both false), which no existing consumer treats as
                 // collidable, so nothing downstream changes.
-                static const std::unordered_set<int> kPortalIds = {
-                    10, 11,                              // gravity (down / up)
-                    12, 13, 47, 111, 660, 745, 1331, 1933, 2751,  // vehicle
-                    99, 101,                             // size (big / mini)
-                    200, 201, 202, 203, 1334,            // speed
-                    286, 287,                            // dual
-                    747,                                 // teleport
-                };
-                const bool isPortal = kPortalIds.count(obj->m_objectID) != 0;
-                if (!isSolid && !isHazard && !isPortal) {
+                // WIDENED 2026-09-11: capture EVERYTHING that is not decoration.
+                //
+                // This filter used to be "solid OR hazard OR one of 20 hardcoded
+                // portal ids", which silently dropped every orb, pad, special
+                // block, mirror portal, spider pad, gravity-toggle portal and
+                // trigger — i.e. most of the interactive object set. gdsim's
+                // Object::create() factory has to triage exactly those, so the
+                // one capture that could have supplied the answer was excluding
+                // the question.
+                //
+                // GD's own m_objectType IS the triage: everything the engine
+                // treats as gameplay has a non-Decoration type, and
+                // GJBaseGameLayer::collisionCheckObjects dispatches purely on it
+                // (case 7 = Decoration is the only `goto skip` at the top of the
+                // loop). So mirror that rule here rather than maintaining a list.
+                const bool isDeco = obj->m_objectType == GameObjectType::Decoration;
+                if (isDeco && !isSolid && !isHazard) {
                     return;
                 }
 
@@ -588,7 +598,31 @@ class $modify(MyPlayLayer, PlayLayer) {
                 hb.isSolid = isSolid;
                 hb.isHazard = isHazard;
 
-                if (auto* obb = obj->getOrientedBox(); obb) {
+                // CIRCLE FIRST (fixed 2026-09-12). GJBaseGameLayer::collisionCheckObjects
+                // dispatches on `m_objectRadius > 0` BEFORE it ever looks at a box:
+                // such an object is a circle to the engine (playerCircleCollision,
+                // 0x140211df0) whatever its rect says. This block used to sit after
+                // `if (auto* obb = obj->getOrientedBox())`, and that getter never
+                // returns null — it builds one on demand — so the circle branch was
+                // unreachable and no radius was ever recorded. Every sawblade in 75
+                // captures came out as an "obb" with its sprite footprint, which is
+                // why gdsim's blade radii had to be guessed from the box via an
+                // isBigRadiusSawblade() id list instead of read from the engine.
+                //
+                // The engine's own radius expression is right here for reference:
+                //     r = (m_scaleX == 1 && m_scaleY == 1) ? m_objectRadius
+                //                                          : max(m_scaleX, m_scaleY) * m_objectRadius
+                if (obj->m_objectRadius > 0.f) {
+                    const float r = (obj->m_scaleX == 1.f && obj->m_scaleY == 1.f)
+                        ? obj->m_objectRadius
+                        : std::max(obj->m_scaleX, obj->m_scaleY) * obj->m_objectRadius;
+                    hb.shape  = ReplayRuntimeHitboxRect::Shape::Circle;
+                    hb.x      = obj->getPositionX();
+                    hb.y      = obj->getPositionY();
+                    hb.radius = r;
+                    hb.width  = r * 2.0f;
+                    hb.height = r * 2.0f;
+                } else if (auto* obb = obj->getOrientedBox(); obb) {
                     hb.shape = ReplayRuntimeHitboxRect::Shape::OrientedQuad;
                     hb.corners = obb->m_corners;
 
@@ -628,6 +662,19 @@ class $modify(MyPlayLayer, PlayLayer) {
                 }
 
                 snapshot.hitboxes.push_back(hb);
+
+                // Registry row: the object's UNSCALED base footprint. getObjectRect
+                // already multiplied by m_scaleX/m_scaleY, and levels scale objects
+                // freely, so the raw rect is whatever THIS instance happens to be —
+                // dividing the scale back out is what makes sightings from different
+                // levels comparable and lets the mode converge on the real base size
+                // (which is the number gdsim's Object::create() factory needs).
+                {
+                    const float sx = std::abs(obj->m_scaleX) > 1e-4f ? std::abs(obj->m_scaleX) : 1.f;
+                    const float sy = std::abs(obj->m_scaleY) > 1e-4f ? std::abs(obj->m_scaleY) : 1.f;
+                    regRows.push_back({hb.objectId, hb.objectType,
+                                       hb.width / sx, hb.height / sy});
+                }
 
                 float left = hb.x - hb.width * 0.5f;
                 float right = hb.x + hb.width * 0.5f;
@@ -703,6 +750,80 @@ class $modify(MyPlayLayer, PlayLayer) {
                       << hb.x << " " << hb.y << " " << hb.width << " " << hb.height << " "
                       << hb.radius << " " << hb.objectType << "\n";
                 }
+            }
+        }
+
+        // ---- Permanent, accumulating object registry -------------------------
+        // The per-level dump above is a snapshot; this is the union of every
+        // object ever seen, across every level and every session. It is what
+        // gdsim's Object::create() factory should ultimately be generated from:
+        // GD's own m_objectType plus its own getObjectRect(), never a guess.
+        //
+        // Per id we keep the DOMINANT footprint. Levels scale objects freely, so
+        // a single sighting proves nothing; the mode over many sightings is the
+        // unscaled base size. Merge rule: same size (within 0.01) accumulates,
+        // a different size only wins if it out-counts the stored one.
+        {
+            struct Entry { int type = 0; float w = 0, h = 0; long long count = 0; int level = 0; };
+            std::map<int, Entry> reg;
+            const std::string regPath =
+                "C:/Users/Kusmic/Documents/GitHub/GDMod/testlevel/movetest/GDMod_objtypes.txt";
+            {
+                std::ifstream in(regPath);
+                std::string line;
+                while (std::getline(in, line)) {
+                    if (line.empty() || line[0] == '#') continue;
+                    std::istringstream ss(line);
+                    int id; Entry e;
+                    if (ss >> id >> e.type >> e.w >> e.h >> e.count >> e.level) reg[id] = e;
+                }
+            }
+            // Count this level's sightings per (id, size) so the mode is per-level
+            // resolved before merging into the long-lived file.
+            std::map<std::pair<int, std::pair<int, int>>, long long> tally;
+            std::map<int, int> typeOf;
+            for (auto const& r : regRows) {
+                auto key = std::make_pair(r.id,
+                    std::make_pair((int)std::lround(r.w * 100.f),
+                                   (int)std::lround(r.h * 100.f)));
+                tally[key]++;
+                typeOf[r.id] = r.type;
+            }
+            for (auto const& [key, n] : tally) {
+                const int id = key.first;
+                const float w = key.second.first / 100.f;
+                const float h = key.second.second / 100.f;
+                auto it = reg.find(id);
+                if (it == reg.end()) {
+                    reg[id] = Entry{typeOf[id], w, h, n, snapshot.levelId};
+                    continue;
+                }
+                Entry& e = it->second;
+                e.type = typeOf[id];   // engine truth, always current
+                if (std::fabs(e.w - w) < 0.011f && std::fabs(e.h - h) < 0.011f) {
+                    e.count += n;
+                } else if (n > e.count) {
+                    e.w = w; e.h = h; e.count = n; e.level = snapshot.levelId;
+                }
+            }
+            std::ofstream f(regPath, std::ios::trunc);
+            if (f.is_open()) {
+                f << "# GDMod object registry -- accumulated across every level played.\n"
+                     "# GD's own m_objectType and getObjectRect(); decorations excluded.\n"
+                     "# GameObjectType: 0 Solid 2 Hazard 3/4 GravityPortal 5 Ship 6 Cube\n"
+                     "#   8 YellowPad 9 PinkPad 10 GravityPad 11 YellowOrb 12 PinkOrb\n"
+                     "#   13 GravityOrb 14/15 MirrorPortal 16 Ball 17/18 SizePortal 19 Ufo\n"
+                     "#   20 Trigger 21 Breakable 23/24 DualPortal 25 Slope 26 Wave 27 Robot\n"
+                     "#   28 TeleportPortal 29 GreenOrb 30 Collectible 32 DropOrb 33 Spider\n"
+                     "#   34 RedPad 35 RedOrb 36 CustomOrb 37 DashOrb 38 GravityDashOrb\n"
+                     "#   39 CollisionObject 40 SpecialBlock 41 SwingPortal 42 GravityToggle\n"
+                     "#   43 SpiderOrb 44 SpiderPad 46 TeleportOrb 47 AnimatedHazard\n"
+                     "# id type width height sightings firstLevel\n";
+                for (auto const& [id, e] : reg) {
+                    f << id << " " << e.type << " " << e.w << " " << e.h << " "
+                      << e.count << " " << e.level << "\n";
+                }
+                log::info("[ObjRegistry] {} distinct object ids known", reg.size());
             }
         }
 

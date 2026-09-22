@@ -9,94 +9,83 @@ Hazard::Hazard(Vec2D s, std::unordered_map<int, std::string>&& fields) : Object(
     prio = 2;
 }
 
-// Circle (this sawblade, centre `pos`, radius size.x/2) vs the player's axis-aligned
-// hitbox. `size` is the sawblade's bounding-box DIAMETER (Object.cpp's factory always
-// gives it a square size, e.g. Sawblade 32.3x32.3) — using the full size.x AS the
-// radius (the pre-existing code, both before and immediately after the geometry fix
-// below) doubles the true danger radius, quadrupling the swept area. FOUND 2026-08-06
-// via a real, GD-verified-clearing replay (Delirium.gdr, level 68839068) that gdsim
-// falsely killed at frame 164/4% — cross-checked the exact geometry: the player's box
-// was a clean 15.6u BELOW the sawblade's own visual box (no overlap at all by eye),
-// yet the old radius=size.x circle (32.3, reaching ~32u from centre) still caught it;
-// radius=size.x/2 (16.15) does not. This affects EVERY sawblade in every level —
-// likely the dominant reason gdsim has been rating countless real, clearable wave/
-// flight sections as impossible.
+// SAWBLADES — radius and shape both re-derived from the binary 2026-09-12.
+// The full rule set and its evidence live inside Sawblade::touching below; this
+// header is the history, because two earlier passes landed on the wrong answer
+// from level evidence alone and the trail is worth keeping:
 //
-// FIXED 2026-08-05 (geometry, kept from that pass): the old test only checked "any
-// player-box CORNER within radius" plus "circle centre strictly inside the box" — it
-// never handled the (very common) case where the closest point on the box is on a
-// FLAT EDGE, not a corner. Standard clamp-to-box closest-point test; correct for all
-// cases once paired with the correct radius above.
-// FOUND 2026-08-10 (level 127323087 "Society"): this used the player's RAW `size`
-// (getLeft/Right/Bottom/Top read the 30×30, mini-scaled-18×18, "cube's 30/18"
-// bounding box — see Player::Player()'s default and Level.cpp:74's comment) —
-// NOT the small ~9×9 inner death hitbox every OTHER hazard test in this file
-// correctly uses (see Hazard::collide's own comment: "a hazard kills when the
-// player's SMALL inner death hitbox ... intersects it, NOT the full 30×30 icon
-// box"). A sawblade is exactly as lethal-hitbox-small as a spike in real GD —
-// there's no reason it would use a 3x-larger player box. Confirmed via a real,
-// human-verified-clearing macro: it clipped a sawblade using the oversized box
-// while the small inner hitbox (checked by hand) does not overlap at all.
-// REVISED 2026-08-11: player box switched from innerHitbox() (~9×9) to
-// unrotatedHitbox() (the full 30×30/mini-18×18 "Main hitbox") — see
-// Hazard::collide's comment for why (GD Creator School "Advanced Hitboxes" #1,
-// trusted per explicit user instruction: the Main hitbox is what kills on
-// hazard/spike contact, not the small Solid hitbox — that one is block-only).
-// FOUND 2026-08-17 (level 2997354 "Decode", real Watch capture via
-// GDMod_truth_2997354.txt): FALSE-SURVIVE at frame 248 — real GD died on the
-// id=675/1734 sawblade (saved as 675, live m_objectID reports 1734 — same
-// placed object; its real-world position matches gdsim's parsed (301,1) exactly
-// once the known +90 real-vs-sim Y offset is applied) while gdsim survived with
-// dy=0.00 (position tracked perfectly; this is a pure hitbox-shape gap, not a
-// physics/timing one). Distance from the real death position to this sawblade's
-// centre was ~30.6u — radius=size.x/2 (16 for this 32×32 class) misses it by a
-// wide margin; radius=size.x (32) clears it with the exact same margin the old,
-// since-reverted universal formula had — but that formula was reverted for GOOD
-// reason (68839068/Delirium, a DIFFERENT sawblade size-class, false-killed at
-// radius=size.x). Rather than re-widen every sawblade and risk that regression,
-// this is scoped to ONLY the class(es) real capture evidence actually covers.
-// If a future capture finds another size-class is also off, extend this the
-// same way (evidence-scoped, not a blanket revert).
+//  * 2026-08-06 found gdsim killing 15.6u away from a blade on a real clearing
+//    replay (Delirium.gdr, level 68839068) and concluded `size` was a DIAMETER,
+//    adding a /2. The observation was real; the diagnosis was not. `size` here
+//    holds GD's m_objectRadius, so the /2 made ~30 blade ids half-lethal, and
+//    the false death it was chasing came from the SHAPE (next point), not the
+//    radius.
+//  * 2026-08-05 replaced a corner-only overlap test with the textbook
+//    clamp-to-box closest-point test, on the reasoning that the corner test
+//    "never handled the very common case where the closest point is on a flat
+//    EDGE". That case is real — and GD genuinely does not handle it either.
+//    playerCircleCollision has no closest-point term at all.
+//  * 2026-08-10/11 then moved the PLAYER box between innerHitbox() and
+//    unrotatedHitbox(); unrotatedHitbox() is correct and is confirmed
+//    independently — PlayerObject overrides getOrientedBox() without setting
+//    m_shouldUseOuterOb, so the player's rect is never rotation-inflated.
 //
-// EXTENDED 2026-08-17 (same level, app's hitbox-flag tool): 677/1736 (12.48×12.48)
-// is the SAME sawblade sprite family as 675/1734, just a smaller scale variant
-// (675/1734=32, 676/1735=17.51, 677/1736=12.48 — one design at 3 editor scales) —
-// user-flagged in-game as visibly bigger than gdsim's modeled hitbox at the exact
-// spot gdsim's own solve was dying on it, consistent with the same
-// bounding-box-not-half-radius property carrying across scale variants of one
-// sprite.
-//
-// EXTENDED again 2026-08-17 (user request: "check sawblade scale issues
-// globally"): 676/1735 is the missing MIDDLE tier of this exact same explicit
-// 3-way family (675/1734=32, 676/1735=17.51, 677/1736=12.48 — one sprite, one
-// GD editor scale slider, 3 saved sizes) — both tiers bracketing it are now
-// directly evidenced, so leaving only the middle one on the old formula would
-// mean gdsim's danger radius NON-MONOTONICALLY jumps big→small→big across one
-// continuous size family, which has no plausible physical explanation. Global
-// per-instance SCALE (kA32/128/129) was also audited across the real macro-
-// batch level cache: scaled sawblades are common, but every instance found
-// was scaled UNIFORMLY (x==y) — size.x already reflects that scale at
-// runtime (Object::Object applies it before Sawblade ever sees `size`), so
-// this radius formula (keyed only on typeId, reading the already-scaled
-// size.x) is correct at any scale without further change. 678/679/680 sit in
-// the same numeric ID block but are NOT part of this explicit legacy-id-pair
-// family (no paired old/new id the way every other entry here has) and have
-// no direct or bracketing evidence yet — left on the standard formula rather
-// than guessed.
-static bool isBigRadiusSawblade(int typeId) {
-    return typeId == 675 || typeId == 1734
-        || typeId == 676 || typeId == 1735
-        || typeId == 677 || typeId == 1736;
-}
-
+// Net: the shape was made more lethal than the engine and the radius less, and
+// the two errors partly cancelled on the levels each was tested against.
 bool Sawblade::touching(Player const& p) const {
-    float radius = isBigRadiusSawblade(typeId) ? size.x : (size.x / 2.0f);
+    // The table in Object.cpp holds GD's m_objectRadius DIRECTLY, so this is the
+    // radius — there is no /2. Verified 2026-09-12 against the binary: blade
+    // radii are set in EnhancedGameObject::customSetup (0x1401a4f70) as either a
+    // hardcoded float or `m_width * k`, with m_width coming from
+    // GameObject::setupSpriteSize (0x1401a36a0):
+    //     88,186,740,1705 -> 32.3      397 -> 28.9      675 -> 32.0
+    //     678 -> 30.4      1619 -> 25.0      1620 -> 15.0      1582 -> 4.0
+    //     89,183,187,679,741 -> m_width*0.36     184,676 -> m_width*0.34
+    //     398,677 -> m_width*0.32                everything else -> m_width*0.30
+    // Twenty of the ids in this table reproduce their engine radius EXACTLY from
+    // size.x (89 = 60*0.36 = 21.6, 677 = 39*0.32 = 12.48, 98 = 40*0.30 = 12.0 …)
+    // and NOT ONE reproduces it from size.x/2.
+    //
+    // So the old `isBigRadiusSawblade(typeId) ? size.x : size.x/2` was halving a
+    // value that was already a radius, for every id outside its six-entry list —
+    // roughly thirty blade ids running at half their real danger radius. That
+    // list, and the long comment that used to justify it, are gone with it.
+    float radius = size.x;
     Entity box = p.unrotatedHitbox();
-    float closestX = std::clamp(pos.x, box.getLeft(), box.getRight());
-    float closestY = std::clamp(pos.y, box.getBottom(), box.getTop());
-    float dx = pos.x - closestX;
-    float dy = pos.y - closestY;
-    return (dx * dx + dy * dy) <= radius * radius;
+
+    // GJBaseGameLayer::playerCircleCollision (0x140211df0), transcribed. GD does
+    // NOT do the textbook circle-vs-rect test. It checks exactly two things:
+    //
+    //     if (playerRect.containsPoint(circleCentre)) -> hit
+    //     for each of the rect's FOUR CORNERS:
+    //         if (distance(corner, circleCentre) < radius) -> hit
+    //     otherwise -> miss
+    //
+    // There is no "closest point on the rect" term, so a circle approaching a
+    // FACE head-on — centre outside the rect, nearest point in the middle of an
+    // edge, every corner further away than the radius — does not collide at all.
+    // Worked example with the full-size 30x30 player and a radius-16 blade
+    // centred 8 units above the top edge: nearest edge point is 8 away (the
+    // textbook test says hit), but both top corners are sqrt(15^2+8^2) = 17.0
+    // away, so GD says MISS.
+    //
+    // gdsim used the closest-point form, which is strictly more lethal than the
+    // engine on exactly that geometry — a flat approach to a blade — and that is
+    // the single most common way to meet one. Replaced with the engine's own
+    // test; this can only ever remove deaths, never add them.
+    const float cx = pos.x, cy = pos.y;
+    if (cx >= box.getLeft() && cx <= box.getRight() &&
+        cy >= box.getBottom() && cy <= box.getTop()) return true;
+
+    const float r2 = radius * radius;
+    const float xs[2] = { box.getRight(), box.getLeft() };
+    const float ys[2] = { box.getTop(),   box.getBottom() };
+    for (float x : xs)
+        for (float y : ys) {
+            const float dx = x - cx, dy = y - cy;
+            if (dx * dx + dy * dy < r2) return true;
+        }
+    return false;
 }
 
 // Real spike/hazard sprites are NOT the full bounding box — Entity::intersects (used
@@ -193,6 +182,13 @@ void Hazard::collide(Player& p) const {
     // fix. No decompiled hazard-collision function exists to independently confirm
     // this (checked 2026-08-11, inconclusive).
     if (!hazardRectHit(*this, p.unrotatedHitbox())) return;
+    // Diagnostic bypass, same purpose/pattern as Sawblade::collide's
+    // GDSIM_DIAG_NOSAWBLADE below: lets a replay run PAST a non-sawblade hazard
+    // death to study a LATER section in isolation (e.g. a transition thousands of
+    // units further into the level that an earlier, separately-tracked death
+    // otherwise makes unreachable in one pass). Never affects a real
+    // Solve/Watch/regression run.
+    if (getenv("GDSIM_DIAG_NOHAZARD")) return;
     p.dead = true; p.deathCause = "hazard";
     p.deathObjType = typeId; p.deathObjPos = pos;
 }

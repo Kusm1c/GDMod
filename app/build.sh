@@ -10,6 +10,7 @@ MINIZ_DIR="vendor/miniz"
 g++ -std=c++23 -O2 -DNDEBUG \
     -I "$RAYLIB_DIR/include" -I "$MINIZ_DIR" -I ../src \
     src/main.cpp src/network.cpp src/leveldata.cpp src/render.cpp src/exportdialog.cpp src/macrocache.cpp \
+    src/tunerui.cpp src/transport.cpp src/trajfit.cpp src/fitui.cpp src/uifont.cpp \
     src/gdr2import.cpp \
     ../src/sim/*.cpp \
     "$MINIZ_DIR/miniz.c" "$MINIZ_DIR/miniz_tinfl.c" "$MINIZ_DIR/miniz_tdef.c" "$MINIZ_DIR/miniz_zip.c" \

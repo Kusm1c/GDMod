@@ -25,6 +25,12 @@
 			"type": "bool",
 			"default": false
 		},
+		"jump-probe": {
+			"name": "Jump Probe (sub-pixel physics capture)",
+			"description": "Hooks PlayerObject::updateJump and records the engine's own state before and after EVERY 240Hz physics step, at full 17-digit precision: y, m_yVelocity, m_gravity, m_gravityMod, m_yStart, m_speedMultiplier, size, ground/slope/dash flags. This is the data that lets a constant be derived exactly instead of fitted. Writes testlevel/GDMod_jump_<id>.txt. HIGH VOLUME (~10 MB per minute of play) — turn it on for one focused run, not permanently. Off by default.",
+			"type": "bool",
+			"default": false
+		},
 		"show-inputs-ingame": {
 			"name": "Show Inputs In-Game",
 			"description": "Show input bars when playing a level with a matching JSON replay.",

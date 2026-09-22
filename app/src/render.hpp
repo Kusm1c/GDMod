@@ -13,6 +13,21 @@ struct Camera2DState {
     float x = 0.f, y = 0.f; // world-space centre of the view
 };
 
+// Zoom range, shared by every camera in the app. The old ceiling was 14 px/unit
+// — about one screen pixel per two world units — which is far too coarse for
+// trajectory work, where the interesting errors are a fraction of a unit and a
+// pin has to land on one specific frame. At 400 px/unit a single world unit
+// spans 400 pixels, so a 0.01u deviation is still a visible 4px gap. The floor
+// goes the other way, far enough out to take in a whole long level at once.
+inline constexpr float kMinZoom = 0.05f;
+inline constexpr float kMaxZoom = 400.f;
+
+// Multiplies the camera's zoom by `factor` while keeping the world point
+// currently under `anchor` (a screen position, normally the cursor) pinned in
+// place. Centre-anchored zoom becomes unusable past ~30 px/unit: whatever you
+// are inspecting slides off screen the moment you zoom in on it.
+void zoomAt(Camera2DState& cam, float factor, Vector2 anchor, int screenW, int screenH);
+
 // One historical sample of the player's position + actual hitbox size
 // (Player::size — varies by vehicle, e.g. wave is 10x10/6x6 mini, not the
 // cube's 30x30/18x18) — see drawLevel's own player-drawing comment for which

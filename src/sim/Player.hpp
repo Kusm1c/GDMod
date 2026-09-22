@@ -115,6 +115,24 @@ struct Player : public Entity {
     bool small;
     bool gravityPortal;
     bool roundVelocity;
+
+    // GD's PlayerObject::m_isAccelerating (offset 0x952). Set by boosts that push
+    // the player OUTSIDE the flight velocity band, and it makes updateJump skip
+    // the flight clamp entirely until the velocity decays back into that band —
+    // which is the only reason a boosted ship/UFO can exceed 432 at all.
+    //
+    // updateJump clears it at the top of its isFlying() branch whenever
+    //     -6.4/sizeDiv < m_yVelocity < 8.0/sizeDiv
+    // (sizeDiv = 0.85 mini, 1.0 big), and the clamp block a few lines later is
+    // guarded by `if (!m_isAccelerating && !m_isDart)`. The bounds are the same
+    // expression, so in practice: while outside the band the clamp is off, and
+    // the instant the velocity re-enters it the clamp turns back on.
+    //
+    // Before this existed, gdsim clamped unconditionally and the UFO's upper
+    // bound had been raised 432 -> 520 purely so a red pad's 518.4 could survive.
+    // That constant is back at its real 432 now; this flag is what carries the
+    // boost instead.
+    bool isAccelerating = false;
     bool dual;            // dual mode active this frame (set/cleared by DualPortal)
     bool isMirror;        // true for the dual mirror player (reads gameStates2 history)
 

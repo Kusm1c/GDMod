@@ -7,51 +7,85 @@
 namespace gdsim {
 
 // GD easing (field 30) with rate (field 85). Maps progress t∈[0,1] → eased [0,1].
-// Types: 0 none, 1 InOut, 2 In, 3 Out (rate-based); 4-6 Elastic; 7-9 Bounce;
-// 10-12 Exponential; 13-15 Sine; 16-18 Back (In/Out/InOut groupings per GD).
-static float bounceOut(float t) {
-    if (t < 1.f/2.75f)      return 7.5625f*t*t;
-    else if (t < 2.f/2.75f) { t -= 1.5f/2.75f;  return 7.5625f*t*t + 0.75f; }
-    else if (t < 2.5f/2.75f){ t -= 2.25f/2.75f; return 7.5625f*t*t + 0.9375f; }
-    else                    { t -= 2.625f/2.75f;return 7.5625f*t*t + 0.984375f; }
+//
+// TRANSCRIBED 2026-09-12 line-for-line from GameToolbox::getEasedValue
+// (0x140068b70) and GameToolbox::bounceTime (0x140068ac0). The previous version
+// was a reimplementation from the standard cocos2d/Robert Penner easing set,
+// which GD does NOT follow in four places — see the notes on cases 3, 4-6, 10
+// and 11. Case 3 alone was up to 7% of a move trigger's whole offset.
+static float bounceTime(float t) {
+    if (t < 0.36363637f) return t * 7.5625f * t;
+    if (t < 0.72727275f) { float u = t - 0.54545456f; return u * 7.5625f * u + 0.75f; }
+    if (t < 0.90909094f) { float u = t - 0.8181818f;  return u * 7.5625f * u + 0.9375f; }
+    { float u = t - 0.95454544f; return u * 7.5625f * u + 0.984375f; }
 }
+
 float easeValue(float t, int type, float rate) {
     t = std::clamp(t, 0.f, 1.f);
+    if (type == 0) return t;
+    // GD's own guard, and it runs BEFORE the switch, so `rate` is never <= 0
+    // inside any case below (which is why case 4's own `rate == 0` fallback to
+    // 0.45000002 is dead code in the binary — do not resurrect it as a default).
     if (rate <= 0.f) rate = 2.f;
-    const float PI = 3.14159265358979f;
+    const float PI = 3.1415927f;
     switch (type) {
-        case 0:  return t;                                                   // none/linear
-        case 1:  return t < 0.5f ? 0.5f*std::pow(2*t, rate)                  // EaseInOut
-                                 : 1.f - 0.5f*std::pow(2*(1-t), rate);
-        case 2:  return std::pow(t, rate);                                   // EaseIn
-        case 3:  return 1.f - std::pow(1-t, rate);                           // EaseOut
-        case 4:  // ElasticInOut
-            if (t==0||t==1) return t;
-            { float p=0.45f; t=t*2-1;
-              if (t<0) return -0.5f*std::pow(2,10*t)*std::sin((t-p/4)*(2*PI/p));
-              return std::pow(2,-10*t)*std::sin((t-p/4)*(2*PI/p))*0.5f+1; }
-        case 5:  // ElasticIn
-            if (t==0||t==1) return t;
-            { float p=0.3f; return -std::pow(2,10*(t-1))*std::sin((t-1-p/4)*(2*PI/p)); }
-        case 6:  // ElasticOut
-            if (t==0||t==1) return t;
-            { float p=0.3f; return std::pow(2,-10*t)*std::sin((t-p/4)*(2*PI/p))+1; }
-        case 7:  return t<0.5f ? (1-bounceOut(1-2*t))*0.5f : bounceOut(2*t-1)*0.5f+0.5f; // BounceInOut
-        case 8:  return 1.f - bounceOut(1-t);                                // BounceIn
-        case 9:  return bounceOut(t);                                        // BounceOut
-        case 10: // ExponentialInOut
-            if (t==0||t==1) return t;
-            return t<0.5f ? 0.5f*std::pow(2,20*t-10) : 1-0.5f*std::pow(2,-20*t+10);
-        case 11: return t==0?0:std::pow(2,10*(t-1));                          // ExponentialIn
-        case 12: return t==1?1:1-std::pow(2,-10*t);                           // ExponentialOut
-        case 13: return -0.5f*(std::cos(PI*t)-1);                             // SineInOut
-        case 14: return 1-std::cos(t*PI/2);                                   // SineIn
-        case 15: return std::sin(t*PI/2);                                     // SineOut
-        case 16: { float s=1.70158f*1.525f;                                  // BackInOut
-                   t*=2; if (t<1) return 0.5f*(t*t*((s+1)*t-s));
-                   t-=2; return 0.5f*(t*t*((s+1)*t+s)+2); }
-        case 17: { float s=1.70158f; return t*t*((s+1)*t-s); }               // BackIn
-        case 18: { float s=1.70158f; t-=1; return t*t*((s+1)*t+s)+1; }       // BackOut
+        case 1: {                                                    // EaseInOut
+            float t2 = t + t;
+            if (t2 >= 1.f) return 1.f - std::pow(2.f - t2, rate) * 0.5f;
+            return std::pow(t2, rate) * 0.5f;
+        }
+        case 2: return std::pow(t, rate);                            // EaseIn
+        // EaseOut is `t^(1/rate)`, NOT the usual `1-(1-t)^rate`. GD mirrors EaseIn
+        // through the EXPONENT, not through the curve. At rate 2 the two differ by
+        // up to 0.068 of full progress (t=0.75: 0.866 vs 0.938), i.e. ~7% of the
+        // trigger's total offset mid-animation — 20 units on a 300-unit move.
+        case 3: return std::pow(t, 1.f / rate);                      // EaseOut
+        // Elastic: the period is the trigger's OWN easeRate, not a hardcoded
+        // 0.45/0.3. With the default rate of 2 that is a completely different
+        // oscillation from the textbook constants this used to use.
+        case 4: {                                                    // ElasticInOut
+            if (t == 0.f || t == 1.f) return t;
+            float q = t + t - 1.f;
+            float s = std::sin(((q - rate * 0.25f) * PI) * 2.f / rate);
+            if (q < 0.f) return std::pow(2.f, q * 10.f) * -0.5f * s;
+            return std::pow(2.f, q * -10.f) * s * 0.5f + 1.f;
+        }
+        case 5: {                                                    // ElasticIn
+            if (t == 0.f || t == 1.f) return t;
+            float s = std::sin((((t - 1.f) - rate * 0.25f) * PI) * 2.f / rate);
+            return -std::pow(2.f, (t - 1.f) * 10.f) * s;
+        }
+        case 6: {                                                    // ElasticOut
+            if (t == 0.f || t == 1.f) return t;
+            float s = std::sin(((t - rate * 0.25f) * PI) * 2.f / rate);
+            return std::pow(2.f, t * -10.f) * s + 1.f;
+        }
+        case 7:                                                      // BounceInOut
+            if (t >= 0.5f) return bounceTime(t + t - 1.f) * 0.5f + 0.5f;
+            return (1.f - bounceTime(1.f - (t + t))) * 0.5f;
+        case 8: return 1.f - bounceTime(1.f - t);                    // BounceIn
+        case 9: return bounceTime(t);                                // BounceOut
+        // No t==0/t==1 special case in GD: at t=0 this really does return
+        // 0.000488, not 0. The guard that used to be here clamped it to 0.
+        case 10: {                                                   // ExponentialInOut
+            float q = t + t - 1.f;
+            if (t + t >= 1.f) return (2.f - std::pow(2.f, q * -10.f)) * 0.5f;
+            return std::pow(2.f, q * 10.f) * 0.5f;
+        }
+        // The -0.001 is in the binary. It makes the curve start at exactly 0
+        // rather than 2^-10, and shifts the whole curve down by that much.
+        case 11: return t == 0.f ? 0.f : std::pow(2.f, (t - 1.f) * 10.f) - 0.001f;
+        case 12: return t == 1.f ? 1.f : 1.f - std::pow(2.f, t * -10.f);
+        case 13: return (std::cos(t * PI) - 1.f) * -0.5f;            // SineInOut
+        case 14: return 1.f - std::cos(t * 1.5707964f);              // SineIn
+        case 15: return std::sin(t * 1.5707964f);                    // SineOut
+        case 16: {                                                   // BackInOut
+            float t2 = t + t;
+            if (t2 >= 1.f) { t2 -= 2.f; return (t2 * 3.5949094f + 2.5949094f) * t2 * t2 * 0.5f + 1.f; }
+            return (t2 * 3.5949094f - 2.5949094f) * t2 * t2 * 0.5f;
+        }
+        case 17: return t * t * (t * 2.70158f - 1.70158f);           // BackIn
+        case 18: { float u = t - 1.f; return u * u * (u * 2.70158f + 1.70158f) + 1.f; }
         default: return t;
     }
 }
@@ -103,6 +137,16 @@ std::optional<Trigger> parseTrigger(int id, const std::unordered_map<int, std::s
             t.kind  = TriggerKind::Move;
             t.moveX = ff(f, 28);
             t.moveY = ff(f, 29);
+            t.lockToPlayerX = fi(f, 58)  != 0;
+            t.lockToPlayerY = fi(f, 59)  != 0;
+            t.lockToCameraX = fi(f, 141) != 0;
+            t.lockToCameraY = fi(f, 142) != 0;
+            t.moveModX      = ff(f, 143, 1.f);
+            t.moveModY      = ff(f, 144, 1.f);
+            t.silent        = fi(f, 544) != 0;
+            // GD's own guard: createMoveCommand stores 1.0 when the field is 0.
+            if (t.moveModX == 0.f) t.moveModX = 1.f;
+            if (t.moveModY == 0.f) t.moveModY = 1.f;
             break;
         case 1346: // Rotate
             t.kind        = TriggerKind::Rotate;

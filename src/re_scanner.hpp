@@ -10,4 +10,11 @@ namespace rescan {
     // Cached read of the "re-scanner" bool setting (live-updated via a Geode
     // setting-change listener). Cheap enough to call every frame.
     bool enabled();
+
+    // Cached read of the separate "jump-probe" setting: the sub-pixel capture that
+    // hooks PlayerObject::updateJump and logs the engine's own state around every
+    // 240Hz physics step at full precision. Kept apart from `enabled()` because it
+    // produces ~10 MB per minute — you turn it on for one focused run, not to
+    // leave running in the background like the rest of the scanner.
+    bool jumpProbeEnabled();
 }

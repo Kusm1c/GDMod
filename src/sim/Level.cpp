@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <unordered_set>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -244,6 +245,34 @@ Level::Level(std::string const& lvlString) {
 // speed portals, which are X-positioned), so the frame each X-activated trigger
 // fires is fixed. We approximate by assuming the player passes every speed portal
 // (true for almost all paths) and walking X forward frame by frame.
+// The player X on each frame, index 0..maxFrames. Factored out of the trigger
+// timeline below so external tooling (test/moveanalyze.cpp) can map a real
+// capture back onto a sim frame using the ENGINE'S OWN walk instead of a copy of
+// it — a private copy would risk measuring the copy's bug rather than gdsim's.
+void Level::buildXTable(std::vector<float>& out, int maxFrames) const {
+    std::vector<std::pair<float,int>> speedChanges;
+    for (auto& sec : sections)
+        for (auto& oc : sec) {
+            int tid = oc->typeId, sp = -1;
+            switch (tid) { case 200: sp=0; break; case 201: sp=1; break;
+                           case 202: sp=2; break; case 203: sp=3; break; case 1334: sp=4; break; }
+            if (sp >= 0) speedChanges.push_back({oc->pos.x, sp});
+        }
+    std::sort(speedChanges.begin(), speedChanges.end(),
+              [](auto& a, auto& b){ return a.first < b.first; });
+
+    const float dt = 1.f / 240.f;
+    int   speed = gameStates[0].speed;
+    float x     = gameStates[0].pos.x;
+    size_t si = 0;
+    out.assign((size_t)maxFrames + 1, x);
+    for (int f = 1; f <= maxFrames; ++f) {
+        x += (float)(player_speeds[speed] * dt);
+        while (si < speedChanges.size() && x >= speedChanges[si].first) speed = speedChanges[si++].second;
+        out[(size_t)f] = x;
+    }
+}
+
 void Level::buildTriggerTimeline() {
     // Speed changes (x, speedIndex) from speed-portal objects in the static set.
     std::vector<std::pair<float,int>> speedChanges;
@@ -275,10 +304,15 @@ void Level::buildTriggerTimeline() {
     }
     // Bound: enough frames to cross the whole level at the slowest speed.
     const uint64_t maxF = (uint64_t)((double)(length + 600.f) / player_speeds[0] / dt) + 480;
-    for (uint64_t f = 1; f <= maxF && ti < triggers.size(); ++f) {
+    // Record X per frame while we walk, for poseMovable's Lock-to-Player-X moves.
+    // The walk must now run to maxF even once every trigger has a fire-frame,
+    // since the table is consumed at arbitrary later frames.
+    playerXAtFrame.assign((size_t)maxF + 1, x);
+    for (uint64_t f = 1; f <= maxF; ++f) {
         x += (float)(player_speeds[speed] * dt);
         while (si < speedChanges.size() && x >= speedChanges[si].first) speed = speedChanges[si++].second;
         while (ti < triggers.size() && triggers[ti].x <= x) triggers[ti++].fireFrame = (int)f;
+        playerXAtFrame[(size_t)f] = x;
     }
 
     // Spawn/touch triggers do NOT fire by X — drop the X fire-frame the walk gave
@@ -313,31 +347,94 @@ void Level::buildTriggerTimeline() {
 
     // ── Spawn propagation ───────────────────────────────────────────────────
     // A Spawn trigger fires its targetGroup's members at fireFrame + spawnDelay.
-    // Roots are X-activated spawns (fireFrame already set); iterate so spawn->spawn
-    // chains resolve. Fully deterministic (all rooted at X), so the per-frame pose
-    // cache stays valid. Earliest activation wins (a group is usually spawned once).
+    // Roots are X-activated spawns (fireFrame already set); walk each root's chain
+    // so spawn->spawn chains resolve — INCLUDING chains that loop back on
+    // themselves. A cyclic spawn chain (e.g. two Spawn triggers that spawn each
+    // other, a standard GD "pendulum" construction) is common and real GD keeps
+    // firing it forever; found 2026-09-10 via level 123617195 "ALLOY" and
+    // test/moveanalyze.exe measuring a Move trigger's group moving 4-5x further
+    // in the real capture than gdsim's single-fire model produced (accumulated
+    // relative Move offsets from repeated firings). See Trigger.hpp's
+    // repeatPeriodFrames for the full derivation.
+    //
+    // Detection: a plain DFS over the graph of Spawn triggers (edges = "my
+    // targetGroup contains this other spawn-triggered Spawn trigger", weighted by
+    // spawnDelay). Re-entering a trigger that is still on the current DFS path
+    // closes a cycle; the elapsed time since that trigger was first entered is
+    // the period, and EVERY trigger between there and here (inclusive) shares it.
+    // Still fully deterministic (a pure function of the level's own graph, not of
+    // the search) so the solver's per-frame pose cache remains rollback-safe.
     std::unordered_map<int, std::vector<int>> groupTriggers;
     for (int i = 0; i < (int)triggers.size(); ++i)
         for (int g : triggers[i].ownGroups)
             groupTriggers[g].push_back(i);
 
-    for (int iter = 0; iter < 64; ++iter) {
-        bool changed = false;
-        for (int si2 = 0; si2 < (int)triggers.size(); ++si2) {
-            const Trigger& s = triggers[si2];
-            if (s.kind != TriggerKind::Spawn || s.fireFrame < 0) continue;
-            int fire = s.fireFrame + (int)std::lround((double)s.spawnDelay * 240.0);
-            auto it = groupTriggers.find(s.targetGroup);
-            if (it == groupTriggers.end()) continue;
-            for (int tg : it->second) {
-                if (tg == si2 || !triggers[tg].spawnTriggered) continue;
-                if (triggers[tg].fireFrame < 0 || fire < triggers[tg].fireFrame) {
-                    triggers[tg].fireFrame = fire;
-                    changed = true;
-                }
-            }
+    // Fires every NON-Spawn member of `group` (Spawn members are walked, not
+    // fired here). `period`, if >0, marks the leaf as repeating at that rate —
+    // never CLEARS an already-known period (a 0 here just means "this particular
+    // path to the leaf doesn't happen to be the cyclic one"; another path already
+    // marked it, and a plain wipe would lose that).
+    auto fireGroupLeaves = [&](int group, int fire, int period) {
+        auto it = groupTriggers.find(group);
+        if (it == groupTriggers.end()) return;
+        for (int tg : it->second) {
+            Trigger& t = triggers[tg];
+            if (t.kind == TriggerKind::Spawn || !t.spawnTriggered) continue;
+            if (t.fireFrame < 0 || fire < t.fireFrame) t.fireFrame = fire;
+            if (period > 0 && (t.repeatPeriodFrames == 0 || period < t.repeatPeriodFrames))
+                t.repeatPeriodFrames = period;
         }
-        if (!changed) break;
+    };
+
+    std::vector<char> onPath(triggers.size(), 0), visited(triggers.size(), 0);
+    std::vector<int>  pathStack, pathFireTime;   // parallel: DFS ancestors + their fire time
+
+    std::function<void(int, int)> walk = [&](int si2, int fire) {
+        Trigger& s = triggers[si2];
+        if (s.fireFrame < 0 || fire < s.fireFrame) s.fireFrame = fire;
+
+        if (onPath[si2]) {
+            // Cycle closes here: si2 is its own ancestor on the current path.
+            // Mark every trigger from si2's first entry through here — the whole
+            // loop — with the elapsed time as their shared period.
+            auto pos = std::find(pathStack.begin(), pathStack.end(), si2);
+            const int entryTime = pathFireTime[(size_t)std::distance(pathStack.begin(), pos)];
+            const int period = fire - entryTime;
+            if (period > 0)
+                for (auto it2 = pos; it2 != pathStack.end(); ++it2) {
+                    Trigger& c = triggers[*it2];
+                    if (c.repeatPeriodFrames == 0 || period < c.repeatPeriodFrames)
+                        c.repeatPeriodFrames = period;
+                }
+            return;
+        }
+        if (visited[si2]) return;   // already fully explored elsewhere
+
+        onPath[si2] = 1;
+        pathStack.push_back(si2);
+        pathFireTime.push_back(fire);
+
+        const int childFire = fire + (int)std::lround((double)s.spawnDelay * 240.0);
+        auto it = groupTriggers.find(s.targetGroup);
+        if (it != groupTriggers.end())
+            for (int tg : it->second)
+                if (tg != si2 && triggers[tg].kind == TriggerKind::Spawn && triggers[tg].spawnTriggered)
+                    walk(tg, childFire);
+
+        // Fire this trigger's own non-spawn leaves LAST, once any cycle a
+        // descendant closed back through `s` has already set s.repeatPeriodFrames.
+        fireGroupLeaves(s.targetGroup, childFire, s.repeatPeriodFrames);
+
+        pathStack.pop_back();
+        pathFireTime.pop_back();
+        onPath[si2] = 0;
+        visited[si2] = 1;
+    };
+
+    for (int si2 = 0; si2 < (int)triggers.size(); ++si2) {
+        Trigger& s = triggers[si2];
+        if (s.kind == TriggerKind::Spawn && !s.spawnTriggered && s.fireFrame >= 0 && !visited[si2])
+            walk(si2, s.fireFrame);
     }
 }
 
@@ -358,19 +455,61 @@ void Level::poseMovable(int idx, int f, Vec2D& pos, float& rot, bool& active) co
         if (t.fireFrame < 0 || t.fireFrame > f) continue;   // not fired (X or spawn)
         if (t.touchTriggered) continue;                      // touch = path-dependent, not modelled
 
-        // preApplied (behind spawn) → already at its end value on frame 0.
-        float prog = t.preApplied ? 1.f
-                   : (t.duration > 0.f) ? (float)(f - t.fireFrame) * dt / t.duration
-                                        : 1.f;
-        // Completed triggers hold their end value (e == 1); skip the transcendental
-        // easing for them — most triggers near the player have long since finished.
-        float e = (prog >= 1.f) ? 1.f : easeValue(prog, t.easing, t.easeRate);
+        if (t.kind == TriggerKind::Move || t.kind == TriggerKind::Rotate) {
+            // A trigger on a cyclic spawn chain (Trigger.hpp's repeatPeriodFrames)
+            // fires again every period forever, and each firing's own offset is
+            // RELATIVE — real GD accumulates them, it doesn't re-home to start —
+            // so replay every firing up to f and sum. repeatPeriodFrames is 0 for
+            // the overwhelming majority of triggers, where this is exactly the
+            // single-firing loop that was here before (k=0, thisFire=t.fireFrame).
+            int fireCount = 1;
+            if (!t.preApplied && t.repeatPeriodFrames > 0 && f > t.fireFrame)
+                fireCount = 1 + (f - t.fireFrame) / t.repeatPeriodFrames;
+            // Safety rail, not a real limit: only a degenerate near-zero period
+            // over a long level could reach this, and no real level needs it.
+            if (fireCount > 20000) fireCount = 20000;
 
-        if (t.kind == TriggerKind::Move) {
-            pos.x += t.moveX * g_calib.moveScale * e;
-            pos.y += t.moveY * g_calib.moveScale * e;
-        } else if (t.kind == TriggerKind::Rotate) {
-            rot += t.degrees * e;
+            for (int k = 0; k < fireCount; k++) {
+                const int thisFire = t.fireFrame + k * t.repeatPeriodFrames;
+                // A Silent move has no action at all in GD — the offset is added
+                // to the objects the instant the trigger fires — so it is already
+                // fully applied on its own fire frame regardless of duration.
+                float prog = (t.preApplied || t.silent) ? 1.f
+                           : (t.duration > 0.f) ? (float)(f - thisFire) * dt / t.duration
+                                                 : 1.f;
+                // Completed firings hold their end value (e == 1); skip the
+                // transcendental easing for them — every firing but at most the
+                // latest one or two has long since finished.
+                float e = (prog >= 1.f) ? 1.f : easeValue(std::clamp(prog, 0.f, 1.f), t.easing, t.easeRate);
+                if (t.kind == TriggerKind::Move) {
+                    if (t.lockToPlayerX && !playerXAtFrame.empty()) {
+                        // Lock to Player X: prepareMoveActions REPLACES this axis's
+                        // eased delta with the player's own per-step X delta times
+                        // moveModX, for as long as the command lives. Summed over
+                        // the window that is just (X(end) - X(start)) * mod, and
+                        // the player's X walk is exactly playerXAtFrame.
+                        // duration <= 0 means the command never finishes (GD's
+                        // `m_duration != -1.0` infinite case and the 0 case both
+                        // land here), so it tracks the player to the current frame.
+                        int endF = f;
+                        if (t.duration > 0.f) {
+                            int lim = thisFire + (int)std::lround((double)t.duration * 240.0);
+                            if (endF > lim) endF = lim;
+                        }
+                        auto X = [&](int fr) -> float {
+                            if (fr < 0) fr = 0;
+                            if ((size_t)fr >= playerXAtFrame.size()) fr = (int)playerXAtFrame.size() - 1;
+                            return playerXAtFrame[(size_t)fr];
+                        };
+                        pos.x += (X(endF) - X(thisFire)) * t.moveModX;
+                    } else {
+                        pos.x += t.moveX * g_calib.moveScale * e;
+                    }
+                    pos.y += t.moveY * g_calib.moveScale * e;
+                } else {
+                    rot += t.degrees * e;
+                }
+            }
         } else if (t.kind == TriggerKind::Toggle) {
             active = t.toggleOn;   // appearing/disappearing collision (last wins)
         } else if (t.kind == TriggerKind::Follow) {
@@ -938,6 +1077,24 @@ bool Level::clearsHazards(const Player& p, float margin) const {
         }
     }
     return true;
+}
+
+void Level::resetToStart() {
+    // gameStates[0] is the spawn state built by the constructor and is never
+    // mutated by stepping, so truncating back to it restores the exact starting
+    // condition. rollback() already clamps and keeps gameStates2 in lockstep.
+    rollback(1);
+    // The dual latch is NOT part of gameStates: once a dual portal fires,
+    // dualEverActive stays true and gameStates2 keeps being stepped. Leaving it
+    // set would make a "fresh" run start already-dual on a level whose dual
+    // section is far past the frame being studied.
+    gameStates2.clear();
+    dualEverActive = false;
+    mirrorDead = false;
+    // Trigger fire-frames are precomputed from a predicted X(frame) walk that
+    // reads player_speeds[] — a Speed-group tunable edit invalidates them, and
+    // that is exactly the kind of edit the fitter probes. Cheap next to a parse.
+    if (hasTriggers) buildTriggerTimeline();
 }
 
 int Level::currentFrame() const { return (int)gameStates.size(); }
