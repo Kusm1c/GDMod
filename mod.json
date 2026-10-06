@@ -31,6 +31,12 @@
 			"type": "bool",
 			"default": false
 		},
+		"engine-trace": {
+			"name": "Engine Trace (per-function state capture)",
+			"description": "Engine-decoding program. Hooks every in-scope PlayerObject gameplay function (update, updateJump, postCollision, collidedWithObjectInternal, collidedWithSlopeInternal, hitGround, didHitHead, flipGravity, ringJump, bumpPlayer, propellPlayer, the 7 mode toggles, togglePlayerScale, ...) and records the COMPLETE physics state of the player immediately before and after each call, plus its arguments. The field list is generated from the engine own code (tools/gen_snapfields.py). This is what the lockstep bench (test/lockstep.cpp) uses to prove a ported engine function exact, one call at a time. Writes testlevel/GDMod_enginetrace_<id>.bin. VERY HIGH VOLUME: turn it on for one short lab run only. Off by default.",
+			"type": "bool",
+			"default": false
+		},
 		"show-inputs-ingame": {
 			"name": "Show Inputs In-Game",
 			"description": "Show input bars when playing a level with a matching JSON replay.",

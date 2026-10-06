@@ -17,7 +17,7 @@ namespace gdsim {
 // function of F, shared across all search branches and stable under the solver's
 // rollback/inject. So positions are precomputed/cached per frame, not per branch.
 
-enum class TriggerKind { Move, Rotate, Toggle, Alpha, Spawn, Follow };
+enum class TriggerKind { Move, Rotate, Toggle, Alpha, Spawn, Follow, Teleport };
 
 struct Trigger {
     TriggerKind kind = TriggerKind::Move;
@@ -73,6 +73,13 @@ struct Trigger {
     bool     toggleOn = true;     // field 56 (activate group = show/enable)
     float    alpha = 1.f;         // field 35
 
+    // Teleport (3022, kind == Teleport): GJBaseGameLayer::teleportPlayer (0x14020fdb0) moves
+    // the player onto an object of targetGroup. Field ids from
+    // TeleportPortalObject::customObjectSetup (string slot offset / 0x20).
+    bool     tpSaveOffset = false;   // field 351: keep the player's offset from the trigger
+    bool     tpIgnoreX    = false;   // field 352
+    bool     tpIgnoreY    = false;   // field 353
+    int      tpGravity    = 0;       // field 354: 1 normal, 2 flipped, 3 toggle
     float    duration = 0.f;      // field 10 (seconds)
     int      easing  = 0;         // field 30 (easing type)
     float    easeRate = 2.f;      // field 85 (easing rate)

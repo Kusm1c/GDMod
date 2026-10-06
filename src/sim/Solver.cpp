@@ -76,24 +76,16 @@ ZeroMarginResult verifyZeroMargin(const std::string& levelStr,
     // via three independent standalone replays of a real DeCode solve, 100%
     // reproducible at the identical frame every time (not flaky/path-dependent at
     // all, unlike the toggle-group theory this comment block used to solely blame).
-    // Fix: zero these globals too, for the exact duration of this check, then restore
-    // the solving-time values so the rest of solveLevelImpl (post-processing passes
-    // that run AFTER a passing check) keeps using the real margin as intended.
-    struct BlockMarginGuard {
-        float savedShip, savedRobot;
-        BlockMarginGuard() : savedShip(g_solveShipBlockClearance), savedRobot(g_solveRobotBlockClearance) {
-            g_solveShipBlockClearance = 0.f;
-            g_solveRobotBlockClearance = 0.f;
-        }
-        ~BlockMarginGuard() {
-            g_solveShipBlockClearance = savedShip;
-            g_solveRobotBlockClearance = savedRobot;
-        }
-    } blockMarginGuard;
-
+    // FIXED PROPERLY 2026-09-24: the margins are no longer global. They are per-Level
+    // fields (Level.hpp), so this check just zeroes them on its OWN fresh Level next to
+    // hazardInflate — the whole borrow-and-restore RAII guard that used to live here is
+    // gone, and with it the window where an unrelated Level could observe the borrowed
+    // value. The failure above is structurally impossible now rather than compensated for.
     Level zeroSim(levelStr);
     zeroSim.hazardInflate = 0.f;
     zeroSim.flightHazardInflate = 0.f;
+    zeroSim.solveShipBlockClearance = 0.f;
+    zeroSim.solveRobotBlockClearance = 0.f;
     for (uint64_t f = 1; f <= cfg.maxFrames; ++f) {
         bool p = f < inputAt.size() && inputAt[f];
         auto& s = zeroSim.runFrame(p, cfg.dt);
@@ -251,9 +243,6 @@ SolverResult solveLevel(const std::string& levelStr,
     const float steps[] = { start, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f };
     SolverResult last;
     float prev = 1e9f;
-    // Always restore the solve-only ship block margin to 0 on the way out, so the
-    // View Level / replay / divergence runs that follow use the true physics.
-    struct MarginGuard { ~MarginGuard() { g_solveShipBlockClearance = 0.f; g_solveRobotBlockClearance = 0.f; } } marginGuard;
     for (float inf : steps) {
         if (inf > start || inf >= prev) continue;   // descending, never exceed requested
         prev = inf;
@@ -268,8 +257,8 @@ SolverResult solveLevel(const std::string& levelStr,
                                              : cfg.shipBlockClearance;
         c.robotBlockClearance = (start > 0.f) ? cfg.robotBlockClearance * (inf / start)
                                               : cfg.robotBlockClearance;
-        g_solveShipBlockClearance  = c.shipBlockClearance;   // live for this attempt
-        g_solveRobotBlockClearance = c.robotBlockClearance;  // grounded-mode analog
+        // Carried on SolverConfig and applied to solveLevelImpl.s own Level (below),
+        // not to a process global -- see Level.hpp. Nothing to restore on the way out.
         last = solveLevelImpl(normalizedLevelStr, c, cancelled);
         if (last.solved || (cancelled && cancelled->load())) return last;
     }
@@ -302,6 +291,9 @@ static SolverResult solveLevelImpl(const std::string& levelStr,
     }
     sim.hazardInflate = cfg.hazardInflate;  // keep real clearance from spikes
     sim.flightHazardInflate = cfg.flightClearance;  // extra margin in flight modes
+    // Solid-block solver margins, per-Level (were process globals until 2026-09-24).
+    sim.solveShipBlockClearance  = cfg.shipBlockClearance;
+    sim.solveRobotBlockClearance = cfg.robotBlockClearance;
 
     const float end = levelEnd(sim);
     result.levelEndEstimate = end;

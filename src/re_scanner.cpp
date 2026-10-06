@@ -233,6 +233,44 @@ void dumpLevelParams(PlayLayer* pl) {
     f << "reverse "     << (ls->m_reverseGameplay ? 1 : 0) << "\n";
     f << "songOffset "  << ls->m_songOffset << "\n";
     f << "objectCount " << (pl->m_objects ? pl->m_objects->count() : 0) << "\n";
+
+    // SPAWN POSITION — added 2026-09-23 to settle an open gdsim bug.
+    //
+    // gdsim hardcodes the spawn at simY=15 (Player::Player()'s `floor(0), grounded(true)`),
+    // i.e. real Y=105. Measured across the 73 GDMod_physics_* captures, 24 of them (33%)
+    // really spawn somewhere else — 195, 225, …, 975, …, 2085 — every single value exactly
+    // 105 + 30k. On those levels gdsim simulates a different part of the map from frame 1,
+    // so every replay and every solve there is meaningless (proven on ALLOY 123617195:
+    // forcing the real simY=885 as a free-fall start matches the real capture to ±0.005u
+    // over 60 frames, where the stock spawn diverges instantly).
+    //
+    // The MECHANISM is still unknown, and the decompile ruled out the obvious candidates:
+    //   * GJBaseGameLayer::setupLevelStart (0x140212220) sets gravity/reverse/dual/size/
+    //     gamemode and NO position at all.
+    //   * PlayLayer::resetLevel (0x1403b8eb0) only READS the player's position and copies
+    //     it into player+0xa90 / player+0x4d0 — the spawn is already established before it.
+    //   * loadStartPosObject (0x140235760) needs m_startPosObject, and the object factory's
+    //     `case 0x1f` (=31) is the ONLY id that constructs a StartPosObject. ALLOY has no
+    //     id 31 anywhere (46372 objects checked), so that path cannot be it.
+    //   * getGroundHeightForMode (0x140211d50) returns per-GAMEMODE constants only
+    //     (240 / 270 / 300), never a per-level value.
+    // So it has to come from state this dump can observe directly. These four lines are
+    // what distinguishes an offset level from a normal one; capture one of each and diff.
+    if (auto* p1 = pl->m_player1) {
+        auto sp = p1->getPosition();
+        f << "spawnX " << sp.x << "\n";
+        f << "spawnY " << sp.y << "   # real-engine Y; gdsim assumes 105 (simY 15) for every level\n";
+    }
+    f << "startPosObject " << (pl->m_startPosObject ? 1 : 0)
+      << "   # 1 = level carries an id-31 StartPosObject (the only id that makes one)\n";
+    if (auto* spo = pl->m_startPosObject) {
+        auto p = spo->getPosition();
+        f << "startPosObjectX " << p.x << "\n";
+        f << "startPosObjectY " << p.y << "\n";
+    }
+    f << "startsWithStartPos " << (ls->m_startsWithStartPos ? 1 : 0) << "\n";
+    f << "disableStartPos "    << (ls->m_disableStartPos    ? 1 : 0) << "\n";
+
     log::info("[REScan] level params dumped for {}", g_levelId);
 }
 

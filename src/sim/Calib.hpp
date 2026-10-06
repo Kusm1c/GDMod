@@ -112,7 +112,7 @@ struct CalibParams {
 
     // Frames a speed-portal change is delayed before it reaches the X-position
     // integrator (GD applies it later than the wave Y-rate etc.). 1 = current.
-    int speedXLagFrames = 1;
+    int speedXLagFrames = 0;
 
     // Margin (units) added to the player's hitbox for HAZARD tests, to match GD's
     // slightly larger effective hazard hitboxes. This is the ACCURACY value (auto

@@ -85,6 +85,25 @@ public:
     // an eased offset. Empty when the timeline has not been built.
     std::vector<float> playerXAtFrame;
 
+    // ── Teleport triggers (3022) ────────────────────────────────────────────
+    // First object (level-string order) of every group, for teleport targets: a
+    // target is usually a decoration, which never becomes an Object, so this is kept
+    // for every object that carries field 57.
+    std::unordered_map<int, Vec2D> groupAnchor;
+    std::unordered_map<int, Vec2D> groupParentPos;   // field 274 group parents
+    bool groupObjectPos(int group, Vec2D& out) const;
+    int  spawnGroup = 0;          // kA36 (see initLevelSettings)
+    bool platformerMode = false;  // kA22
+    std::vector<int> teleportTriggers;      // indices into `triggers` (kind Teleport)
+    Vec2D spawnPosRaw{0.f, 0.f};            // gameStates[0] before reset-time teleports
+    bool  spawnUpsideDownRaw = false;
+    // Where teleportPlayer would put a player at `pos` (frame f = Player::frame);
+    // false when the target group has no object (only gravity then applies).
+    bool teleportTarget(const Trigger& t, Vec2D pos, int f, Vec2D& out) const;
+    void applyTeleport(Player& p, const Trigger& t) const;
+    // PlayerObject::updateRotation for the flying modes (updateShipRotation), run where
+    // the engine runs it: end of the step, after checkSpawnObjects. Then m_lastPosition.
+    static void updateVisualRotation(Player& p);
     void buildTriggerTimeline();
     // Player X per frame (0..maxFrames), the same input-independent walk the
     // trigger timeline uses. Lets tooling align a real capture (whose frame
@@ -110,7 +129,55 @@ public:
     // where the sim is least reliable. Set by the solver; 0 for playback/divergence.
     float flightHazardInflate = 0.0f;
 
+    // Per-frame scratch for stepPlayer's four object buckets. These used to be locals,
+    // which meant FOUR heap allocations on every simulated frame — two of them
+    // `reserve(100)` of ObjectContainer, i.e. several KB each. At ~40 M frames per beam
+    // run that is tens of millions of allocations, and it is the reason the parallel
+    // beam was SLOWER than serial: the per-frame cost is dominated by the process-wide
+    // allocator lock, which does not parallelise at all (measured — with the same slot
+    // refactor but every task forced inline the run was 117.9s, vs 172.7s once the work
+    // was actually spread over 24 threads). Held per Level, so each worker's clone has
+    // its own and no synchronisation is involved. stepPlayer never recurses, and
+    // runFrame's two calls (player, then dual mirror) are strictly sequential, so one
+    // set of buffers is enough.
+    std::vector<ObjectContainer> scratchBlocks, scratchHazards, scratchEffects, scratchModifiers;
+
+    // Seed this Level's simulation from an arbitrary Player state: the beam/cube-graph
+    // searches do `rollback(0); gameStates[0] = node;` to restart from a frontier node.
+    //
+    // Player carries a RAW BACK-POINTER `level` (Player.hpp), set once when the Level is
+    // built and then propagated by copy through every frame. A state produced by ANOTHER
+    // Level therefore arrives pointing at that other Level, and the physics reads it
+    // (Player.cpp's prevPlayer/blockDeathHitbox, Vehicle.cpp's section scan,
+    // Block.cpp's currentFrame). With one shared Level that is invisibly harmless; the
+    // moment workers each get their own Level it silently reads another worker's
+    // gameStates. Route every injection through here so the pointer is always re-anchored.
+    inline void seedState(const Player& st) {
+        rollback(0);
+        gameStates[0] = st;
+        gameStates[0].level = this;
+    }
+
+    // Solver-only BLOCK death-box margins, read every frame by Player::blockDeathHitbox.
+    // These used to be the process-global g_solveShipBlockClearance /
+    // g_solveRobotBlockClearance (Calib.hpp). Global made the margin a property of the
+    // PROCESS rather than of the simulation, which Solver.cpp:62-81 already documents as
+    // a real bug in a single thread (verifyZeroMargin had to install an RAII guard to
+    // borrow the globals back to 0 around its own "zero-margin" replay). It also makes
+    // two concurrent solves at different margins silently corrupt each other's physics,
+    // so it is the first thing that has to go before the beam can be parallelised.
+    //
+    // Seeded from the globals at construction so the Physics Lab's live tunables (which
+    // hold stable addresses, Tunables.cpp:271) keep working exactly as before; the solver
+    // now sets the per-Level copy instead, and a fresh Level for replay/divergence simply
+    // has its own 0 with no guard needed.
+    float solveShipBlockClearance  = 0.0f;
+    float solveRobotBlockClearance = 0.0f;
+
     static constexpr uint32_t sectionSize = 100;
+    // Effects (portals/orbs/pads) closer than this in X are collision candidates each
+    // step; touching() is decided when each one's turn comes (engine order).
+    static constexpr float kEffectScanX = 160.f;
     bool debug = false;
 
     Level(std::string const& lvlString);

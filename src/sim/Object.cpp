@@ -80,17 +80,17 @@ std::optional<ObjectContainer> Object::create(std::unordered_map<int, std::strin
     objs(({ 1568 }), Block, 62, 32)
     objs(({ 1569 }), Block, 32, 32)
 
-    // D block (id 1755): a wave-safe solid. Grounded modes land on it like a normal
-    // 30×30 block; the wave never dies inside it (handled in Block::collide). Hitbox
-    // size assumed 30×30 (default block) pending validation from GDMod_hitbox capture.
-    objs(({ 1755 }), Block, 30, 30)
+    // D block (id 1755) is NOT a solid: the object registry has it as m_objectType 40
+    // (Special), and GJBaseGameLayer::collisionCheckObjects (case 0x28) only sets the
+    // player's m_stateDartSlide = 2 on touch. It is a SpecialBlock below; a cube passes
+    // through it. (It used to be a 30x30 Block here.)
 
     // Special letter blocks (see SpecialBlock.hpp for the full spec + ID sourcing).
     // Hitbox sizes assumed 30×30 (default block footprint, same assumption as D
     // above) pending real capture — these are non-solid touch zones, not geometry,
     // so the exact size mostly affects how forgiving/precise a creator's placement
     // needs to be, not whether the mechanic works at all.
-    objs(({ 1813, 1829, 1859 }), SpecialBlock, 30, 30)   // J, S, H
+    objs(({ 1813, 1829, 1859, 1755 }), SpecialBlock, 30, 30)   // J, S, H, D
     objs(({ 2866 }), GravityFlipBlock, 30, 30)           // F
     objs(({ 2069, 3645 }), ForceBlock, 30, 30)           // Force (square, circle)
 
@@ -215,7 +215,7 @@ std::optional<ObjectContainer> Object::create(std::unordered_map<int, std::strin
     objs(({ 200 }), SpeedPortal, g_phys.portalSpeed200W, g_phys.portalSpeed200H)
     objs(({ 201 }), SpeedPortal, g_phys.portalSpeed201W, g_phys.portalSpeed201H)
     objs(({ 202 }), SpeedPortal, g_phys.portalSpeed202W, g_phys.portalSpeed202H)
-    objs(({ 203 }), SpeedPortal, g_phys.portalSpeed203W, g_phys.portalSpeed203H)   // STILL UNVERIFIED — no instance captured yet
+    objs(({ 203 }), SpeedPortal, g_phys.portalSpeed203W, g_phys.portalSpeed203H)   // 65 x 56 from setupSpriteSize
     objs(({ 1334 }), SpeedPortal, g_phys.portalSpeed1334W, g_phys.portalSpeed1334H)
 
     objs(({ 289,294,299,305,309,315,321,326,331,337,343,349,353,363,371,483,492,651,665,
@@ -266,6 +266,25 @@ bool Object::touching(Player const& player) const {
             self.size.x += 2.f * reach;
             self.size.y += 2.f * reach;
             return self.intersects(playerHb);
+        }
+    }
+    // ORIENTED non-solids (rotation not a multiple of 90; GameObject::updateIsOriented sets
+    // m_shouldUseOuterOb): GJBaseGameLayer::collisionCheckObjects / checkCollisions first
+    // test the object's bounding rect against the player's axis-aligned rect, then
+    // OBB2D::overlaps1Way both ways against the player's OBB — which PlayerObject builds
+    // from its VISUAL rotation (getObjectRotation -> getRotation). Solids are rect-only.
+    // Truth 108166595 f317 (wave at 45 deg vs a 45-deg gravity portal) and 85701165
+    // f355/f577 (rotated speed portals) touch exactly when the player's box is rotated.
+    if (prio != 1 && player.visRot != 0.f) {
+        const float r = std::fmod(std::fabs(rotation), 90.f);
+        if (r > 1e-3f && r < 90.f - 1e-3f) {
+            // bounding rect of this object's OBB vs the unrotated player rect
+            const float a = rotation * 0.017453292519943295f;
+            const float hw = 0.5f * (std::fabs(size.x * std::cos(a)) + std::fabs(size.y * std::sin(a)));
+            const float hh = 0.5f * (std::fabs(size.x * std::sin(a)) + std::fabs(size.y * std::cos(a)));
+            if (pos.x - hw > playerHb.getRight() || pos.x + hw < playerHb.getLeft() ||
+                pos.y - hh > playerHb.getTop()   || pos.y + hh < playerHb.getBottom()) return false;
+            return intersects(player.orientedHitbox());
         }
     }
     return intersects(playerHb);

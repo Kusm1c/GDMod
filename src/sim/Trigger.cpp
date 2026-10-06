@@ -94,9 +94,10 @@ float easeValue(float t, int type, float rate) {
 // GD trigger object IDs we simulate (physics-affecting only).
 //   901  = Move        1346 = Rotate      1347 = Follow
 //   1049 = Toggle      1007 = Alpha       1268 = Spawn
+//   3022 = Teleport
 bool isTriggerId(int id) {
     return id == 901 || id == 1346 || id == 1347 ||
-           id == 1049 || id == 1007 || id == 1268;
+           id == 1049 || id == 1007 || id == 1268 || id == 3022;
 }
 
 static float ff(const std::unordered_map<int, std::string>& m, int k, float def = 0.f) {
@@ -171,6 +172,14 @@ std::optional<Trigger> parseTrigger(int id, const std::unordered_map<int, std::s
             t.kind       = TriggerKind::Spawn;
             t.spawnDelay = ff(f, 63);
             break;
+        case 3022: // Teleport (player -> an object of targetGroup)
+            t.kind         = TriggerKind::Teleport;
+            t.tpSaveOffset = fi(f, 351) != 0;
+            t.tpIgnoreX    = fi(f, 352) != 0;
+            t.tpIgnoreY    = fi(f, 353) != 0;
+            t.tpGravity    = fi(f, 354);
+            if (t.targetGroup == 0 && t.tpGravity == 0) return std::nullopt;
+            return t;
         default:
             return std::nullopt;
     }

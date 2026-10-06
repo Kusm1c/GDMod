@@ -15,6 +15,9 @@
 
 #include "Solver_internal.hpp"
 #include "DebugPaths.hpp"
+#include "ThreadPool.hpp"
+#include <memory>
+#include <thread>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -76,7 +79,28 @@ bool solveLevelBeam(Level& sim, float end, const SolverConfig& cfg,
     // spawn and restore it on every exit — otherwise the optimizer / fallbacks
     // would re-simulate from a stale mid-level state.
     const Player spawn = sim.gameStates[0];
-    auto restoreSpawn = [&]{ sim.rollback(0); sim.gameStates[0] = spawn; };
+    auto restoreSpawn = [&]{ sim.seedState(spawn); };
+
+    // ── Parallel expansion ────────────────────────────────────────────────────
+    // Worker 0 is the calling thread and uses `sim` itself; the others get their own
+    // Level. A clone is MANDATORY, not an optimisation: stepPlayer poses movable
+    // objects in place (Level.cpp) and runFrame mutates gameStates, so two threads
+    // sharing one Level would corrupt each other's physics. Cloning happens here,
+    // straight after rollback(0), while gameStates holds only the spawn — a mid-search
+    // clone would deep-copy thousands of Players, and re-PARSING instead of copying
+    // would cost ~104 ms per worker (Level.hpp's own measurement).
+    int nThreads = cfg.threads > 0 ? cfg.threads
+                                   : std::max(1, (int)std::thread::hardware_concurrency());
+    if (const char* s = getenv("GDSIM_THREADS")) { int v = atoi(s); if (v > 0) nThreads = v; }
+    ThreadPool pool(nThreads);
+    std::vector<std::unique_ptr<Level>> clones;
+    std::vector<Level*> sims(pool.workers(), &sim);
+    for (int w = 1; w < pool.workers(); ++w) {
+        clones.push_back(std::unique_ptr<Level>(new Level(sim)));
+        sims[w] = clones.back().get();
+    }
+    if (pool.workers() > 1)
+        dlog("Beam threads: " + std::to_string(pool.workers()));
 
     struct Link { int32_t parent; uint8_t pressed; };
     std::vector<std::vector<Link>> hist;
@@ -98,12 +122,59 @@ bool solveLevelBeam(Level& sim, float end, const SolverConfig& cfg,
     const auto t0 = std::chrono::steady_clock::now();
     auto elapsed = [&]{ return std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count(); };
-    const double kLimit = std::clamp((double)end / 150.0, 45.0, 180.0);
+    // Wall-clock budget for the whole beam. NOTE this is a SINGLE-THREADED budget and
+    // it is the binding constraint on hard levels, not the physics: on "black off"
+    // (109927, end=25045 -> kLimit exactly 167.0s) the beam times out at 98% with the
+    // frontier pinned at its width cap (peakFrontier 3999/4000), and it times out at
+    // the same 167.0s whatever the hazard margin — i.e. it never converges, it just
+    // runs out of clock. GDSIM_BEAM_SECONDS overrides it so that "is this a search
+    // budget or a real wall?" can be answered directly before spending effort on
+    // physics that may be fine.
+    const double kBaseLimit = cfg.beamSeconds > 0.0
+                                  ? cfg.beamSeconds
+                                  : std::clamp((double)end / 150.0, 45.0, 180.0);
+    double kLimit = kBaseLimit;
+    bool allowExtend = cfg.beamSeconds <= 0.0;   // an explicit budget is respected exactly
+    if (const char* s = getenv("GDSIM_BEAM_SECONDS")) {   // diagnostic override
+        double v = atof(s);
+        if (v > 0) { kLimit = v; allowExtend = false; }
+    }
+
+    // ADAPTIVE EXTENSION (2026-09-23). The base budget is not a statement about the
+    // level, it is `end / 150` — so a level that needs more search than its length
+    // suggests is cut off mid-progress and the remaining budget goes to the LATER
+    // stages instead. Measured on "black off" (109927): the beam times out at 98%
+    // after its 167.0s, then path-seeker burns another 167s and greedy 89s and neither
+    // finishes — while the SAME beam, given more clock, solves the level at 329.2s.
+    // The budget was in the wrong place, not too small overall.
+    //
+    // So: while the frontier is still pushing bestX forward, keep going instead of
+    // falling through; when it stalls, stop immediately as before. The ceiling is 3x
+    // the base, which is about what beam+pathseeker+greedy already cost together
+    // (167+167+89 = 423s ~ 2.5x here), so a hard level cannot cost materially more
+    // wall time than it does today — it just spends it on the stage that was working.
+    // A genuinely stuck beam still gives up at the base limit, because bestX stops
+    // moving and the stall window closes.
+    const double kMaxLimit   = kBaseLimit * 3.0;
+    const double kStallWindow = std::max(20.0, kBaseLimit * 0.2);
+    double lastProgressT = 0.0;   // elapsed() when bestX last improved
+    float  lastProgressX = 0.f;
 
     // Expansion scratch reused each layer to avoid per-frame allocation churn.
     struct Cand { Player st; int32_t parent; uint8_t pressed; int16_t since; uint8_t tier; int32_t presses; };
     std::vector<Cand> cands;
     std::unordered_map<uint64_t, int> bestByKey;
+
+    // Per-slot expansion results, reused across layers (see the expansion loop).
+    // slotValid is uint8_t and NOT vector<bool>: the workers write distinct elements
+    // concurrently, which is only defined for a real byte array.
+    std::vector<uint8_t> slotValid;
+    std::vector<int32_t> slotFinish;   // >=0 = this slot crossed the end, value = presses
+    std::vector<Cand>    slotCand;
+    // Cache-line padded so the per-item increment does not ping-pong one line between
+    // every worker (this counter is bumped once per simulated frame, i.e. millions of times).
+    struct alignas(64) Counter { uint64_t v = 0; };
+    std::vector<Counter> expandedBy;
 
     float    bestX     = 0.f;
     int      bestLayer = -1, bestIdx = -1;   // furthest committed state, for partial reconstruct
@@ -353,6 +424,17 @@ bool solveLevelBeam(Level& sim, float end, const SolverConfig& cfg,
             if (cancelled && cancelled->load()) { dlog("Beam cancelled (while paused)"); writeStuck("CANCELLED"); fillBestPartial(); restoreSpawn(); return false; }
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+        if (elapsed() > kLimit && allowExtend && kLimit < kMaxLimit
+            && (elapsed() - lastProgressT) < kStallWindow) {
+            // Still pushing the frontier forward — take the budget the later stages
+            // would have spent failing, rather than handing the level to them.
+            kLimit = std::min(kMaxLimit, kLimit + kBaseLimit * 0.5);
+            int pct = end > 0.f ? (int)(bestX * 100.f / end) : 0;
+            dlog("Beam EXTEND -> " + f2(kLimit) + "s (still advancing: X=" + std::to_string((int)bestX)
+                 + ", " + std::to_string(pct) + "%, last gain "
+                 + f2(elapsed() - lastProgressT) + "s ago)");
+            if (prog) prog->addLog("Beam extend " + f2(kLimit) + "s (" + std::to_string(pct) + "%)");
+        }
         if (elapsed() > kLimit) {
             int pct = end > 0.f ? (int)(bestX * 100.f / end) : 0;
             dlog("Beam TIMEOUT at X=" + std::to_string((int)bestX) + " (" + std::to_string(pct)
@@ -377,36 +459,51 @@ bool solveLevelBeam(Level& sim, float end, const SolverConfig& cfg,
         // a rising edge (start of a new click) is only allowed once enough frames
         // have passed since this state's previous click start.
         const std::vector<Link>& curLinks = hist.back();
-        for (int i = 0; i < (int)beam.size(); ++i) {
+        const int nb = (int)beam.size();
+        // Slot k = (frontier index i, press bit pb) with k = i*2 + pb. Writing a
+        // pre-sized slot rather than push_back into a shared vector is what keeps the
+        // parallel result bit-identical to the single-threaded one: the compaction
+        // below walks k in order, so `cands` ends up in exactly the enumeration order
+        // the old nested loop produced.
+        slotValid.assign((size_t)nb * 2, 0);
+        slotFinish.assign((size_t)nb * 2, -1);
+        slotCand.resize((size_t)nb * 2);
+        expandedBy.assign(pool.workers(), Counter{});
+
+        pool.parallelFor(nb * 2, [&](int k, int w) {
+            const int i  = k >> 1;
+            const int pb = k & 1;
             const int lastIn = curLinks[i].pressed;   // input bit that produced beam[i]
             const int sc     = beamSince[i];
-            // NOTE: no `&& solveLayer < 0` guard — once a finisher is found we keep
-            // scanning the rest of this layer to pick the fewest-press one (below),
-            // then break out of the frame loop via `if (solveLayer >= 0) break;`.
-            for (int pb = 0; pb < 2; ++pb) {
-                const bool rising = (pb == 1 && lastIn == 0);
-                if (minGap > 0 && rising && sc < minGap) continue; // too soon to click again
-                sim.rollback(0);
-                sim.gameStates[0] = beam[i];
-                Player& c = sim.runFrame((bool)pb, dt);
-                ++statesExpanded;
-                if (c.dead) continue;
-                const int32_t presses = beamPresses[i] + pb;
-                if (c.pos.x >= end) {            // reached the finish
-                    // Anti-over-input: among every branch crossing the end THIS layer,
-                    // keep the one with the fewest total presses (the laziest finisher)
-                    // rather than the first enumerated. All finishers share this frame,
-                    // so x is identical between them — this never costs progress.
-                    if (solveLayer < 0 || presses < solvePresses) {
-                        solveLayer = (int)t + 1; solveParent = i;
-                        solvePressed = pb;       solvePresses = presses;
-                    }
-                    continue;
+            const bool rising = (pb == 1 && lastIn == 0);
+            if (minGap > 0 && rising && sc < minGap) return;  // too soon to click again
+            Level& ws = *sims[w];
+            ws.seedState(beam[i]);
+            Player& c = ws.runFrame((bool)pb, dt);
+            ++expandedBy[w].v;
+            if (c.dead) return;
+            const int32_t presses = beamPresses[i] + pb;
+            if (c.pos.x >= end) { slotFinish[k] = presses; return; }   // reached the finish
+            const int16_t ns   = (int16_t)(rising ? 0 : std::min(sc + 1, 30000));
+            const uint8_t tier = clearTier(ws, c, cfg.hazardMargin);
+            slotCand[k]  = Cand{ c, i, (uint8_t)pb, ns, tier, presses };
+            slotValid[k] = 1;
+        });
+
+        for (const auto& e : expandedBy) statesExpanded += e.v;
+        for (int k = 0; k < nb * 2; ++k) {
+            if (slotFinish[k] >= 0) {
+                // Anti-over-input: among every branch crossing the end THIS layer,
+                // keep the one with the fewest total presses (the laziest finisher)
+                // rather than the first enumerated. All finishers share this frame,
+                // so x is identical between them — this never costs progress.
+                if (solveLayer < 0 || slotFinish[k] < solvePresses) {
+                    solveLayer = (int)t + 1;  solveParent  = k >> 1;
+                    solvePressed = k & 1;     solvePresses = slotFinish[k];
                 }
-                int16_t ns = (int16_t)(rising ? 0 : std::min(sc + 1, 30000));
-                uint8_t tier = clearTier(sim, c, cfg.hazardMargin);
-                cands.push_back({ c, i, (uint8_t)pb, ns, tier, presses });
+                continue;
             }
+            if (slotValid[k]) cands.push_back(std::move(slotCand[k]));
         }
         if (solveLayer >= 0) break;
         if (cands.empty()) {
@@ -558,6 +655,10 @@ bool solveLevelBeam(Level& sim, float end, const SolverConfig& cfg,
         ++layersDone;
 
         if (prog) prog->bestX.store(bestX);
+        // Progress stamp for the adaptive extension above. Sampled once per layer (not
+        // per candidate) so it costs one clock read per layer, and gated on a real
+        // advance so that a frontier shuffling within the same X does not count.
+        if (bestX > lastProgressX + 1.f) { lastProgressX = bestX; lastProgressT = elapsed(); }
         if (t % 240 == 0) {
             int pct = end > 0.f ? (int)(bestX * 100.f / end) : 0;
             dlog("  beam t=" + std::to_string(t) + " X=" + std::to_string((int)bestX)

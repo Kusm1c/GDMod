@@ -121,6 +121,51 @@ struct SolverConfig {
     // with the hazard margin so a genuinely tight level still solves (frame-perfect
     // at 0 if that's the only way). Reaches the 13711278 killer edge at ≥3.
     float robotBlockClearance = 3.0f;
+    // Wall-clock budget for the beam stage, in seconds. 0 = the automatic formula
+    // (clamp(end/150, 45, 180)).
+    //
+    // MEASURED 2026-09-23 on "black off" (109927, end=25045): the automatic formula
+    // gives exactly 167.0s and the beam times out at 98% (X=24638/25045) with the
+    // frontier pinned at its width cap. Given 1200s instead, THE SAME BEAM, at the
+    // SAME margins, solves the level in 329.2s with 489 clicks. So the level was never
+    // unsolvable and the physics was never the problem — the budget was ~2x too small.
+    // Dropping the hazard margin to 0 made it WORSE (86%), confirming the constraint is
+    // the clock and not the margin: a wider feasible set spreads the same frontier thinner.
+    //
+    // The formula therefore under-budgets hard levels by roughly 2x, and the 180s
+    // ceiling caps it regardless of level. This is also the single strongest argument
+    // for parallelising the beam: 329s of search is ~40M single-threaded expansions on
+    // a machine with 24 cores, all of which sit idle (see Solver_Beam.cpp's expansion
+    // loop — the per-layer work is independent).
+    double beamSeconds = 0.0;
+    // Worker threads for the beam's per-layer expansion. 0 = hardware_concurrency,
+    // 1 = fully single-threaded (no threads created at all).
+    //
+    // DEFAULTS TO 1 BECAUSE THREADS CURRENTLY LOSE. The machinery is correct and proven
+    // deterministic — click lists are byte-identical at 1/4/12/24 threads on truths 308
+    // and 146, because every expansion writes a pre-sized slot indexed by its own
+    // (frontier index, press bit) and is compacted in that order — but it is SLOWER:
+    //
+    //     truth 308, W=4000:  1 thr 121.7s | 4 thr 140.1s | 12 thr 161.3s | 24 thr 169.9s
+    //
+    // Four rounds of tuning did not turn it around: lock-free work claiming, an inline
+    // threshold for small layers (ThreadPool::minParallel), removing stepPlayer's four
+    // per-frame heap allocations (kept — a genuine single-thread win), and rewriting the
+    // barrier to count completed ITEMS instead of checked-in WORKERS (helped at 4
+    // threads, 158s -> 140s, not enough).
+    //
+    // The isolating measurement, which any future attempt should start from:
+    //     GDSIM_THREADS=24 GDSIM_MIN_PARALLEL=99999999   -> 117.9s
+    //     GDSIM_THREADS=1                                -> 119.1s
+    // i.e. 24 threads created, every task forced inline, costs nothing. The pool, the
+    // Level clones and the slot refactor are all free; 100% of the loss is in actually
+    // spreading the work. With ~4 us of work per item, the next thing to suspect is
+    // cross-core traffic on the shared `beam` / `slotCand` arrays — which would mean the
+    // fix is a COARSER decomposition (parallelise whole independent searches, e.g. the
+    // margin ladder or several levels at once) rather than the inside of one layer.
+    //
+    // Env GDSIM_THREADS overrides this for A/B testing.
+    int  threads    = 1;
     int  beamWidth  = 4000;         // beam frontier width (states kept per frame).
                                     // Easy levels dedup well below this; only tight
                                     // flight corridors use the full width.

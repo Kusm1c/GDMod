@@ -691,6 +691,82 @@ where the recorded deviation from the real player is **0.19 units**, i.e. the
 trajectory was right and only the rule was wrong. `test/waveprobe.exe` reproduces
 the old verdict in one command.
 
+## Solid blocks never kill directly either
+
+`collisionCheckObjects` does **not** handle GameObjectType 0 / 0x15 (solid) in
+its per-type switch at all. It appends them to a separate list
+(`m_collidedObjects`, `GJBaseGameLayer+0x634`), and the caller then walks that
+list and runs `PlayerObject::collidedWithObject` (0x1403919b0) ->
+`collidedWithObjectInternal` (0x140391a70) on each one. Grepped whole-function:
+that function, `hitGround` (0x14039bf30), `didHitHead` (0x140393c30) and
+`updateCollide` (0x140393ff0) contain **zero** `destroyPlayer` /
+`playerDestroyed` calls. `collidedWithObjectInternal`'s only "destroy" is
+`GJBaseGameLayer::destroyObject` (0x140216090) — that breaks the *object*, not
+the player.
+
+The only `destroyPlayer` in the whole collision pass is in the **hazard** loop
+(GameObjectType 2 / 0x2f), which runs after the solid loop.
+
+So a solid can kill in exactly one way: the CRUSH test at the top of
+`PlayerObject::postCollision` (0x14038d580).
+
+```c
+// param_1[299] = m_snapCeilY (+0x958), param_1[300] = m_snapFloorY (+0x960);
+// each is written only when this frame actually pushed the player under an
+// object's bottom / up onto an object's top.
+if (m_snapCeilY == 0 || m_snapFloorY == 0 || flag_0x188) goto no_death;
+float f = m_isPlatformer ? 0.8f : 0.7f;
+float gap = fabs(m_snapCeilY - m_snapFloorY);
+if (gap == 0) goto no_death;
+if (!upsideDown && m_snapCeilY < pos.y && m_snapCeilY < m_lastPosY) goto no_death;
+if ( upsideDown && pos.y < m_snapCeilY && m_lastPosY < m_snapCeilY) goto no_death;
+if (getObjectRect().height * f <= gap) goto no_death;
+destroyPlayer();
+```
+
+### Floor candidates can never kill
+
+What `collidedWithObjectInternal` *does* do before anything else is classify the
+object: `objTop <= playerBottom + snapUpThreshold` makes it a **floor
+candidate** — a surface the player is going to end up standing on. That gate is
+the same `clip` already ported into `Block::collide` (10 grounded, 6 flight, 7
+while gripping a slope, 15 in one platformer case). An object that passes it
+stays a floor candidate *while the player is still rising into it*: GD does
+nothing at all until `m_yVelocity` turns over, then snaps the player onto its
+top.
+
+Measured on the real per-frame capture of DeCode (2997354), mini cube, block id
+**661** at real-GD `(24547.5, 217.5)`, 15x15:
+
+| frame | x | y | feet | objTop-feet | full 18x18 pen | 7x7 inner pen |
+|---|---|---|---|---|---|---|
+| 16969 | 24538.9 | 225.855 | 216.855 | 8.145 | 7.90 x 8.15 | 1.00 x 1.25 |
+| 16971 | 24541.0 | 226.196 | 217.196 | 7.804 | 10.00 x 7.80 | 3.10 x 0.90 |
+| 16974 | 24544.2 | 226.350 | 217.350 | 7.650 | 13.20 x 7.65 | 4.20 x 0.75 |
+| 16975 | 24545.2 | **234.0** | **225.0** | 0.000 | — | grounded=1 |
+
+Six consecutive frames with the full hitbox up to 13.2 x 8.1 units *inside* the
+block, and real GD does not kill — it snaps the feet to exactly the block top
+(225.0) the moment the jump apex is passed. `objTop - feet` never leaves
+7.65..8.15, i.e. always under the snap-up threshold of 10.
+
+gdsim used to kill on the **first** of those frames: its 7x7 inner death box
+(4.2 x 4.2 for a mini) clipped the block's top-left corner by 1.00 x 1.25, over
+`kSolidGraze` = 0.75, so the graze tolerance could not save it. Fixed by
+refusing the death for any floor candidate. `thinGraze` objects (<5u wide) stay
+excluded exactly as they are from the landing branch. Bank: 13/13, 0 regressed.
+
+`test/blockprobe.exe <level> <x> <y> <vel> [mini]` reproduces the verdict in one
+command.
+
+### Coordinate note
+
+gdsim world Y = real GD world Y **- 90** (gdsim puts the floor at 0, GD at 90).
+The app's "Physics trail offset Y=90.0" is that convention, not a
+misalignment — but it means a raw `GDMod_physics_<id>.txt` Y needs 90 subtracted
+before comparing against gdsim, and the object positions in
+`GDMod_hitbox_<id>.txt` are in **real GD space**, 90 above what `objdump` prints.
+
 ## Known gaps in gdsim after this pass
 
 Ordered by how much they cost the pathfinder on real levels.
@@ -733,3 +809,37 @@ Decoration) and accumulates into
 firstLevel`, merged across every level and every session, keeping the dominant
 (unscaled) footprint per id. That file is what `Object::create` should
 eventually be generated from.
+
+## `PlayerObject::update` (0x140388d80) — ported, `src/sim/engine/PlayerEngine.cpp`
+
+One 240 Hz step of the player **before** the collision pass. Transcribed from the code;
+checked by `test/updatecheck.cpp` (in `test/regress.sh`) on the two jump-probe captures:
+X bit-exact on every step the collision pass did not touch (86 446 steps, all 8 modes).
+
+1. `m_yVelocity` clamped to ±1000 (direct stores, not quantised). `if (m_isDead) return`.
+2. `m_yVelocityRelated3 = 0`. If `!m_isLocked`:
+   - `updateJump(dt * 0.9f)` — the 0.9f (@0x140622bd8) is applied in FLOAT;
+   - force blocks (`m_stateForce > 0`): `dv = (double)((dt*0.9f * m_stateForceVector.y) * k)`,
+     k = ship .47 / bird .58 / swing .4 / ball, spider .6 / robot .9 / cube 1; mini ship .5875,
+     bird .72499996, swing .61538464 (@0x140622afc…b84). `setYVelocity(dv + v)`;
+     `m_isAccelerating` if dv≠0; `m_accelerationOrSpeed += dv/12.94*1.5` when dv pushes against
+     gravity;
+   - dashing: `v = 0`;
+   - **`dy = (double)(dt*0.9f) * v`** (the NEW velocity: semi-implicit),
+     **`dx = (double)playerSpeed * speedMultiplier * (double)dt`** (FULL dt, no 0.9);
+   - wave (not dashing): `dy = |dx| * (upsideDown?-1:1) * (jumpBuffered?1:-1)`, ×2 when mini —
+     the wave's velocity is ignored; dashing: `dy = m_dashY * dx`;
+   - going left: `dx = -dx`; `x = dx + m_maybeReverseAcceleration`; sideways swaps x/y;
+     `setPosition(getPosition() + CCPoint((float)x, (float)dy))` — float add;
+   - reverse speed: `a = min(|rs|, dx*0.02)` signed like rs; `reverseAccel = a; rs -= a`.
+3. Always (after the dead check): `m_stateJumpBuffered = m_jumpBuffered`,
+   `m_stateRingJump2 = m_stateRingJump`, one 4-byte zero store at 0x98b clears
+   `m_touchedRing, m_touchedCustomRing, m_touchedGravityPortal, m_maybeTouchedBreakableBlock`;
+   **decrement** `m_stateNoAutoJump, DartSlide, FlipGravity, HitHead, OnGround, BoostX, BoostY,
+   maybeStateForce2, Scale, Force`; `m_stateForceVector = 0`; `m_jumpPadRelated.clear()`.
+   The m_state* fields are frame countdowns, not flags.
+
+**Position:** the live position is the CCNode's (virtual `getPosition` +0xc8 / `setPosition`
++0xb8). `PlayerObject::m_position` (0xa90) is a different field, written only by the
+constructor and `spiderTestJumpInternal` (0x1403950c0). The engine-trace snapshot read 0xa90
+as "the position" until this was found; it now captures `nodePosition` via `getPosition()`.

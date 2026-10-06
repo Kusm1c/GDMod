@@ -54,7 +54,12 @@ void TeleportPortal::collide(Player& p) const {
     // target-Y computation during a real playthrough of 85701165 (the mod already
     // has the Geode bindings/addresses to do this — see the bindings inventory).
     // Don't guess a replacement formula from this single data point alone.
+    // GJBaseGameLayer::teleportPlayer, 747 branch: (player.x, portal.y + yOffset), with
+    // yOffset = linked exit.y - portal.y = field 54 (PlayLayer::addObject creates the exit
+    // there). Verified on truth 85701165 f827: -17 + 852 = 835 exactly (the old "925"
+    // note above forgot the 90 engine-Y offset).
     p.pos.y = pos.y + distance;
+    p.teleported = true;
 }
 
 } // namespace gdsim

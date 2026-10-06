@@ -178,7 +178,12 @@ static Vehicle cube() {
             // ground/slopes from this — approximated here via the slope check
             // only, since a J block always co-locates with an actual Block
             // object, naturally excluding the bare-floor case in practice).
-            bool bufferedJump = p.buffer && !p.prevPlayer().buffer;
+            // The engine's test is `m_jumpBuffered && m_isOnGround` (updateJump,
+            // PlayerEngine.cpp), and m_isOnGround is LAST frame's collision result —
+            // so a fresh press ON the landing frame does not jump either; it has to be
+            // held into the next frame (truth 274283 f2149: 1-frame tap on the landing
+            // frame, real stays down and dies on the spike at 2835; gdsim jumped).
+            bool bufferedJump = p.buffer && !p.prevPlayer().buffer && p.prevPlayer().grounded;
             if (bufferedJump && p.touchingJBlock && !p.slopeData.slope) bufferedJump = false;
             // FOUND 2026-08-17 (real Watch capture, level 2997354 "DeCode", fresh
             // 251-click solve): a click landing on the EXACT frame a slope grip is
@@ -397,8 +402,14 @@ static Vehicle ball() {
     };
 
     v.update = +[](Player& p) {
-        if (!p.prevPlayer().velocityOverride || p.prevPlayer().slopeData.slope)
-            p.acceleration = g_phys.ballAccel;
+        // Always the ball's own gravity (updateJump: mult 0.6, no exception). This was
+        // gated on !prevPlayer().velocityOverride, and every grounded ball frame sets
+        // velocity 0 WITH override — so a flip from the floor kept the stale CUBE
+        // acceleration inherited from before the ball portal: +0.216 instead of the
+        // engine's +0.129 on the flip frame (truth 274283 f296 / 13519: real 3.483 =
+        // updateJump(0)'s flip 3.354 + one ball step; gdsim 3.570), ~1u off per flip.
+        // The vehicle-switch frame keeps the OLD vehicle's accel in postCollision.
+        p.acceleration = g_phys.ballAccel;
 
         if (!p.input) p.vehicleBuffer = false;
 

@@ -133,8 +133,7 @@ static SolverResult cubeSearch(const std::string& levelStr, const SolverConfig& 
              << " speed=" << sim.gameStates[0].speed << " xSpeed=" << sim.gameStates[0].xSpeed
              << " frame=" << sim.gameStates[0].frame << "\n";
         auto step = [&](Player p, bool press) {
-            sim.rollback(0);
-            sim.gameStates[0] = std::move(p);
+            sim.seedState(p);
             auto &s = sim.runFrame(press, dt);
             dbg2 << "step press=" << press << " => frame=" << s.frame << " x=" << s.pos.x
                  << " y=" << s.pos.y << " ground=" << s.grounded << " dead=" << s.dead
@@ -159,8 +158,7 @@ static SolverResult cubeSearch(const std::string& levelStr, const SolverConfig& 
     // Step one frame from an arbitrary stored state (the beam's injection idiom):
     // inject as gameStates[0], run, copy the result out before the next rollback.
     auto step = [&](Player p, bool press) -> Player {
-        sim.rollback(0);
-        sim.gameStates[0] = std::move(p);
+        sim.seedState(p);
         return sim.runFrame(press, dt);   // returns Player& into gameStates[1]; copied out
     };
     auto decision = [&](const Player& p) -> bool {
@@ -247,7 +245,7 @@ static SolverResult cubeSearch(const std::string& levelStr, const SolverConfig& 
         inp.assign(hi + 2, false);
         for (auto& c : clk)
             for (uint64_t f = c.pressFrame; f < c.releaseFrame && f < inp.size(); ++f) inp[f] = true;
-        sim.rollback(0); sim.gameStates[0] = spawn;
+        sim.seedState(spawn);
         for (uint32_t f = 1; ; ++f) {
             bool p = f < inp.size() && inp[f];
             auto& s = sim.runFrame(p, dt);

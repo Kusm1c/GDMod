@@ -11,9 +11,10 @@ void SpecialBlock::collide(Player& p) const {
         std::fprintf(stderr, "SPECIALBLOCK-TOUCH f=%d typeId=%d pos=(%.2f,%.2f) playerXY=(%.2f,%.2f)\n",
                      p.frame, typeId, pos.x, pos.y, p.pos.x, p.pos.y);
     switch (typeId) {
-        case 1813: p.touchingJBlock = true; break;  // J: Stop Jump Buffer
-        case 1829: p.touchingSBlock = true; break;  // S: Stop Dash
-        case 1859: p.touchingHBlock = true; break;  // H: Allow Head Collision
+        case 1813: p.stateNoAutoJump = 2; p.touchingJBlock = true; break;  // J: Stop Jump Buffer
+        case 1829: p.touchingSBlock = true; break;                          // S: Stop Dash
+        case 1859: p.stateHitHead = 2;    p.touchingHBlock = true; break;   // H: Allow Head Collision
+        case 1755: p.stateDartSlide = 2; break;                             // D: wave slides on solids
         default: break;
     }
 }

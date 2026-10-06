@@ -241,8 +241,12 @@ void Orb::collide(Player& p) const {
             // DeCode's own fidelity over the broader batch for now.
             p.velocityOverride = !touching(p.prevPlayer());
         }
-        if (type == OrbType::Blue || type == OrbType::Green || type == OrbType::GravityFlip)
+        if (type == OrbType::Blue || type == OrbType::Green || type == OrbType::GravityFlip) {
             p.upsideDown = !p.upsideDown;
+            // Ring already touched on the previous step: the press reaches it through
+            // pushButton, before update() moves the player (see Player::flipBeforeUpdate).
+            if (touching(p.prevPlayer())) p.flipBeforeUpdate = true;
+        }
         if (p.vehicle.type == VehicleType::Ball)
             p.input = false;
     }

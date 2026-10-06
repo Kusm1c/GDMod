@@ -32,9 +32,17 @@ Entity Player::blockDeathHitbox() const {
     // ceiling (block bottom): a ±2.1u box grazes the block by a sub-unit hair at the
     // first frame while the real wave (tiny hitbox) threads it. Give the wave a
     // smaller box. (Env override for offline tuning; falls back to the constant.)
-    float sc = small ? 0.6f : 1.0f;
+    // ENGINE (2026-10-05, disassembly of PlayerObject::collidedWithObjectInternal at
+    // 0x140393646): the solid-death test is `player->getObjectRect(0.3f, 0.3f)` against
+    // the object's rect. That overload REPLACES the sprite scale (where mini lives), so
+    // the box is m_width*0.3 x m_height*0.3 and does NOT shrink for mini: 9x9 for the
+    // 30-unit modes, 8.1 for the spider (27), 3x3 for the wave (10). (Ghidra had dropped
+    // the two float args, which is why an earlier read concluded there was no inner box
+    // and the 7x7 / x0.6 values above it were fitted.)
     Vec2D c = pos;
-    Vec2D sz{7.f * sc, 7.f * sc};
+    const float base = vehicle.type == VehicleType::Wave   ? 10.f
+                     : vehicle.type == VehicleType::Spider ? 27.f : 30.f;
+    Vec2D sz{base * 0.3f, base * 0.3f};
 
     // Solver-time robustness margin against SOLID BLOCKS in flight modes. gdsim's
     // ship accel is exact, but ~6-7u of click-phase drift accumulates over a long
@@ -43,10 +51,10 @@ Entity Player::blockDeathHitbox() const {
     // correctly for upside-down ships) so the solver leaves clearance under block
     // ceilings; the floor/landing side is untouched (no false death when a ship
     // grazes a platform below it). Zero everywhere except during solveLevel().
-    if (g_solveShipBlockClearance > 0.f && level &&
+    if (level && level->solveShipBlockClearance > 0.f &&
         (vehicle.type == VehicleType::Ship || vehicle.type == VehicleType::Ufo ||
          vehicle.type == VehicleType::Swing)) {
-        float m = g_solveShipBlockClearance;           // world units, not size-scaled
+        float m = level->solveShipBlockClearance;           // world units, not size-scaled
         sz.y += m;                                     // taller box …
         c.y  += (float)grav(m * 0.5);                  // … all added on the ceiling side
     }
@@ -58,10 +66,10 @@ Entity Player::blockDeathHitbox() const {
     // grav-up (top) side and BOTH horizontal sides — but never the bottom, so a
     // normal platform landing (death box sitting just above the block top) can't
     // false-trigger. Zero everywhere except during solveLevel().
-    if (g_solveRobotBlockClearance > 0.f && level &&
+    if (level && level->solveRobotBlockClearance > 0.f &&
         (vehicle.type == VehicleType::Cube || vehicle.type == VehicleType::Robot ||
          vehicle.type == VehicleType::Spider)) {
-        float m = g_solveRobotBlockClearance;          // world units, not size-scaled
+        float m = level->solveRobotBlockClearance;          // world units, not size-scaled
         sz.x += 2.f * m;                               // wider (both sides, symmetric)
         sz.y += m;                                     // taller on the grav-up side only
         c.y  += (float)grav(m * 0.5);
@@ -69,6 +77,8 @@ Entity Player::blockDeathHitbox() const {
     return {c, sz, 0};
 }
 Entity Player::unrotatedHitbox() const { return {pos, size, 0}; }
+// gdsim's Entity rotation is the negated GD (clockwise) angle, like every object's.
+Entity Player::orientedHitbox() const { return {pos, size, -visRot}; }
 
 void Player::setVelocity(double v, bool override_flag) {
     velocityOverride = override_flag;
@@ -131,9 +141,16 @@ void Player::preCollision(bool pressed) {
     velocityOverride = false;
     gravityPortal = false;
     roundVelocity = true;
-    touchingJBlock = false;
+    // update()'s end-of-step countdowns (see Player.hpp), then the flags they drive.
+    if (stateNoAutoJump > 0) --stateNoAutoJump;
+    if (stateDartSlide  > 0) --stateDartSlide;
+    if (stateHitHead    > 0) --stateHitHead;
+    touchingJBlock = stateNoAutoJump > 0;
     touchingSBlock = false;
-    touchingHBlock = false;
+    touchingHBlock = stateHitHead > 0;
+    ceilingSnapped = false;
+    teleported = false;
+    flipBeforeUpdate = false;
 
     if (button != pressed) {
         button = pressed;
@@ -230,7 +247,11 @@ void Player::postCollision() {
     }
 #endif
 
-    if (pos.y > 1476.3f || (upsideDown && getBottom() < floor)) {
+    // No height limit: the engine's player code kills only in collidedWithObjectInternal,
+    // collidedWithSlopeInternal and postCollision's crush test (and x < -30 when going left,
+    // GJBaseGameLayer::checkCollisions). The old `pos.y > 1476.3` kill had no counterpart and
+    // killed spawn-group starts above it (128093374 spawns at y 1987.5, kA36).
+    if (upsideDown && getBottom() < floor) {
         if (getenv("GDSIM_BOUNDS_DEBUG"))
             std::fprintf(stderr, "BOUNDS f=%d pos.y=%f getBottom=%f floor=%f ceiling=%f size.y=%f upsideDown=%d small=%d\n",
                          frame, pos.y, getBottom(), floor, ceiling, size.y, upsideDown, small);
@@ -268,7 +289,11 @@ void Player::postCollision() {
     if (frame == lastVehicleSwitchFrame)
         acceleration = prevPlayer().acceleration;
 
-    if (!velocityOverride) {
+    // ceilingSnapped: Block.cpp already zeroed the velocity for the END of this
+    // frame (real GD's updateJump ran its gravity step BEFORE the clamp, not after),
+    // so adding another `a*dt` here would launch the ship off the ceiling with a
+    // frame of thrust real GD never gives it. See Player.hpp's ceilingSnapped.
+    if (!velocityOverride && !ceilingSnapped) {
         double newVel = velocity + acceleration * dt;
 
         bool wasGrounded = prevPlayer().grounded;
@@ -327,7 +352,15 @@ void Player::postCollision() {
     // pipeline is semi-implicit. Skipped when grounded/snapped (would push off the
     // floor), on velocity overrides, and for wave (its Y velocity is set instant in
     // preCollision, so preFrameVelocity already equals the final velocity).
-    bool semiImplicit = !velocityOverride && !grounded && vehicle.type != VehicleType::Wave;
+    // A player still flagged grounded whose NEW velocity carries it off the floor
+    // (a ship thrusting up from the ground: accel only, no setVelocity to clear
+    // `grounded`) moves too: PlayerObject::update always integrates dt*0.9*v_new, the
+    // floor only snaps back what goes INTO it. Truth 39401655 / 138452785 f10: real
+    // takeoff dY = 0.225*0.108 = 0.0243; gdsim held y and carried that 0.024 through
+    // the whole ship section (a spike killed it one frame early). Slopes excluded:
+    // Slope::calc owns the riding Y.
+    const bool liftingOff = grounded && velocity > 0 && !slopeData.slope;
+    bool semiImplicit = !velocityOverride && (!grounded || liftingOff) && vehicle.type != VehicleType::Wave;
     if (getenv("GDSIM_GRAVFLIP_DEBUG") && frame >= 1930 && frame <= 1935)
         std::fprintf(stderr, "RESYNC-CHECK f=%d velOverride=%d grounded=%d resyncPos=%d semiImplicit=%d clampSnapped=%d velocity=%.3f preFrameVel=%.3f yBefore=%.3f\n",
                      frame, velocityOverride, grounded, resyncPosition, semiImplicit, clampSnapped, velocity, preFrameVelocity, pos.y);
@@ -342,7 +375,7 @@ void Player::postCollision() {
     // x=816.61 flip). Identical to grav() on every non-flip frame.
     const double gsignPre = prevPlayer().upsideDown ? -1.0 : 1.0;
     const double preApplied = gsignPre * preAppliedGravStep * dt;
-    if (clampSnapped) {
+    if (clampSnapped || ceilingSnapped || teleported) {
         resyncPosition = false;   // position was explicitly snapped to the ceiling
     } else if (resyncPosition || semiImplicit) {
         pos.y += (float)(grav(velocity) * dt - grav(preFrameVelocity) * dt - preApplied);

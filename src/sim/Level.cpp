@@ -66,6 +66,13 @@ void Level::initLevelSettings(std::string const& lvlSettings, Player& player) {
     if ((player.small = (bool)numFromString<int>(get_or("kA3", "0"))))
         player.size = player.size * 0.6f;
 
+    // Spawn group (kA36, LevelSettingsObject+0x1c4) and platformer flag (kA22, +0x155):
+    // GJBaseGameLayer::resetPlayer (0x1402120b0) puts the player on an object of the
+    // spawn group instead of (0,105) — Y only, unless platformer. Applied once the
+    // objects are parsed (Level ctor). ALLOY 123617195 spawns at real Y 975 this way.
+    spawnGroup     = numFromString<int>(get_or("kA36", "0"));
+    platformerMode = numFromString<int>(get_or("kA22", "0")) != 0;
+
     player.upsideDown = (bool)numFromString<int>(get_or("kA11", "0"));
     player.vehicle = Vehicle::from(static_cast<VehicleType>(numFromString<int>(get_or("kA2", "0"))));
     // A level that STARTS in a vehicle never fires that vehicle's `enter` transition
@@ -82,6 +89,13 @@ void Level::initLevelSettings(std::string const& lvlSettings, Player& player) {
 }
 
 Level::Level(std::string const& lvlString) {
+    // Seed the solver block margins from the Physics Lab's live globals so editing them
+    // there still affects a newly built Level (see Level.hpp). The solver overwrites the
+    // per-Level copy for its own run; replay/divergence Levels keep whatever the lab set,
+    // which is the same behaviour the globals had.
+    solveShipBlockClearance  = g_solveShipBlockClearance;
+    solveRobotBlockClearance = g_solveRobotBlockClearance;
+
     std::string normalized = normalizeLevelString(lvlString);
     std::stringstream ss(normalized);
     std::string objstr;
@@ -110,6 +124,15 @@ Level::Level(std::string const& lvlString) {
         }
 
         const int id = obj.count(1) ? numFromString<int>(obj[1]) : 0;
+
+        if (obj.count(57)) {                         // teleport/spawn targets (Level.hpp)
+            const Vec2D at{(float)stod_def(obj[2]), (float)stod_def(obj[3])};
+            for (int g : parseGroups(obj[57])) groupAnchor.emplace(g, at);
+            // Field 274 = the groups this object is the PARENT of
+            // (GJBaseGameLayer::loadGroupParentsFromString; setGroupParent: last wins).
+            if (obj.count(274))
+                for (int g : parseGroups(obj[274])) groupParentPos[g] = at;
+        }
 
         if (isTriggerId(id)) {                       // a trigger, not a collision object
             if (auto tr = parseTrigger(id, obj)) triggers.push_back(*tr);
@@ -187,14 +210,30 @@ Level::Level(std::string const& lvlString) {
         }
     }
 
+    if (spawnGroup > 0) {
+        Vec2D at;
+        if (groupObjectPos(spawnGroup, at)) {
+            player.pos.y = at.y;
+            if (platformerMode) player.pos.x = at.x;
+            player.grounded = false;
+        }
+    }
+
+    player.rotLastPos = player.pos;
     player.level = this;
     gameStates.push_back(player);
     // gameStates2 stays empty until the first dual portal (lazy, zero overhead).
 
-    hasTriggers = !movable.empty();
+    spawnPosRaw        = gameStates[0].pos;
+    spawnUpsideDownRaw = gameStates[0].upsideDown;
+    bool anyTeleport = false;
+    for (const Trigger& t : triggers) anyTeleport |= t.kind == TriggerKind::Teleport;
+    hasTriggers = !movable.empty() || anyTeleport;
     if (hasTriggers) {
         std::sort(triggers.begin(), triggers.end(),
                   [](const Trigger& a, const Trigger& b) { return a.x < b.x; });
+        for (int ti = 0; ti < (int)triggers.size(); ++ti)
+            if (triggers[ti].kind == TriggerKind::Teleport) teleportTriggers.push_back(ti);
         buildTriggerTimeline();   // reads gameStates[0]; must run after push_back
 
         // Invert group→trigger into movable-object→triggers (X-sorted) and measure
@@ -287,6 +326,10 @@ void Level::buildTriggerTimeline() {
               [](auto& a, auto& b){ return a.first < b.first; });
 
     const float dt = 1.f / 240.f;
+    // Reset-time teleports below rewrite gameStates[0]; start from the parsed spawn so
+    // a rebuild (rollback / tunable edit) is idempotent.
+    gameStates[0].pos        = spawnPosRaw;
+    gameStates[0].upsideDown = spawnUpsideDownRaw;
     int   speed = gameStates[0].speed;
     float x     = gameStates[0].pos.x;
     size_t si = 0, ti = 0;
@@ -297,11 +340,23 @@ void Level::buildTriggerTimeline() {
     // below fire them at frame 1 — which animated them across the spawn and, e.g.,
     // swept a -150u move-triggered platform straight through the falling player.
     // `triggers` is X-sorted, so these are exactly the leading entries.
-    while (ti < triggers.size() && triggers[ti].x < x) {
+    // PlayLayer::resetLevel runs checkSpawnObjects with the player at spawn, which
+    // fires every trigger with x <= spawn X (`playerX < triggerX` breaks): <=, not <.
+    while (ti < triggers.size() && triggers[ti].x <= x) {
         triggers[ti].fireFrame  = 0;
         triggers[ti].preApplied = true;
         ++ti;
     }
+    // Reset-time Teleport triggers (ALLOY 123617195 spawns at real Y 975 this way) move
+    // the starting player itself. checkSpawnObjects reads the player X once, so every
+    // trigger behind spawn fires even if a teleport moves the player mid-loop.
+    for (int tk : teleportTriggers) {
+        const Trigger& t = triggers[tk];
+        if (t.preApplied && !t.touchTriggered && !t.spawnTriggered)
+            applyTeleport(gameStates[0], t);
+    }
+    x = gameStates[0].pos.x;
+    gameStates[0].rotLastPos = gameStates[0].pos;
     // Bound: enough frames to cross the whole level at the slowest speed.
     const uint64_t maxF = (uint64_t)((double)(length + 600.f) / player_speeds[0] / dt) + 480;
     // Record X per frame while we walk, for poseMovable's Lock-to-Player-X moves.
@@ -311,8 +366,20 @@ void Level::buildTriggerTimeline() {
     for (uint64_t f = 1; f <= maxF; ++f) {
         x += (float)(player_speeds[speed] * dt);
         while (si < speedChanges.size() && x >= speedChanges[si].first) speed = speedChanges[si++].second;
-        while (ti < triggers.size() && triggers[ti].x <= x) triggers[ti++].fireFrame = (int)f;
+        float teleportX = x; bool teleported = false;
+        while (ti < triggers.size() && triggers[ti].x <= x) {
+            Trigger& t = triggers[ti++];
+            t.fireFrame = (int)f;
+            // A teleport fired at the end of step f moves the X every later trigger is
+            // measured against (checkSpawnObjects of the following steps).
+            Vec2D to;
+            if (t.kind == TriggerKind::Teleport && !t.touchTriggered && !t.spawnTriggered
+                && teleportTarget(t, {x, gameStates[0].pos.y}, (int)f + 1, to)) {
+                teleportX = to.x; teleported = true;
+            }
+        }
         playerXAtFrame[(size_t)f] = x;
+        if (teleported) x = teleportX;
     }
 
     // Spawn/touch triggers do NOT fire by X — drop the X fire-frame the walk gave
@@ -444,16 +511,33 @@ void Level::buildTriggerTimeline() {
 // toggles are applied in X order so the last-fired one wins. Depends only on f
 // (and the object's fixed start pose), so it is identical across every search
 // branch and exact after the solver rolls a player back to an earlier frame.
+// ENGINE TIMELINE (GJBaseGameLayer::update 0x140237850, per 240 Hz step): processCommands ->
+// PlayerObject::update -> prepareMoveActions/processMoveActionsStep -> checkCollisions ->
+// checkSpawnObjects. So a trigger the player passes in loop step F (Trigger::fireFrame, set by
+// buildTriggerTimeline's X walk) is activated at the END of step F and first affects step F+1;
+// a touch trigger is activated inside step F's collision pass, same result. A Move/Rotate
+// command's elapsed time does NOT advance on its first step: GroupCommandObject2::reset sets the
+// skip flag +0x1b0 and GroupCommandObject2::step consumes it instead of adding dt. Its eased
+// progress in step g is therefore (g - F - 1) * dt / duration — measured exactly on truth
+// 21227933 (group 9 rising floor, x=1 trigger: real motion ends at step 122, gdsim ended at 120).
+// `f` here is Player::frame, which runs one ahead of the loop step (g = f - 1).
+static inline bool engineActive(const Trigger& t, int g) {
+    return t.preApplied || (t.fireFrame >= 0 && g >= t.fireFrame + 1);
+}
+
 void Level::poseMovable(int idx, int f, Vec2D& pos, float& rot, bool& active) const {
     pos    = movableMeta[idx].startPos;
     rot    = movableMeta[idx].startRot;
     active = true;
 
     const float dt = 1.f / 240.f;
+    const int g = f - 1;   // loop step (see the timeline above)
     for (int ti : movableToTriggers[idx]) {
         const Trigger& t = triggers[ti];
-        if (t.fireFrame < 0 || t.fireFrame > f) continue;   // not fired (X or spawn)
-        if (t.touchTriggered) continue;                      // touch = path-dependent, not modelled
+        if (!engineActive(t, g)) continue;                   // not fired yet (X, spawn or touch)
+        // Touch triggers act only once the replay-only detector fired them (the engine never
+        // activates one without a touch, including the "behind spawn" ones).
+        if (t.touchTriggered && (!modelTouchTriggers || t.preApplied)) continue;
 
         if (t.kind == TriggerKind::Move || t.kind == TriggerKind::Rotate) {
             // A trigger on a cyclic spawn chain (Trigger.hpp's repeatPeriodFrames)
@@ -463,8 +547,8 @@ void Level::poseMovable(int idx, int f, Vec2D& pos, float& rot, bool& active) co
             // the overwhelming majority of triggers, where this is exactly the
             // single-firing loop that was here before (k=0, thisFire=t.fireFrame).
             int fireCount = 1;
-            if (!t.preApplied && t.repeatPeriodFrames > 0 && f > t.fireFrame)
-                fireCount = 1 + (f - t.fireFrame) / t.repeatPeriodFrames;
+            if (t.repeatPeriodFrames > 0 && g > t.fireFrame + 1)
+                fireCount = 1 + (g - t.fireFrame - 1) / t.repeatPeriodFrames;
             // Safety rail, not a real limit: only a degenerate near-zero period
             // over a long level could reach this, and no real level needs it.
             if (fireCount > 20000) fireCount = 20000;
@@ -474,8 +558,13 @@ void Level::poseMovable(int idx, int f, Vec2D& pos, float& rot, bool& active) co
                 // A Silent move has no action at all in GD — the offset is added
                 // to the objects the instant the trigger fires — so it is already
                 // fully applied on its own fire frame regardless of duration.
-                float prog = (t.preApplied || t.silent) ? 1.f
-                           : (t.duration > 0.f) ? (float)(f - thisFire) * dt / t.duration
+                // Reset-activated triggers (preApplied: x <= spawn) are NOT held at their
+                // end value: PlayLayer::resetLevel activates them through the ordinary
+                // checkSpawnObjects path (fireFrame 0), so they animate from step 1 like any
+                // other. (The audio-only flag +0x88a is the only reset special case.) Holding
+                // them put 113443235's -1500u/100s blade wall on the spawn at frame 1.
+                float prog = t.silent ? 1.f
+                           : (t.duration > 0.f) ? (float)(g - thisFire - 1) * dt / t.duration
                                                  : 1.f;
                 // Completed firings hold their end value (e == 1); skip the
                 // transcendental easing for them — every firing but at most the
@@ -491,7 +580,9 @@ void Level::poseMovable(int idx, int f, Vec2D& pos, float& rot, bool& active) co
                         // duration <= 0 means the command never finishes (GD's
                         // `m_duration != -1.0` infinite case and the 0 case both
                         // land here), so it tracks the player to the current frame.
-                        int endF = f;
+                        // The per-step player delta is applied from the command's
+                        // first step (F+1) on, so the window is X(g) - X(F).
+                        int endF = g;
                         if (t.duration > 0.f) {
                             int lim = thisFire + (int)std::lround((double)t.duration * 240.0);
                             if (endF > lim) endF = lim;
@@ -515,13 +606,14 @@ void Level::poseMovable(int idx, int f, Vec2D& pos, float& rot, bool& active) co
         } else if (t.kind == TriggerKind::Follow) {
             // Copy the follow group's MOVE displacement accrued over the follow
             // window [fireFrame, fireFrame+duration], scaled by the follow mods.
+            // moveOffsetOfGroupAt takes a Player::frame like this function.
             int fEnd = f;
             if (t.duration > 0.f) {
-                int end = t.fireFrame + (int)std::lround((double)t.duration * 240.0);
+                int end = t.fireFrame + 1 + (int)std::lround((double)t.duration * 240.0);
                 if (fEnd > end) fEnd = end;
             }
             Vec2D now  = moveOffsetOfGroupAt(t.followGroup, fEnd);
-            Vec2D base = moveOffsetOfGroupAt(t.followGroup, t.fireFrame);
+            Vec2D base = moveOffsetOfGroupAt(t.followGroup, t.fireFrame + 1);
             pos.x += (now.x - base.x) * t.followXMod;
             pos.y += (now.y - base.y) * t.followYMod;
         }
@@ -538,13 +630,14 @@ Vec2D Level::moveOffsetOfGroupAt(int group, int f) const {
     if (git == groupToMovable.end() || git->second.empty()) return off;
     const int idx = git->second.front();
     const float dt = 1.f / 240.f;
+    const int g = f - 1;   // loop step, see poseMovable's timeline comment
     for (int ti : movableToTriggers[idx]) {
         const Trigger& t = triggers[ti];
         if (t.kind != TriggerKind::Move) continue;          // move-only → no recursion
-        if (t.fireFrame < 0 || t.fireFrame > f) continue;
-        if (t.touchTriggered) continue;
-        float prog = (t.duration > 0.f)
-            ? (float)(f - t.fireFrame) * dt / t.duration : 1.f;
+        if (!engineActive(t, g)) continue;
+        if (t.touchTriggered && (!modelTouchTriggers || t.preApplied)) continue;
+        float prog = t.silent ? 1.f
+                   : (t.duration > 0.f) ? (float)(g - t.fireFrame - 1) * dt / t.duration : 1.f;
         float e = (prog >= 1.f) ? 1.f : easeValue(prog, t.easing, t.easeRate);
         off.x += t.moveX * g_calib.moveScale * e;
         off.y += t.moveY * g_calib.moveScale * e;
@@ -571,6 +664,8 @@ static Player spawnMirror(const Player& p1) {
 }
 
 Player Level::stepPlayer(Player p, bool pressed, float dt) {
+    const auto snapBefore = p.snapData;   // see the stair-snap undo at the end
+    const bool groundedBefore = p.grounded;
     p.dt = dt;
     p.preCollision(pressed);
     size_t sectionIdx = (size_t)std::min(
@@ -585,7 +680,16 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
     if (&currSection != &prevSection) secs[1] = currSection;
     if (&nextSection != &currSection) secs[2] = nextSection;
 
-    std::vector<ObjectContainer> blocks, hazards, effects, modifiers;
+    // Reused per-Level buffers, not locals — see Level.hpp. clear() keeps the capacity,
+    // so after the first few frames this allocates nothing at all.
+    std::vector<ObjectContainer>& blocks    = scratchBlocks;
+    std::vector<ObjectContainer>& hazards   = scratchHazards;
+    std::vector<ObjectContainer>& effects   = scratchEffects;
+    std::vector<ObjectContainer>& modifiers = scratchModifiers;
+    blocks.clear();
+    hazards.clear();
+    effects.clear();
+    modifiers.clear();
     blocks.reserve(100);
     hazards.reserve(100);
 
@@ -596,7 +700,9 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
             if (o->prio == 1)      blocks.push_back(o);
             else if (o->prio == 2) hazards.push_back(o);
             else if (o->prio == 3) { if (o->touching(p)) modifiers.push_back(o); }
-            else if (o->touching(p)) effects.push_back(o);  // collide in X order below
+            // Every nearby effect is a CANDIDATE, tested at processing time (see the
+            // effect loop below): a teleport earlier in the pass moves the player.
+            else if (std::abs(o->pos.x - p.pos.x) < kEffectScanX) effects.push_back(o);
         }
     }
 
@@ -615,7 +721,7 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
             if (t.fireFrame >= 0) continue;   // already fired
             if (std::abs(p.pos.x - t.x) > kTouchTriggerHalfSize + p.size.x * 0.5f) continue;
             if (std::abs(p.pos.y - t.y) > kTouchTriggerHalfSize + p.size.y * 0.5f) continue;
-            t.fireFrame = (int)p.frame;
+            t.fireFrame = (int)p.frame - 1;   // activated in this loop step (p.frame - 1)
             if (getenv("GDSIM_TOUCHTRIG_DEBUG"))
                 std::fprintf(stderr, "TOUCHTRIG fired ti=%d f=%d group=%d x=%.2f y=%.2f playerXY=(%.2f,%.2f)\n",
                              it->second, (int)p.frame, t.targetGroup, t.x, t.y, p.pos.x, p.pos.y);
@@ -680,7 +786,7 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
             if (o->prio == 1)      blocks.push_back(oc);
             else if (o->prio == 2) hazards.push_back(oc);
             else if (o->prio == 3) { if (o->touching(p)) modifiers.push_back(oc); }
-            else if (o->touching(p)) effects.push_back(oc);
+            else if (std::abs(o->pos.x - p.pos.x) < kEffectScanX) effects.push_back(oc);
         }
     }
 
@@ -695,14 +801,20 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
         if (m->touching(p)) m->collide(p);
     }
 
-    // Apply effects (portals/orbs/pads) in the order the player ENCOUNTERS them —
-    // left to right by X — not arbitrary parse order. Matters when two effects
-    // overlap in one step: e.g. a gravity portal immediately before a teleport
-    // portal must flip gravity BEFORE the teleport moves the player out of its
-    // range (otherwise the flip is missed and the player dies in wrong gravity).
+    // Engine order (GJBaseGameLayer::collisionCheckObjects): sections left to right,
+    // each section's objects in m_uniqueID order (level-string order = Object::id), and
+    // every non-solid is tested against the player's CURRENT rect when its turn comes —
+    // the rect is refreshed after a teleport (LAB_140215e78). So a portal that only
+    // overlaps the teleport's exit fires in the same step if it comes later in that
+    // order (truth 85701165 f827: wave teleported to y 835 and turned cube there on the
+    // same frame via the cube portal at (1321.6,825.7)). The old left-to-right X sort,
+    // with touching() decided before any effect ran, missed it.
     std::sort(effects.begin(), effects.end(),
               [](const ObjectContainer& a, const ObjectContainer& b) {
-                  return a.operator->()->pos.x < b.operator->()->pos.x;
+                  const Object* oa = a.operator->(); const Object* ob = b.operator->();
+                  const int sa = (int)std::floor(oa->pos.x / (float)sectionSize);
+                  const int sb = (int)std::floor(ob->pos.x / (float)sectionSize);
+                  return sa != sb ? sa < sb : oa->id < ob->id;
               });
     const bool upBeforeEffects = p.upsideDown;
     for (auto& e : effects) {
@@ -732,7 +844,11 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
                      p.frame, (int)p.vehicle.type, p.dead, p.grounded, upBeforeEffects, p.upsideDown,
                      p.gravityPortal, p.preFrameVelocity);
     }
-    if (p.upsideDown != upBeforeEffects && !p.dead && !p.grounded
+    // Only for a flip the engine makes BEFORE update() (pushButton on an already-touched
+    // ring). A flip from the collision pass (gravity portal, pad, a ring touched this
+    // step) comes after the move: real Y keeps the old direction this step (truth
+    // 108166595 f318: 45-deg gravity portal, wave continues down 1.95 then turns).
+    if (p.upsideDown != upBeforeEffects && !p.dead && !p.grounded && p.flipBeforeUpdate
         && p.vehicle.type == VehicleType::Wave) {
         const double v0 = (p.input * 2 - 1) * player_speeds[(int)p.speed]
                           * (p.small ? 2.0 : 1.0);
@@ -835,7 +951,6 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
              // cap exception only applies to orb-caused flips; p.gravityPortal
              // (set by GravityPortal::collide(), reset every frame in preCollision)
              // distinguishes the two without needing a second position-keyed hack.
-             && (std::fabs(p.preFrameVelocity) < 809.5 || p.gravityPortal)
              && !getenv("GDSIM_NOCUBEFLIPCORR")) {
         // TRIED 2026-08-20 (DeCode): a least-squares fit across 8 real gravity-flip
         // touches suggested scaling this "2.0" down to ~0.82 (pointwise errors at
@@ -848,6 +963,18 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
         // to trust a single scale confidently. Formula kept at the original,
         // theory-derived 2.0 pending a better per-touch understanding.
         double delta = 2.0 * p.grav(p.preFrameVelocity) * p.dt;
+        // ENGINE RULE (2026-10-05, GJBaseGameLayer::playerTouchedRing 0x140217e40): a ring
+        // or pad touched in the collision pass flips gravity AFTER this step's update()
+        // already moved the player with the old WORLD velocity — which is exactly what
+        // preCollision did. So a DEFERRED flip (velocityOverride: newly touched orb/pad)
+        // needs no Y correction at all. Only the same-step case (pushButton -> ringJump
+        // BEFORE update, i.e. a fresh press on an already-touched orb, velocityOverride
+        // false) needs this term, to undo postCollision's resync running with the new
+        // sign. Truth 2997354 f616: blue orb grazed with the button held — real Y keeps
+        // falling 1.664, the old correction mirrored it to +1.567. The per-velocity
+        // patches that used to sit below (-422.712 / -313.200 -> 0) and the terminal-
+        // velocity gate were all this one rule, measured touch by touch.
+        if (p.velocityOverride) delta = 0.0;
         // TRIED 2026-08-21: an independent reference implementation
         // (seanlnge/gd-simulate) suggested a delta=0 model for EVERY GravityPortal
         // touch (position integration happens before portal application there, so
@@ -865,8 +992,7 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
         // distance, f3595->f2411 — the corridor's later touches are apparently
         // sensitive to any change in the shared formula). Keyed narrowly by this
         // touch's own near-unique preFrameVelocity so nothing else is affected.
-        if (std::fabs(p.preFrameVelocity - (-422.712)) < 1.0)
-            delta = 0.0;
+
         // Same fix, 4th gravity-flip touch (preFrameVelocity -313.200, Blue Orb at
         // x~2373, user-flagged): locally correct (formula +2.610, real needs ~0) but
         // regressed the reachable distance when applied ALONE — this touch feeds
@@ -874,8 +1000,7 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
         // GravityPortal.cpp corrections below), whose constants were derived
         // assuming this touch's OLD (uncorrected) behavior. Re-enabled together with
         // a re-derivation of that whole downstream batch against the new state.
-        else if (std::fabs(p.preFrameVelocity - (-313.200)) < 1.0)
-            delta = 0.0;
+
         // TRIED extending this same per-touch approach to the corridor's other 5
         // gravity-flip touches (f1476/1837/1857/1883/1909), each keyed by its own
         // preFrameVelocity with a "needed" delta measured the same way as the
@@ -945,19 +1070,35 @@ Player Level::stepPlayer(Player p, bool pressed, float dt) {
 
     if (!p.dead) p.postCollision();
 
-    // Cache the stair-snap reference x on the frame the cube lands (landingFrame was
-    // set to this exact frame during collision), but ONLY while still grounded. On
-    // an orb/jump the frame after touchdown, Block::collide re-stamps landingFrame
-    // but the effect has already launched the cube (grounded=false); caching there
-    // overwrites refX with the post-launch X — one X-step (~1.3u) too far forward,
-    // over-driving the next stair snap into its ±threshold clamp (proven on truth
-    // 308 f1778→1779: real locks refX at the 2308.29 landing; gdsim was overwriting
-    // it with the 2309.59 launch frame). The `grounded` guard keeps refX correct
-    // through multi-frame grounded walks (needed by 174's pre-ship cube phase) while
-    // rejecting the launched frame. On non-landing frames refX carries forward via
-    // the state copy; works under solver state injection without a gameStates lookup.
-    if (p.snapData.landingFrame == p.frame && p.grounded)
-        p.snapData.refX = p.pos.x;
+    // Undo a stair-snap record made on the frame the cube LAUNCHED (jump/orb). The
+    // engine runs updateJump before the collision pass, so a launching cube has
+    // already left the floor and collidedWithObjectInternal never places it (never
+    // calls checkSnapJumpToObject); gdsim collides first and jumps in postCollision,
+    // so Block::collide still recorded this frame's floor. Keeping it paired the
+    // wrong object with the next landing — truth 274283 f1907: the jump recorded
+    // block (2475,15) where the engine still held (2445,15), and the landing at f1970
+    // on (2565,75) matched the +90/+60 stair: gdsim snapped X +1.0, real did not,
+    // and the cube then took an edge one frame early and died on the spike at 2835.
+    // (Also truth 308 f1778->1779: the record stays the landing's.) Only a launch
+    // from an established floor contact: a landing that launches on the same frame
+    // (held into the landing) was a real placement and keeps its record.
+    if (p.snapData.landingFrame == p.frame && !p.grounded && groundedBefore) {
+        p.snapData.object      = snapBefore.object;
+        p.snapData.objectId    = snapBefore.objectId;
+        p.snapData.objectSolid = snapBefore.objectSolid;
+        p.snapData.snapDX      = snapBefore.snapDX;
+    }
+
+    // Teleport triggers activated in this step (X-passed, spawned or touched): the engine
+    // runs them from checkSpawnObjects / the collision pass, i.e. at the END of the step.
+    if (!p.dead)
+        for (int tk : teleportTriggers) {
+            const Trigger& t = triggers[tk];
+            if (!t.preApplied && t.fireFrame >= 0 && t.fireFrame == (int)p.frame - 1
+                && (!t.touchTriggered || modelTouchTriggers))
+                applyTeleport(p, t);
+        }
+    updateVisualRotation(p);
 
     return p;
 }
@@ -1095,6 +1236,109 @@ void Level::resetToStart() {
     // reads player_speeds[] — a Speed-group tunable edit invalidates them, and
     // that is exactly the kind of edit the fitter probes. Cheap next to a parse.
     if (hasTriggers) buildTriggerTimeline();
+}
+
+// FUN_140071ef0: slerp between two angles (radians) through unit quaternions of the half
+// angles, every operation in float like the binary (cosf/sinf/acosf, atan2 in double).
+static float slerpAngle(float a, float b, float t) {
+    const float ha = a * 0.5f, hb = b * 0.5f;
+    const float c1 = std::cos(ha), s1 = std::sin(ha);
+    float c2 = std::cos(hb), s2 = std::sin(hb);
+    float dot = c2 * c1 + s2 * s1;
+    if (dot < 0.f) { dot = -dot; s2 = -s2; c2 = -c2; }
+    float w1 = 1.f - t, w2 = t;
+    if (1.f - dot > 0.0001f) {
+        const float om = std::acos(dot), so = std::sin(om);
+        w1 = std::sin((1.f - t) * om) / so;
+        w2 = std::sin(om * t) / so;
+    }
+    const float S = s1 * w1 + s2 * w2;
+    const float C = c1 * w1 + c2 * w2;
+    return (float)(std::atan2((double)S, (double)C) * 2.0);
+}
+
+// PlayerObject::updateShipRotation (0x140390c40), classic mode (no reverse, not sideways):
+// target = atan2f(-dy, dx) of this step's motion, slerped from the current rotation by
+// t = min(delta, factor*delta), delta = 0.25 (the step's 60 Hz-unit dt). Factor: 0.15
+// ship/swing, 0.25 wave (0.4 mini), 0.07 UFO (whose target is first scaled by -0.4 and
+// clamped to +-0.1). x0.25 while colliding with a slope. Skipped on a slope / dashing, and
+// when the step moved less than sqrt(1.2*delta).
+void Level::updateVisualRotation(Player& p) {
+    const VehicleType v = p.vehicle.type;
+    const bool flying = v == VehicleType::Ship || v == VehicleType::Ufo
+                     || v == VehicleType::Wave || v == VehicleType::Swing;
+    if (flying && !p.dashing && !p.slopeData.slope) {
+        const float delta = 0.25f;
+        const float dx = p.pos.x - p.rotLastPos.x;
+        const float dy = -(p.pos.y - p.rotLastPos.y);
+        if (dx * dx + dy * dy >= delta * 1.2f) {
+            float target = std::atan2(dy, dx);
+            float factor = 0.15f;
+            if (v == VehicleType::Ufo) {
+                target *= -0.4f;
+                factor = 0.07f;
+                target = (p.upsideDown == false) ? std::max(-0.1f, target) : std::min(0.1f, target);
+            } else if (v == VehicleType::Wave) {
+                factor = p.small ? 0.4f : 0.25f;
+            }
+            const float t = std::min(delta, factor * delta);
+            const float cur = p.visRot * 0.017453292f;
+            p.visRot = slerpAngle(cur, target, t) * 57.29578f;
+        }
+    }
+    p.rotLastPos = p.pos;
+}
+
+// GJBaseGameLayer::tryGetObject (0x140224590): the group's parent object (field 274), else
+// the group's only object, else a RANDOM one (rand-driven in the engine; the first in level
+// order stands in for it here).
+bool Level::groupObjectPos(int group, Vec2D& out) const {
+    if (auto it = groupParentPos.find(group); it != groupParentPos.end()) { out = it->second; return true; }
+    if (auto it = groupAnchor.find(group); it != groupAnchor.end()) { out = it->second; return true; }
+    return false;
+}
+
+// GJBaseGameLayer::teleportPlayer (0x14020fdb0), positional part. Target = an object of
+// the trigger's group (the engine picks one at random when the group holds several; the
+// first in level order is used here). Save Offset (351) keeps the player's offset from the
+// trigger; Ignore X / Ignore Y (352/353) keep that axis.
+bool Level::teleportTarget(const Trigger& t, Vec2D pos, int f, Vec2D& out) const {
+    Vec2D target;
+    auto mv = groupToMovable.find(t.targetGroup);
+    if (mv != groupToMovable.end() && !mv->second.empty()) {
+        const int idx = mv->second.front();
+        target = movableMeta[idx].startPos;
+        if ((size_t)idx < movableToTriggers.size()) {
+            float rot; bool active;
+            poseMovable(idx, f, target, rot, active);
+        }
+    } else if (!groupObjectPos(t.targetGroup, target)) {
+        return false;
+    }
+    if (t.tpSaveOffset) target = target + (pos - Vec2D{t.x, t.y});
+    if (t.tpIgnoreX) target.x = pos.x;
+    if (t.tpIgnoreY) target.y = pos.y;
+    out = target;
+    return true;
+}
+
+void Level::applyTeleport(Player& p, const Trigger& t) const {
+    Vec2D to;
+    if (teleportTarget(t, p.pos, (int)p.frame, to)) {
+        p.pos = to;
+        p.grounded = false;                       // m_isOnGround2 = 0
+    }
+    // Gravity option 354: flipGravity(player, flip, true) — halves the WORLD velocity;
+    // gdsim's velocity is gravity-relative, so the sign turns as well.
+    bool flip = p.upsideDown;
+    if (t.tpGravity == 1) flip = false;
+    else if (t.tpGravity == 2) flip = true;
+    else if (t.tpGravity == 3) flip = !p.upsideDown;
+    if (flip != p.upsideDown) {
+        p.upsideDown = flip;
+        p.velocity   = -p.velocity * 0.5;
+        p.grounded   = false;
+    }
 }
 
 int Level::currentFrame() const { return (int)gameStates.size(); }

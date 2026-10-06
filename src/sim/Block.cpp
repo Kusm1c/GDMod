@@ -36,43 +36,53 @@ Block::Block(Vec2D s, std::unordered_map<int, std::string>&& fields) : Object(s,
 // not just a bigger box. Reverted; DeCode's specific corner-miss stays open. Do not
 // retry with a flat symmetric pad — need to actually port the decompile's directional
 // snap math (or get grounded-flag re-scanner truth) before touching this again.
-enum class SnapType { None, BigStair, LittleStair, DownStair };
-
-static float snapThreshold(Vec2D const& diff, Player const& p) {
-    std::array<Vec2D, 3> stairs;
-    float threshold;
-    switch (p.speed) {
-        case 0:  stairs = {Vec2D(120,-30),Vec2D(90,30),Vec2D(60,60)};   threshold=1; break;
-        case 1:  stairs = {Vec2D(150,-30),Vec2D(p.small?90.f:120.f,30),Vec2D(90,60)};  threshold=1; break;
-        case 2:  stairs = {Vec2D(195,-30),Vec2D(p.small?90.f:150.f,30),Vec2D(120,60)}; threshold=2; break;
-        case 3:  stairs = {Vec2D(225,-30),Vec2D(90.f,30),Vec2D(135,60)}; threshold=2; break;
-        default: stairs = p.small
-            ? std::array<Vec2D,3>{Vec2D(150,-30),Vec2D(120,30),Vec2D(90,60)}
-            : std::array<Vec2D,3>{Vec2D(225,-30),Vec2D(180,30),Vec2D(135,60)};
-            // GD's exact snap (GDCS Player Snap Bug): x_shift = 1 unit at 4x speed
-            // regardless of size (1 for 0.5x/1x/4x, 2 for 2x/3x). Was small?1:2, which
-            // over-snapped big 4x by a unit.
-            threshold = 1; break;
+// PlayerObject::checkSnapJumpToObject (0x140393cb0), ported from the disassembly
+// (every compare is a float ucomiss/comiss against .rdata; the snap itself is double).
+// collidedWithObjectInternal calls it each time it places a CUBE on top of a solid —
+// the landing frame AND every grounded frame after, once per object, in collision
+// order — with prev = m_objectSnappedTo:
+//
+//   if prev && prev.uid != obj.uid && prev.type == Solid
+//      && (dx,dy) matches a stair (up,+30) / (down,-30) / (up2,+60), dy sign-flipped
+//         when upside down, within tol:
+//       target = (double)obj.x + m_snapDistance, clamped to player.x +- tol
+//   m_objectSnappedTo = obj;  m_snapDistance = (double)(player.x - obj.x)
+//
+// Per m_playerSpeed (tol/up/down/up2): 0.7 1/90/120/60, 0.9 1/120/150/90,
+// 1.1 2/150/195/120, 1.3 2/180/225/135, anything else (4x) 1/120/150/90.
+// `up` drops to 90 when m_vehicleSize != 1, except at 4x which skips that test.
+// The old gdsim table (from GDCS prose) had big-3x up=90 and big-4x = 225/180/135.
+static void checkSnapJumpToObject(Block const& b, Player& p) {
+    auto& sd = p.snapData;
+    if (sd.objectId >= 0 && sd.objectId != b.id && sd.objectSolid) {
+        float tol = 1.f, up = 120.f, down = 150.f, up2 = 90.f;
+        bool sizeTest = true;
+        switch (p.speed) {
+            case 0:  up = 90.f;  down = 120.f; up2 = 60.f;             break;
+            case 1:                                                    break;
+            case 2:  up = 150.f; down = 195.f; up2 = 120.f; tol = 2.f; break;
+            case 3:  up = 180.f; down = 225.f; up2 = 135.f; tol = 2.f; break;
+            default: sizeTest = false;                                 break;
+        }
+        if (sizeTest && p.small) up = 90.f;
+        const float s = p.upsideDown ? -1.f : 1.f;
+        const float ox = sd.object.pos.x, oy = sd.object.pos.y;
+        const float nx = b.pos.x,         ny = b.pos.y;
+        const bool stair =
+            (std::fabs(nx - (ox + up))   <= tol && std::fabs(ny - (s * 30.f + oy)) <= tol) ||
+            (std::fabs(nx - (ox + down)) <= tol && std::fabs(ny - (oy - s * 30.f)) <= tol) ||
+            (std::fabs(nx - (ox + up2))  <= tol && std::fabs(ny - (s * 60.f + oy)) <= tol);
+        if (stair) {
+            double target = (double)nx + sd.snapDX;
+            const double px = (double)p.pos.x, t = (double)tol;
+            if (std::fabs(target - px) > t) target = target > px ? px + t : px - t;
+            p.pos.x = (float)target;
+        }
     }
-    for (auto& stair : stairs)
-        if (std::abs(diff.x - stair.x) <= threshold && std::abs(diff.y - stair.y) <= threshold)
-            return threshold;
-    return 0;
-}
-
-static void trySnap(Block const& b, Player& p) {
-    auto snapData = p.snapData;
-    auto diff = b.pos - snapData.object.pos;
-    diff.y = p.grav(diff.y);
-    if (float threshold = snapThreshold(diff, p); threshold > 0) {
-        // refX is the cached pos.x of the previous landing state — identical to
-        // the old getState(playerFrame).nextPlayer()->pos.x, but available even
-        // when the simulator only holds a single injected state.
-        p.pos.x = std::clamp(
-            snapData.refX + diff.x,
-            p.pos.x - threshold,
-            p.pos.x + threshold);
-    }
+    sd.object      = b;
+    sd.objectId    = b.id;
+    sd.objectSolid = dynamic_cast<BreakableBlock const*>(&b) == nullptr;
+    sd.snapDX      = (double)(p.pos.x - b.pos.x);
 }
 
 void Block::collide(Player& p) const {
@@ -83,7 +93,6 @@ void Block::collide(Player& p) const {
     // the generic collision function this file otherwise ports — GD Creator School
     // confirms D-blocks are a distinct special case). Real GD lets a WAVE touch a D
     // block without dying. Grounded modes fall through to normal handling below.
-    if (typeId == 1755 && p.vehicle.type == VehicleType::Wave) return;
 
     // WAVE: REVERTED 2026-08-11 (explicit, repeated, forceful user instruction: the
     // wave dies on ANY collision — block or slope — no exception whatsoever except a
@@ -97,8 +106,11 @@ void Block::collide(Player& p) const {
     // not ridden the way a cube rests on a platform. Simplified to the literal rule:
     // unconditional death on touch, D block (Block::collide's own early return above)
     // the only exception.
-    if (p.vehicle.type == VehicleType::Wave) {
-        if (p.innerHitbox().intersects(*this)) {
+    // collidedWithObjectInternal: `if (isDart && m_stateDartSlide < 1) -> death path`.
+    // With a D block's slide state active the wave takes the ordinary solid path below
+    // (it lands on / slides along the surface, flying snap threshold).
+    if (p.vehicle.type == VehicleType::Wave && p.stateDartSlide < 1) {
+        if (p.blockDeathHitbox().intersects(*this)) {
             p.dead = true; p.deathCause = "block";
             p.deathObjType = typeId; p.deathObjPos = pos;
         }
@@ -109,7 +121,7 @@ void Block::collide(Player& p) const {
     // non-flying modes (Cube/Ball/Robot/Spider), 6 for flying modes (Ship/Ufo/Swing;
     // Wave has its own death-hitbox path below and never uses this clip).
     int clip = (p.vehicle.type == VehicleType::Ufo || p.vehicle.type == VehicleType::Ship
-                || p.vehicle.type == VehicleType::Swing) ? 6 : 10;
+                || p.vehicle.type == VehicleType::Swing || p.vehicle.type == VehicleType::Wave) ? 6 : 10;
 
     if (p.upsideDown != p.prevPlayer().upsideDown && !p.gravityPortal) return;
 
@@ -302,6 +314,51 @@ void Block::collide(Player& p) const {
     // 1.5u knife-edge, full stop.
     constexpr float kThinObjectMaxWidth = 5.f;
     bool thinGraze = size.x < kThinObjectMaxWidth;
+
+    // FOUND 2026-09-22 (real per-frame capture, level 2997354 "DeCode" x=24538,
+    // user flagged typeId=661 via the app's J-flag tool; the deviation export
+    // shows gdsim within 0.0005u of the real player for the whole approach, so
+    // only the death RULE was wrong).
+    //
+    // Real GD has NO "a solid overlaps me, therefore I die" rule at all. The
+    // whole solid pass was read end to end in the decompile:
+    //   GJBaseGameLayer::collisionCheckObjects (0x140214960) does NOT handle
+    //   GameObjectType 0/0x15 (solid) in its per-type switch — it pushes them
+    //   into a separate list (m_collidedObjects, +0x634) and the caller then
+    //   runs PlayerObject::collidedWithObject -> collidedWithObjectInternal
+    //   (0x140391a70) on each. Neither that function nor hitGround/didHitHead/
+    //   updateCollide contains a single destroyPlayer/playerDestroyed call
+    //   (grepped whole-function). The ONLY destroyPlayer in the pass is in the
+    //   HAZARD list loop (GameObjectType 2/0x2f). A solid can therefore only
+    //   kill through PlayerObject::postCollision (0x14038d580), which is a
+    //   CRUSH test: you must have been pushed up onto a floor (m_snapFloorY)
+    //   AND down under a ceiling (m_snapCeilY) in the SAME frame, and
+    //   `fabs(floor - ceil) < getObjectRect().height * 0.7` (0.8 in platformer).
+    //
+    // What collidedWithObjectInternal DOES do first is classify the object as a
+    // FLOOR CANDIDATE: `objTop <= playerBottom + snapUpThreshold` (the same 10 /
+    // 6 / 7 already ported into `clip` right above). An object that passes that
+    // gate is a surface you are going to be stood on, not an obstacle — and it
+    // stays a floor candidate while you are still RISING toward it; GD simply
+    // does nothing until your velocity turns over, then snaps you onto its top.
+    //
+    // Measured on the real capture (GD coords, block 661 at y[210..225], mini
+    // cube feet rising 216.855 -> 217.350): objTop-feet stayed 7.65..8.15 (always
+    // under clip=10) for SIX frames while the full 18x18 hitbox was up to
+    // 13.2 x 8.1 units inside the block, then frame 16975 snapped feet to exactly
+    // 225.0 with grounded=1. gdsim killed on the FIRST of those frames because
+    // the 7x7 inner box clipped the same corner by 1.00 x 1.25 — over
+    // kSolidGraze, so the graze tolerance above could not save it.
+    //
+    // So: never let the inner-box overlap kill an object the landing branch below
+    // would accept on geometry alone. This is not a new leniency — it reuses that
+    // branch's own already-calibrated gate, and only removes the death for the
+    // frames BEFORE the landing it is already committed to. thinGraze objects are
+    // excluded exactly as they are from the landing branch (a 1.5u knife-edge is
+    // never a floor in real GD), so their behaviour is unchanged.
+    const bool floorCandidate = !thinGraze && (p.gravTop(*this) - bottom) <= clip;
+    if (blockHit && floorCandidate) blockHit = false;
+
     if (blockHit && !p.touchingHBlock) {
         p.dead = true; p.deathCause = "block";
         p.deathObjType = typeId; p.deathObjPos = pos;
@@ -316,16 +373,9 @@ void Block::collide(Player& p) const {
         // improperly-linked Player — costs nothing in the normal case, and turns
         // a hard crash into "this frame's stair-snap cache just doesn't update".
         if (p.vehicle.type == VehicleType::Cube && p.level) {
-            if (!p.prevPlayer().grounded) {
-                // Snap only when ≥1 frame has passed since the tracked landing.
-                // Use the monotonic Player::frame (landingFrame) so the check is
-                // correct under state injection, where gameStates indices reset.
-                if (p.snapData.playerFrame > 0 && p.snapData.landingFrame < p.frame)
-                    trySnap(*this, p);
-            }
+            checkSnapJumpToObject(*this, p);
             p.snapData.playerFrame  = p.level->currentFrame();
             p.snapData.landingFrame = p.frame;
-            p.snapData.object       = *this;
         }
     } else {
         if (p.vehicle.type == VehicleType::Ship || p.vehicle.type == VehicleType::Ufo || p.vehicle.type == VehicleType::Ball) {
@@ -338,6 +388,23 @@ void Block::collide(Player& p) const {
             if (p.gravTop(p) - p.gravBottom(*this) <= clip - 1 && p.velocity > 0) {
                 p.pos.y = p.grav(p.gravBottom(*this)) - p.grav(p.size.y / 2);
                 p.velocity = 0;
+                // FOUND 2026-09-23 (level 13519 "The Nightmare", real per-frame
+                // capture, ship at x=13764): this snap is the END state of the real
+                // frame — updateJump already ran its `v += a*dt; y += v*dt` BEFORE
+                // checkCollisions clamped — so real GD reports y EXACTLY on the
+                // ceiling and yVel EXACTLY 0 for every frame the ship is held under
+                // it (17 straight frames in the capture, y=345.000 / vy=0.000).
+                // gdsim then ran postCollision on top: it re-added this frame's
+                // gravity step to the zeroed velocity AND applied the semi-implicit
+                // resync, which subtracts `grav(preFrameVelocity)*dt` — the whole
+                // pre-snap ascent — dragging the ship 1.111u straight back off the
+                // ceiling on the snap frame. That 1.1u error let the ship clip the
+                // NEXT wall's ceiling corner ~100 frames later, reset its velocity a
+                // second time, and end the corridor 37u above the real player: gdsim
+                // flew the gap clean while the real run sank into the spike at
+                // x=14034 (Simulate cleared, Watch died). Flag it so postCollision
+                // leaves both the snapped Y and the zeroed velocity alone.
+                p.ceilingSnapped = true;
             }
         } else if ((p.vehicle.type == VehicleType::Cube || p.vehicle.type == VehicleType::Robot
                     || p.vehicle.type == VehicleType::Spider) && p.grav(p.velocity) > 0 && !notNewCollision

@@ -64,15 +64,20 @@ struct Player : public Entity {
     } slopeData;
 
     struct {
+        // PlayerObject::m_objectSnappedTo (0x888) / m_snapDistance (0x838), written
+        // together by Block.cpp's checkSnapJumpToObject port on every cube floor
+        // placement. objectId < 0 = m_objectSnappedTo == nullptr. Like the engine,
+        // nothing clears them except a fresh Player (init/resetObject).
         Entity object;
+        int    objectId = -1;       // Object::id (m_uniqueID stand-in)
+        bool   objectSolid = false; // getObjectType() == Solid (a BreakableBlock is not)
+        double snapDX = 0.0;        // (double)(player.x - object.x) at that call
+        // Frame of the last cube floor placement (landing branch), kept for
+        // Slope.cpp's "landed on a block" test; the ground floor resets it.
         int playerFrame = 0;
-        // Stair-snap reference, cached so it travels with the state instead of
-        // requiring a gameStates lookup (which breaks under solver state
-        // injection). landingFrame is the monotonic Player::frame at the last
-        // cube landing; refX is that landing state's final pos.x — exactly what
-        // getState(playerFrame).nextPlayer()->pos.x used to return.
-        int   landingFrame = 0;
-        float refX = 0.f;
+        // Monotonic Player::frame of that placement — lets Level::stepPlayer undo a
+        // record made on the frame the cube launched (see its comment).
+        int landingFrame = 0;
     } snapData;
 
     float ceiling;
@@ -145,6 +150,14 @@ struct Player : public Entity {
     bool touchingJBlock = false;  // J (1813): suppress buffered auto-jump on landing
     bool touchingSBlock = false;  // S (1829): neutralize a dash orb
     bool touchingHBlock = false;  // H (1859): survive a block's underside/side touch
+    // The engine keeps these as STEP COUNTDOWNS, not per-touch flags
+    // (GJBaseGameLayer::collisionCheckObjects case 0x28 sets them to 2; the end of
+    // PlayerObject::update decrements them): m_stateNoAutoJump (J, +0xb74),
+    // m_stateDartSlide (D, +0xb78), m_stateHitHead (H, +0xb7c). A touch therefore lasts
+    // the touching step and the next one. touchingJBlock / touchingHBlock read them.
+    int  stateNoAutoJump = 0;
+    int  stateDartSlide  = 0;     // > 0: a wave lands on solids instead of dying
+    int  stateHitHead    = 0;
 
     // Dash orb (1704): while held, follow the orb's angle at constant velocity, no
     // gravity. dashTan = tan(angle); velocity = player_speeds[speed]*dashTan each
@@ -170,12 +183,39 @@ struct Player : public Entity {
     double preAppliedGravStep = 0.0;
     bool   resyncPosition = false;
 
+    // A block's underside clamped this frame's flight ceiling (Block.cpp's
+    // ship/UFO/ball branch: pos.y snapped to the block's bottom, velocity zeroed).
+    // Real GD reaches that state at the END of the frame — PlayerObject::updateJump
+    // has ALREADY run `v += a*dt; y += v*dt` before checkCollisions clamps — so the
+    // frame finishes with velocity exactly 0 and Y exactly on the ceiling, and only
+    // the NEXT frame's gravity step lifts it off. gdsim runs collisions in the
+    // middle of the frame, so postCollision must not re-apply this frame's gravity
+    // step, nor its semi-implicit position resync, on top of the snap.
+    // Reset every frame in preCollision.
+    bool   ceilingSnapped = false;
+    // A teleport (portal 747 or trigger 3022) SET pos this step: the engine's position
+    // is the target, with no integration on top, so postCollision must not resync it.
+    bool   teleported = false;
+    // A gravity flip that the engine performs BEFORE this step's update(): a fresh press on
+    // a ring already touched last step (PlayerObject::pushButton -> ringJump). Flips from
+    // the collision pass (portals, pads, newly touched rings) happen AFTER the move.
+    bool   flipBeforeUpdate = false;
+
     Player();
 
     void preCollision(bool input);
     void postCollision();
 
     Entity unrotatedHitbox() const;
+    // The player's VISUAL rotation (CCNode rotation, degrees, GD convention: clockwise
+    // positive) and PlayerObject+0x9f8, the position at the end of the previous step.
+    // GJBaseGameLayer::update calls PlayerObject::updateRotation AFTER the collision pass
+    // and then stores the position; the player's OBB (getOrientedBox) uses this rotation,
+    // and the engine tests ORIENTED non-solid objects (rotation % 90 != 0: hazards,
+    // portals, orbs, pads) against that OBB. See Level::updateVisualRotation.
+    float  visRot = 0.f;
+    Vec2D  rotLastPos{0.f, 0.f};
+    Entity orientedHitbox() const;
     Entity innerHitbox() const;
     Entity blockDeathHitbox() const;
 

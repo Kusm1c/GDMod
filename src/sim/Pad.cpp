@@ -17,7 +17,9 @@ PadType padTypeFromId(int id) {
 
 Pad::Pad(Vec2D s, std::unordered_map<int, std::string>&& fields) : EffectObject(s, std::move(fields)) {
     type = padTypeFromId(numFromString<int>(fields[1]));
-    if (numFromString<int>(fields[5]) == 1) rotation += deg2rad(180);
+    // Object rotation is in DEGREES (GD's field 6, negated). This added deg2rad(180) =
+    // 3.14 "degrees", which made every flipped pad a 3-degree ORIENTED object.
+    if (numFromString<int>(fields[5]) == 1) rotation += 180.f;
 }
 
 // Laid out like camila314/pathfinder's gd-sim/src/Objects/Pad.cpp: grouped by pad
@@ -105,17 +107,16 @@ double padVelocityValue(PadType t, VehicleType v, bool mini, int speed) {
 
 void Pad::collide(Player& p) const {
     if (type == PadType::Blue) {
-        auto rot = rad2deg(std::abs(rotation));
-        if ((rot > 90 && !p.upsideDown) || (rot < 90 && p.upsideDown)) return;
+        const float rot = std::fmod(std::abs(rotation), 360.f);
+        const bool facingDown = rot > 90.f && rot < 270.f;
+        if ((facingDown && !p.upsideDown) || (!facingDown && p.upsideDown)) return;
         if (p.upsideDown != p.prevPlayer().upsideDown) return;
-        // A WAVE gravity-pad takes effect one frame after first contact (newly-touched
-        // deferral, like an orb — see [[orb_touch_timing_sameframe]]): GD resolves the
-        // pad in the collision phase after this frame's motion, so a freshly-touched
-        // flip only bites next frame. gdsim's SAT overlap fires a frame early, which in
-        // a mini-wave gravity-pad corridor (85701165) compounds into a large drift.
-        // Return WITHOUT marking the pad used so it fires on the next (still-overlapping)
-        // frame. Non-wave pads keep their existing velocityOverride next-frame handling.
-        if (p.vehicle.type == VehicleType::Wave && !Object::touching(p.prevPlayer())) return;
+        // The gravity pad flips on first contact (collisionCheckObjects case 10), AFTER this
+        // step's move, so the new direction shows on the next step by itself. The old
+        // "wave pads fire one frame later" deferral only cancelled the same-step wave Y
+        // re-integration Level::stepPlayer used to apply to every flip (now limited to
+        // pushButton flips, see Player::flipBeforeUpdate). Truth 85701165 f6: mini wave
+        // overlaps the pad (23,3) by 0.29 and rises from f7.
         if (getenv("GDSIM_ORBTOUCH_DEBUG"))
             std::fprintf(stderr, "PAD-TOUCH f=%d typeId=%d pos=(%.2f,%.2f) playerXY=(%.2f,%.2f) velBefore=%.3f\n",
                          p.frame, typeId, pos.x, pos.y, p.pos.x, p.pos.y, p.velocity);

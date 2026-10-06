@@ -289,8 +289,10 @@ struct PhysicsTables {
     float portalSpeed200W = 35.f, portalSpeed200H = 44.f;
     float portalSpeed201W = 33.f, portalSpeed201H = 56.f;
     float portalSpeed202W = 51.f, portalSpeed202H = 56.f;
-    // STILL UNVERIFIED - no upright instance captured yet, this is a guess.
-    float portalSpeed203W = 30.f, portalSpeed203H = 90.f;
+    // From the binary: GameObject::setupSpriteSize gives 203 = 65 x 56 (tools/gd_spritesize.txt,
+    // which reproduces every captured portal above). The old 30 x 90 was a guess; with it the
+    // rotated, 0.25-scaled 3x portal of truth 85701165 fired one step late (f577).
+    float portalSpeed203W = 65.f, portalSpeed203H = 56.f;
     float portalSpeed1334W = 69.f, portalSpeed1334H = 56.f;
 };
 

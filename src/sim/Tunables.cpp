@@ -233,7 +233,7 @@ void buildRegistry() {
         {"speed 200",      &P.portalSpeed200W,  &P.portalSpeed200H,  "0.5x speed portal. Measured 35x44."},
         {"speed 201",      &P.portalSpeed201W,  &P.portalSpeed201H,  "1x speed portal. Measured 33x56."},
         {"speed 202",      &P.portalSpeed202W,  &P.portalSpeed202H,  "2x speed portal. Measured 51x56."},
-        {"speed 203",      &P.portalSpeed203W,  &P.portalSpeed203H,  "3x speed portal. UNVERIFIED - no instance captured yet."},
+        {"speed 203",      &P.portalSpeed203W,  &P.portalSpeed203H,  "3x speed portal (65 x 56, GameObject::setupSpriteSize)."},
         {"speed 1334",     &P.portalSpeed1334W, &P.portalSpeed1334H, "4x speed portal. Measured 69x56."},
     };
     for (auto& pt : portals) {
